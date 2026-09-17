@@ -653,6 +653,9 @@ pub const fn is_arc_chain(chain_id: u64) -> bool {
     chain_id == ARC_CHAIN_ID || chain_id == ARC_TESTNET_CHAIN_ID
 }
 
+/// Stable mainnet: the native gas asset IS USDT0.
+pub const STABLE_CHAIN_ID: u64 = 988;
+
 /// The native/USD price source for a chain. xDAI is defined to be USD-pegged
 /// and Arc's native coin IS USDC, which also keeps their stablecoin settlement
 /// and relayer funding independent of Binance availability; every other chain
@@ -664,7 +667,8 @@ pub const fn is_arc_chain(chain_id: u64) -> bool {
 /// — a tenth of a cent on a dollar coin — so a market outage must not be able
 /// to move what a person is charged on a chain whose coin is the dollar.
 pub fn pegged_native_usd_price(chain_id: u64) -> Option<U256> {
-    (is_gnosis_chain(chain_id) || is_arc_chain(chain_id)).then_some(U256::from(USD_PRICE_SCALE))
+    (is_gnosis_chain(chain_id) || is_arc_chain(chain_id) || chain_id == STABLE_CHAIN_ID)
+        .then_some(U256::from(USD_PRICE_SCALE))
 }
 
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.

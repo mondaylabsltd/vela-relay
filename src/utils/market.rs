@@ -52,7 +52,7 @@ fn valid_positive_decimal(value: &str) -> bool {
 mod tests {
     use super::valid_positive_decimal;
     use vela_relay_core::settlement::{
-        ARC_CHAIN_ID, ARC_TESTNET_CHAIN_ID, GNOSIS_CHAIN_ID, is_gnosis_chain,
+        ARC_CHAIN_ID, ARC_TESTNET_CHAIN_ID, GNOSIS_CHAIN_ID, STABLE_CHAIN_ID, is_gnosis_chain,
         pegged_native_usd_price,
     };
 
@@ -77,7 +77,7 @@ mod tests {
     /// what decides a value the protocol defines.
     #[test]
     fn prices_every_dollar_native_chain_without_the_market() {
-        for chain_id in [GNOSIS_CHAIN_ID, ARC_CHAIN_ID, ARC_TESTNET_CHAIN_ID] {
+        for chain_id in [GNOSIS_CHAIN_ID, ARC_CHAIN_ID, ARC_TESTNET_CHAIN_ID, STABLE_CHAIN_ID] {
             assert!(
                 pegged_native_usd_price(chain_id).is_some(),
                 "chain {chain_id} must be pegged, not quoted"
