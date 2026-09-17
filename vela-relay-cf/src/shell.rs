@@ -5,9 +5,35 @@ use worker::{Context, Env, MessageBatch, MessageExt, Request, Response, Result, 
 
 use crate::proto::{ItemResolutionWire, LaneCommand, LaneReply};
 
+/// Permissive CORS, matching the docker shell's `CorsLayer::permissive()`.
+///
+/// Not cosmetic: the wallet is a BROWSER app and every call it makes to this
+/// relay is cross-origin. Without these headers the browser refuses the
+/// response before any code sees it, so the relay looks unreachable from the
+/// web shell while `curl` and the native shells — neither of which enforces
+/// CORS — see a perfectly healthy service. Found exactly that way, in a real
+/// browser, during the Arc integration (vela-wallet spec 060).
+fn with_cors(response: Response) -> Result<Response> {
+    let headers = response.headers().clone();
+    headers.set("access-control-allow-origin", "*")?;
+    headers.set(
+        "access-control-allow-methods",
+        "GET, POST, OPTIONS, HEAD, PUT, PATCH, DELETE",
+    )?;
+    headers.set("access-control-allow-headers", "*")?;
+    headers.set("access-control-expose-headers", "*")?;
+    headers.set("access-control-max-age", "86400")?;
+    Ok(response.with_headers(headers))
+}
+
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    crate::http::handle(req, env).await
+    // The preflight never reaches the router: it carries no body and asks only
+    // whether the real call is allowed.
+    if req.method() == worker::Method::Options {
+        return with_cors(Response::empty()?.with_status(204));
+    }
+    with_cors(crate::http::handle(req, env).await?)
 }
 
 /// The queue consumer: groups a delivered batch by (chainId, lane) — pure

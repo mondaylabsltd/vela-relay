@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{app::AppState, utils::rpc};
 
-const NATIVE_TREASURY_FLOOR: &str = "0x5af3107a4000";
+use vela_relay_core::treasury::{NATIVE_TREASURY_FLOOR, quantity_is_below};
 
 #[derive(Serialize)]
 struct TreasuryAddress {
@@ -102,19 +102,10 @@ pub async fn status(
         .into_response()
 }
 
+/// The JSON hop only; the grammar itself is the core's, shared with the
+/// Cloudflare shell so both report the same floor (`treasury::parse_quantity`).
 fn parse_quantity(value: &Value) -> Result<String, ()> {
-    let value = value.as_str().ok_or(())?;
-    let digits = value.strip_prefix("0x").ok_or(())?;
-    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| format!("0x{}", digits.to_ascii_lowercase()))
-        .ok_or(())
-}
-
-fn quantity_is_below(value: &str, floor: &str) -> bool {
-    let value = value[2..].trim_start_matches('0');
-    let floor = floor[2..].trim_start_matches('0');
-
-    value.len() < floor.len() || (value.len() == floor.len() && value < floor)
+    vela_relay_core::treasury::parse_quantity(value.as_str().ok_or(())?)
 }
 
 fn error(status: StatusCode, message: &'static str) -> Response {
