@@ -3,6 +3,7 @@
 //! `vela_relay_core::wire` — the same bytes as the docker shell.
 
 use serde_json::{Value, json};
+use vela_relay_core::account;
 use vela_relay_core::admission::SUPPORTED_ENTRY_POINTS;
 use vela_relay_core::wire::{
     self, GetUserOperationByHashParams, GetUserOperationReceiptParams,
@@ -38,12 +39,174 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             Ok(response.with_headers(headers))
         }
         (worker::Method::Get, "/healthz") => Ok(Response::empty()?.with_status(204)),
+        // The treasury surface, at parity with the docker shell. Load-bearing
+        // for the WALLET, not for operators: it asks before anyone signs, and
+        // a relay that cannot pay gas on a chain has to say so. Without these
+        // routes the probe 404s, the wallet reads "this relay does not serve
+        // the chain", and — worse, when the probe cannot be reached at all —
+        // a person is left watching a spinner for an operation that can never
+        // land (found in a real browser on Arc testnet, spec 060).
+        (worker::Method::Get, "/v1/treasury") => {
+            let Ok(config) = CfConfig::from_env(&env) else {
+                return json_error(500, "configuration error");
+            };
+            match config.settlement_recipient.as_deref() {
+                Some(address) => Response::from_json(&json!({ "address": address })),
+                None => json_error(503, "settlement recipient is not configured"),
+            }
+        }
         (worker::Method::Get, "/readyz") => readiness(&env),
         (worker::Method::Get, "/version") => Response::from_json(&json!({
             "name": "vela-relay",
             "version": env!("CARGO_PKG_VERSION"),
             "build": option_env!("VELA_RELAY_BUILD").unwrap_or("dev"),
         })),
+        (worker::Method::Get, _) if path.starts_with("/v1/treasury/") => {
+            let Some(chain_id) = path
+                .strip_prefix("/v1/treasury/")
+                .and_then(|rest| rest.parse::<u64>().ok())
+            else {
+                return Response::error("not found", 404);
+            };
+            let config = match CfConfig::from_env(&env) {
+                Ok(config) => config,
+                Err(error) => {
+                    worker::console_error!("configuration error: {error}");
+                    return json_error(500, "configuration error");
+                }
+            };
+            let Some(address) = config.settlement_recipient.clone() else {
+                return json_error(503, "settlement recipient is not configured");
+            };
+            let user_rpc_url = req.headers().get(USER_RPC_URL_HEADER).ok().flatten();
+            let balance = crate::arms::rpc::call(
+                &config,
+                &env,
+                chain_id,
+                user_rpc_url.as_deref(),
+                "eth_getBalance",
+                json!([address, "latest"]),
+            )
+            .await;
+            // A balance we could not read is NOT a balance of zero: the wallet
+            // routes 5xx as transient and 404 as "not served", and neither may
+            // be invented out of an unreachable RPC.
+            let Ok(result) = balance else {
+                return json_error(503, "treasury RPC is unavailable");
+            };
+            let Some(balance) = result
+                .value
+                .as_str()
+                .and_then(|value| vela_relay_core::treasury::parse_quantity(value).ok())
+            else {
+                return json_error(503, "treasury RPC returned an invalid balance");
+            };
+            let floor = vela_relay_core::treasury::NATIVE_TREASURY_FLOOR;
+            Response::from_json(&json!({
+                "chainId": chain_id,
+                "address": address,
+                "asset": "native",
+                "balance": balance,
+                "floor": floor,
+                "bootstrapNeeded": vela_relay_core::treasury::quantity_is_below(&balance, floor),
+            }))
+        }
+        // `/v1/account/{chain_id}/{safe}` — the docker shell's account view.
+        // Informational for the wallet (it reads this under a `.catch`), which
+        // is exactly why its absence went unnoticed: the web shell degraded
+        // quietly instead of complaining. Parity matters more than the feature
+        // here — two deployments of one relay must answer the same questions.
+        (worker::Method::Get, _) if path.starts_with("/v1/account/") => {
+            let mut parts = path.trim_start_matches("/v1/account/").split('/');
+            let (Some(chain_id), Some(safe_address), None) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                return Response::error("not found", 404);
+            };
+            let Ok(chain_id) = chain_id.parse::<u64>() else {
+                return Response::error("not found", 404);
+            };
+            let Some(safe_address) = account::normalize_address(safe_address) else {
+                return json_error(400, "invalid safeAddress");
+            };
+            let config = match CfConfig::from_env(&env) {
+                Ok(config) => config,
+                Err(error) => {
+                    worker::console_error!("configuration error: {error}");
+                    return json_error(500, "configuration error");
+                }
+            };
+            let Some(settlement_recipient) = config.settlement_recipient.clone() else {
+                return json_error(503, "settlement recipient is not configured");
+            };
+            let entry_point = SUPPORTED_ENTRY_POINTS[0];
+            let Some(nonce_data) = account::entry_point_nonce_calldata(&safe_address) else {
+                return json_error(400, "invalid safeAddress");
+            };
+            let user_rpc_url = req.headers().get(USER_RPC_URL_HEADER).ok().flatten();
+            let call = async |method: &str, params: serde_json::Value| {
+                crate::arms::rpc::call(
+                    &config,
+                    &env,
+                    chain_id,
+                    user_rpc_url.as_deref(),
+                    method,
+                    params,
+                )
+                .await
+            };
+            // Sequential, not joined: workerd gives one request a single thread
+            // and these are three small reads, so the docker shell's `join!`
+            // buys nothing here.
+            let Ok(balance) = call(
+                "eth_getBalance",
+                json!([settlement_recipient.as_str(), "latest"]),
+            )
+            .await
+            else {
+                return json_error(503, "account RPC is unavailable");
+            };
+            let rpc_used = balance.domain.clone();
+            let Some(balance) = balance
+                .value
+                .as_str()
+                .and_then(|value| vela_relay_core::treasury::parse_quantity(value).ok())
+            else {
+                return json_error(503, "account RPC returned an invalid balance");
+            };
+            let mut nonces = [0u64; 2];
+            for (slot, block_tag) in nonces.iter_mut().zip(["latest", "pending"]) {
+                let Ok(result) = call(
+                    "eth_call",
+                    json!([{ "to": entry_point, "data": nonce_data }, block_tag]),
+                )
+                .await
+                else {
+                    return json_error(503, "account RPC is unavailable");
+                };
+                let Some(nonce) = result
+                    .value
+                    .as_str()
+                    .and_then(|value| account::parse_nonce(value).ok())
+                else {
+                    return json_error(503, "account RPC returned an invalid nonce");
+                };
+                *slot = nonce;
+            }
+            let [latest_nonce, pending_nonce] = nonces;
+            Response::from_json(&json!({
+                "chainId": chain_id,
+                "entryPoint": entry_point,
+                "safeAddress": safe_address,
+                "settlementRecipient": settlement_recipient,
+                "onchainBalance": balance,
+                "spendableBalance": balance,
+                "latestNonce": latest_nonce,
+                "pendingNonce": pending_nonce,
+                "status": account::account_status(&balance, latest_nonce, pending_nonce).as_str(),
+                "rpcUsed": rpc_used,
+            }))
+        }
         (worker::Method::Post, _) => {
             let Some(chain_id) = parse_chain_path(&path) else {
                 return Response::error("not found", 404);
@@ -79,6 +242,12 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         }
         _ => Response::error("not found", 404),
     }
+}
+
+/// The docker shell's error envelope: `{"error": "..."}` with the status the
+/// wallet's probe classifies on.
+fn json_error(status: u16, message: &str) -> Result<Response> {
+    Ok(Response::from_json(&json!({ "error": message }))?.with_status(status))
 }
 
 /// Same envelope flow as the docker shell's `rpc::handle`, over wire fns.

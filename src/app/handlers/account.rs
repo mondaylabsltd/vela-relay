@@ -7,6 +7,10 @@ use axum::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use vela_relay_core::account::{
+    AccountStatus, account_status, entry_point_nonce_calldata, normalize_address,
+};
+
 use crate::{
     app::{AppState, rpc::SUPPORTED_ENTRY_POINTS},
     utils::rpc,
@@ -23,19 +27,9 @@ struct AccountInfo {
     spendable_balance: String,
     latest_nonce: u64,
     pending_nonce: u64,
-    status: AccountStatus,
+    status: &'static str,
     rpc_used: String,
 }
-
-#[derive(Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum AccountStatus {
-    Active,
-    InsufficientBalance,
-    LockedPendingUnknown,
-}
-
-const ENTRY_POINT_NONCE_SELECTOR: &str = "35567e1a";
 
 pub async fn handle(
     State(state): State<AppState>,
@@ -116,7 +110,7 @@ pub async fn handle(
             );
         }
     };
-    let status = account_status(&vault_balance, latest_nonce, pending_nonce);
+    let status = account_status(&vault_balance, latest_nonce, pending_nonce).as_str();
     (
         StatusCode::OK,
         Json(AccountInfo {
@@ -135,43 +129,20 @@ pub async fn handle(
         .into_response()
 }
 
-fn normalize_address(value: &str) -> Option<String> {
-    let valid = value.len() == 42
-        && value.starts_with("0x")
-        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
-    valid.then(|| value.to_ascii_lowercase())
-}
-
+/// The JSON hops only; the grammar and the verdict are the core's
+/// (`vela_relay_core::account`), shared with the Cloudflare shell so a wallet
+/// gets the same answer from either deployment.
 fn parse_quantity(value: &Value) -> Result<String, ()> {
-    let value = value.as_str().ok_or(())?;
-    let digits = value.strip_prefix("0x").ok_or(())?;
-    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| format!("0x{}", digits.to_ascii_lowercase()))
-        .ok_or(())
+    vela_relay_core::treasury::parse_quantity(value.as_str().ok_or(())?)
 }
 
 fn parse_nonce(value: &Value) -> Result<u64, ()> {
-    let quantity = parse_quantity(value)?;
-    u64::from_str_radix(&quantity[2..], 16).map_err(|_| ())
+    vela_relay_core::account::parse_nonce(value.as_str().ok_or(())?)
 }
 
 fn entry_point_nonce_params(entry_point: &str, safe_address: &str, block_tag: &str) -> Value {
-    let address = safe_address
-        .strip_prefix("0x")
-        .expect("Safe address is normalized");
-    let data = format!("0x{ENTRY_POINT_NONCE_SELECTOR}{address:0>64}{:0>64}", "");
-
+    let data = entry_point_nonce_calldata(safe_address).expect("Safe address is normalized");
     json!([{ "to": entry_point, "data": data }, block_tag])
-}
-
-fn account_status(balance: &str, latest_nonce: u64, pending_nonce: u64) -> AccountStatus {
-    if pending_nonce > latest_nonce {
-        AccountStatus::LockedPendingUnknown
-    } else if balance[2..].bytes().all(|byte| byte == b'0') {
-        AccountStatus::InsufficientBalance
-    } else {
-        AccountStatus::Active
-    }
 }
 
 fn error(status: StatusCode, message: &'static str) -> Response {
@@ -182,10 +153,8 @@ fn error(status: StatusCode, message: &'static str) -> Response {
 mod tests {
     use serde_json::json;
 
-    use super::{
-        AccountInfo, AccountStatus, account_status, entry_point_nonce_params, parse_nonce,
-        parse_quantity,
-    };
+    use super::{AccountInfo, account_status, entry_point_nonce_params, parse_nonce, parse_quantity};
+    use vela_relay_core::account::AccountStatus;
 
     #[test]
     fn parses_rpc_quantities_without_losing_the_hex_response_shape() {
@@ -239,7 +208,7 @@ mod tests {
             spendable_balance: "0x2a".into(),
             latest_nonce: 0,
             pending_nonce: 0,
-            status: AccountStatus::Active,
+            status: AccountStatus::Active.as_str(),
             rpc_used: "https://rpc.example".into(),
         })
         .unwrap();

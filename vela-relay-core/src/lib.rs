@@ -39,6 +39,7 @@
 //! clock, randomness, or the environment.
 
 pub mod abi;
+pub mod account;
 pub mod admission;
 pub mod alchemy;
 pub mod alert;
@@ -56,6 +57,7 @@ pub mod settlement;
 pub mod signing;
 pub mod simulation;
 pub mod task;
+pub mod treasury;
 pub mod tempo;
 pub mod vault;
 pub mod wire;
