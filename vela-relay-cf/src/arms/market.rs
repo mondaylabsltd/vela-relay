@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use worker::{Delay, Env, Fetch, Headers, Method, Request, RequestInit};
 
-const RPC_LIST_URL: &str = "https://ethereum-data.awesometools.dev/chains/eip155-";
+const RPC_LIST_URL: &str = "https://ethereum-data.getvela.app/chains/eip155-";
 const METADATA_REQUEST_ATTEMPTS: usize = 3;
 const METADATA_CACHE_TTL_SECS: u64 = 60 * 60;
 const KV_BINDING: &str = "CACHE";

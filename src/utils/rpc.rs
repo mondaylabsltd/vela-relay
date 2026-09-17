@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 pub const USER_RPC_URL_HEADER: &str = "x-vela-rpc-url";
 
-const RPC_LIST_URL: &str = "https://ethereum-data.awesometools.dev/chains/eip155-";
+const RPC_LIST_URL: &str = "https://ethereum-data.getvela.app/chains/eip155-";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -115,7 +115,7 @@ pub async fn call(
     first_result(
         client,
         chain_id,
-        "awesometools",
+        "chain-directory",
         &fallback_urls,
         method,
         &params,
@@ -179,7 +179,7 @@ pub async fn call_simulation(
     match first_simulation_result(
         client,
         chain_id,
-        "awesometools",
+        "chain-directory",
         &fallback_urls,
         method,
         &params,
