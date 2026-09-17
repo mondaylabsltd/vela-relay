@@ -141,6 +141,7 @@ pub const ALCHEMY_NETWORKS: &[AlchemyNetwork] = &[
     AlchemyNetwork::evm("optimism", 10, "https://opt-mainnet.g.alchemy.com/v2/"),
     AlchemyNetwork::evm("pharos", 1672, "https://pharos-mainnet.g.alchemy.com/v2/"),
     AlchemyNetwork::evm("plasma", 9745, "https://plasma-mainnet.g.alchemy.com/v2/"),
+    AlchemyNetwork::evm("plume", 98866, "https://plume-mainnet.g.alchemy.com/v2/"),
     AlchemyNetwork::evm(
         "polygonzkevm",
         1101,
@@ -238,7 +239,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(slugs.len(), ALCHEMY_NETWORKS.len());
-        assert_eq!(ALCHEMY_NETWORKS.len(), 81);
+        assert_eq!(ALCHEMY_NETWORKS.len(), 82);
         assert!(
             ALCHEMY_NETWORKS
                 .iter()
