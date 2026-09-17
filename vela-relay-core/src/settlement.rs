@@ -645,12 +645,26 @@ pub const fn is_gnosis_chain(chain_id: u64) -> bool {
     chain_id == GNOSIS_CHAIN_ID
 }
 
-/// The native/USD price source for a chain. xDAI is defined to be USD-pegged,
-/// which also keeps Gnosis stablecoin settlement and relayer funding
-/// independent of Binance availability; every other chain consults the
-/// market.
+/// Arc mainnet and its testnet: the native gas asset IS USDC.
+pub const ARC_CHAIN_ID: u64 = 5_042;
+pub const ARC_TESTNET_CHAIN_ID: u64 = 5_042_002;
+
+pub const fn is_arc_chain(chain_id: u64) -> bool {
+    chain_id == ARC_CHAIN_ID || chain_id == ARC_TESTNET_CHAIN_ID
+}
+
+/// The native/USD price source for a chain. xDAI is defined to be USD-pegged
+/// and Arc's native coin IS USDC, which also keeps their stablecoin settlement
+/// and relayer funding independent of Binance availability; every other chain
+/// consults the market.
+///
+/// On Arc the peg is load-bearing beyond convenience: the client's fee floor is
+/// "$0.01 worth of the native coin" and it reads the price out of THIS quote.
+/// An unpriced native asset degrades that floor to a blind 0.001-coin fallback
+/// — a tenth of a cent on a dollar coin — so a market outage must not be able
+/// to move what a person is charged on a chain whose coin is the dollar.
 pub fn pegged_native_usd_price(chain_id: u64) -> Option<U256> {
-    is_gnosis_chain(chain_id).then_some(U256::from(USD_PRICE_SCALE))
+    (is_gnosis_chain(chain_id) || is_arc_chain(chain_id)).then_some(U256::from(USD_PRICE_SCALE))
 }
 
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.

@@ -60,6 +60,7 @@ pub const ALCHEMY_NETWORKS: &[AlchemyNetwork] = &[
     ),
     AlchemyNetwork::non_evm("aptos", "https://aptos-mainnet.g.alchemy.com/v2/"),
     AlchemyNetwork::evm("arbitrum", 42161, "https://arb-mainnet.g.alchemy.com/v2/"),
+    AlchemyNetwork::evm("arc", 5042, "https://arc-mainnet.g.alchemy.com/v2/"),
     AlchemyNetwork::evm(
         "arc-testnet",
         5042002,
@@ -237,7 +238,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(slugs.len(), ALCHEMY_NETWORKS.len());
-        assert_eq!(ALCHEMY_NETWORKS.len(), 80);
+        assert_eq!(ALCHEMY_NETWORKS.len(), 81);
         assert!(
             ALCHEMY_NETWORKS
                 .iter()

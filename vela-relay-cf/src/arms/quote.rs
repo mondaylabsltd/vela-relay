@@ -134,10 +134,11 @@ async fn tempo_quote(
     Ok((vec![quote::tempo_quote(recipient, balance)], result.domain))
 }
 
-/// Same policy as the docker `native_usd_price`: Gnosis pegged at one dollar,
+/// Same policy as the docker `native_usd_price`: a chain whose native coin is a
+/// dollar by construction (Gnosis's xDAI, Arc's USDC) is pegged at one dollar,
 /// otherwise Binance with a success/failure cache (KV, timestamps embedded).
 async fn native_usd_price(env: &Env, chain_id: u64, symbol: &str) -> Option<String> {
-    if chain_id == GNOSIS_CHAIN_ID {
+    if vela_relay_core::settlement::pegged_native_usd_price(chain_id).is_some() {
         return Some("1".into());
     }
     let symbol = symbol.trim().to_ascii_uppercase();

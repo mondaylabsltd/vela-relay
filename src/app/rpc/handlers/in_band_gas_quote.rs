@@ -24,7 +24,7 @@ use crate::{
         },
     },
     utils::{
-        market::{binance_usdt_price, is_gnosis_chain},
+        market::binance_usdt_price,
         rpc::{self, PaymentAssets},
         tempo,
     },
@@ -185,9 +185,11 @@ fn parse_address(value: &str, field: &str) -> Result<[u8; 20], RpcError> {
 }
 
 async fn native_usd_price(chain_id: u64, symbol: &str) -> Option<String> {
-    // xDAI is the Gnosis native gas asset and is intentionally USD-pegged. Do not depend on an
-    // exchange ticker for a value that the protocol defines as one dollar.
-    if is_gnosis_chain(chain_id) {
+    // xDAI is the Gnosis native gas asset and is intentionally USD-pegged; on Arc the native gas
+    // asset IS USDC. Do not depend on an exchange ticker for a value the protocol defines as one
+    // dollar — and on Arc the client's "$0.01 worth of the native coin" fee floor reads its price
+    // out of this quote, so a market outage must not be able to move what a person is charged.
+    if vela_relay_core::settlement::pegged_native_usd_price(chain_id).is_some() {
         return Some("1".into());
     }
     let symbol = symbol.trim().to_ascii_uppercase();
