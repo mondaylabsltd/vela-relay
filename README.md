@@ -193,11 +193,13 @@ stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
 Both fields are embedded at compile time by `build_info.rs`, which both shells'
 build scripts share, so a deployment cannot report a release it is not running:
 
-- **`version`** — the release tag. In CI on a tag push it is that tag; otherwise
-  `git describe` names the last tag plus the distance past it
-  (`v0.9.1-3-gabc123def456`), with `-dirty` for uncommitted changes. It is *not*
-  the `Cargo.toml` version, which has read `0.1.0` across every release tagged
-  so far.
+- **`version`** — the release tag. `v0.9.1` means the build *is* that release;
+  `v0.9.1+3` means three commits past it, and `-dirty` is appended when tracked
+  files were modified. It deliberately does not repeat the commit SHA the way
+  `git describe` would (`v0.9.1-3-gabc123`) — the `commit` field beside it
+  already says that, and said it at a different length. It is *not* the
+  `Cargo.toml` version, which has read `0.1.0` across every release tagged so
+  far.
 - **`commit`** — the 12-character commit SHA (the full `GITHUB_SHA` truncated in
   CI, `git rev-parse` otherwise).
 
