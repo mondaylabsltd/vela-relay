@@ -134,6 +134,16 @@ pub struct RoutedUserOperation {
     pub stream: String,
     pub partition_id: u32,
     pub offset: u64,
+    /// The submission speed the client named on `eth_sendUserOperation`, if it
+    /// named one.
+    ///
+    /// It rides the envelope rather than the UserOperation for two reasons:
+    /// the operation's serde shape is `deny_unknown_fields` ERC-4337 wire and
+    /// its bytes are hashed, and the speed is a preference about how the RELAY
+    /// submits, not a term of the operation the user signed. `skip_serializing`
+    /// keeps an untiered envelope byte-identical to the ones already in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_tier: Option<crate::gas_math::SubmissionTier>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

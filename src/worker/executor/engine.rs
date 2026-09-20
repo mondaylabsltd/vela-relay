@@ -1702,6 +1702,23 @@ impl BatchShell<'_> {
                             "repriced the outer transaction to the signed in-band budget"
                         );
                     }
+                    Diagnostic::SubmissionTierCap {
+                        tier,
+                        quoted_fee,
+                        cap,
+                        base_fee,
+                        tip,
+                    } => {
+                        tracing::info!(
+                            chain_id,
+                            tier = tier.as_str(),
+                            quoted_fee,
+                            cap,
+                            base_fee,
+                            tip,
+                            "submitting at the client-requested speed"
+                        );
+                    }
                     Diagnostic::HoldBudgetExhausted {
                         hash,
                         attempt,
@@ -2757,6 +2774,7 @@ fn delayed_operation_from_routed(routed: &RoutedUserOperation) -> DelayedUserOpe
         stream: routed.stream.clone(),
         partition_id: routed.partition_id,
         offset: routed.offset,
+        submission_tier: routed.submission_tier,
     }
 }
 
@@ -2772,6 +2790,7 @@ fn routed_operation_from_delayed(operation: &DelayedUserOperation) -> RoutedUser
         stream: operation.stream.clone(),
         partition_id: operation.partition_id,
         offset: operation.offset,
+        submission_tier: operation.submission_tier,
     }
 }
 

@@ -27,7 +27,7 @@ pub async fn handle(
     config: &CfConfig,
     params: SendUserOperationParams,
 ) -> RpcResponse<Value> {
-    let SendUserOperationParams(user_operation, entry_point) = params;
+    let SendUserOperationParams(user_operation, entry_point, submission_tier) = params;
 
     let core: crux_core::Core<AdmissionApp> = crux_core::Core::new();
     let mut effects = core.process_event(AdmissionEvent::Submit(Box::new(SubmitRequest {
@@ -35,6 +35,7 @@ pub async fn handle(
         entry_point: entry_point.clone(),
         user_operation,
         settlement_recipient: config.settlement_recipient.clone(),
+        submission_tier,
     })));
 
     loop {

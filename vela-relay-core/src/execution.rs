@@ -27,6 +27,7 @@ use crate::{
         NATIVE_TOP_UP_USD_CAP, native_amount_for_usd_cap, native_top_up_reserve,
         plan_native_top_up, plan_tempo_top_up, treasury_affordable_top_up,
     },
+    gas_math::SubmissionTier,
     hold::{HoldDecision, decide_hold},
     receipt::receipt_succeeded,
     settlement::{
@@ -440,6 +441,19 @@ pub enum ExecutionDiagnostic {
         base_fee: u128,
         tip: u128,
     },
+    /// info: "submitting at the client-requested speed"
+    ///
+    /// `cap` is what the tier resolved to after the clamps, so `cap` below
+    /// `tier × base + tip` is the reimbursement or the inclusion floor
+    /// speaking — the one line that explains why a paid-for speed was not
+    /// delivered verbatim.
+    SubmissionTierCap {
+        tier: SubmissionTier,
+        quoted_fee: u128,
+        cap: u128,
+        base_fee: u128,
+        tip: u128,
+    },
     /// warn: "in-band reimbursement stayed unaffordable for the whole hold budget"
     HoldBudgetExhausted {
         hash: String,
@@ -737,6 +751,9 @@ pub struct Candidate {
     pub hash_string: String,
     pub entry_point: Address,
     pub packed: PackedOperation,
+    /// The submission speed this operation's client named, carried over from
+    /// its queue envelope.
+    pub submission_tier: Option<SubmissionTier>,
 }
 
 pub fn candidate_from_record(
@@ -774,7 +791,35 @@ pub fn candidate_from_record(
         hash_string: routed.user_operation_hash.to_ascii_lowercase(),
         entry_point,
         packed,
+        submission_tier: routed.submission_tier,
     })
+}
+
+/// The speed one outer transaction submits at, given what its operations asked
+/// for.
+///
+/// `None` — nobody asked — is the guarantee that a bundle of ordinary
+/// operations never touches the tier machinery at all.
+///
+/// Otherwise the bundle takes the FASTEST speed any of its operations named,
+/// and an operation that named none counts as `Standard`, because standard IS
+/// the pace the relay keeps on its own. So a neighbour can never slow an
+/// operation below today's cap, and the operation that paid for speed gets it.
+/// A higher cap costs nothing on the chain — it charges `base + tip` whatever
+/// the cap says — and the settlement clamp downstream still holds the cap to
+/// what the WEAKEST payer in the bundle funds, so a fast neighbour can never
+/// price a slow one out of its own transaction.
+pub fn bundle_submission_tier(candidates: &[Candidate]) -> Option<SubmissionTier> {
+    candidates
+        .iter()
+        .any(|candidate| candidate.submission_tier.is_some())
+        .then(|| {
+            candidates
+                .iter()
+                .map(|candidate| candidate.submission_tier.unwrap_or_default())
+                .max()
+                .unwrap_or_default()
+        })
 }
 
 /// Whether the queue envelope still matches the admitted record.
@@ -1386,12 +1431,43 @@ async fn execute_with_lane_lease(
     } else {
         None
     };
-    let fees = FeeContext {
+    let mut fees = FeeContext {
         quoted_fee_per_gas: context.max_fee_per_gas,
         base_fee_per_gas: context.base_fee_per_gas,
         max_priority_fee_per_gas: context.max_priority_fee_per_gas,
         inclusion_floor_bps: policy.settlement_inclusion_floor_bps,
+        requested_tier: bundle_submission_tier(&survivors),
     };
+    // A client may name how fast it wants its operation in. Resolving the name
+    // here, against the base fee the shell just read, is what makes a stale
+    // quote harmless: the client never names a price, only a speed. When it
+    // named nothing this returns `None` and the fee below is the one the
+    // executor has always used.
+    if let Some(tier) = fees.requested_tier
+        && let Some(cap) = crate::settlement::decide_submission_cap(
+            treasury,
+            &chain_assets.assets,
+            &call_datas,
+            &allocations,
+            native_usd_price,
+            &fees,
+        )
+        .map_err(|error| error.to_string())?
+    {
+        emit_diagnostic(
+            ctx,
+            ExecutionDiagnostic::SubmissionTierCap {
+                tier,
+                quoted_fee: fees.quoted_fee_per_gas,
+                cap,
+                base_fee: fees.base_fee_per_gas,
+                tip: fees.max_priority_fee_per_gas,
+            },
+        )
+        .await;
+        fees.quoted_fee_per_gas = cap;
+        context.max_fee_per_gas = cap;
+    }
     let settlement = match decide_settlement(
         treasury,
         &chain_assets.assets,
@@ -2851,10 +2927,11 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        BroadcastReply, BundleSimVerdict, BundleSimulationData, DeferCause, ExecutionApp,
-        ExecutionDiagnostic, ExecutionEvent, ExecutionOperation, ExecutionOutcome, ExecutionPolicy,
-        ItemResolution, OperationSimVerdict, ResolvedChainAssets, SignedBundle, StartBatch,
-        TransactionContext,
+        BroadcastReply, BundleSimVerdict, BundleSimulationData, Candidate, DeferCause,
+        ExecutionApp, ExecutionDiagnostic, ExecutionEvent, ExecutionOperation, ExecutionOutcome,
+        ExecutionPolicy, ItemResolution, OperationSimVerdict, ResolvedChainAssets, SignedBundle,
+        StartBatch, SubmissionTier, TransactionContext, bundle_submission_tier,
+        candidate_from_record,
     };
     use crate::{
         abi::{PackedOperation, user_operation_hash},
@@ -3029,6 +3106,12 @@ mod tests {
         fixture_with_nonce(paid, "0x0")
     }
 
+    fn fixture_at(paid: u128, tier: SubmissionTier) -> Fixture {
+        let mut fixture = fixture_with_nonce(paid, "0x0");
+        fixture.routed.submission_tier = Some(tier);
+        fixture
+    }
+
     fn fixture_with_nonce(paid: u128, nonce: &str) -> Fixture {
         let operation = UserOperation::V0_7(Box::new(user_op_with_nonce(paid, nonce)));
         let packed = PackedOperation::try_from(&operation).expect("fixture packs");
@@ -3048,6 +3131,7 @@ mod tests {
             stream: "chain-42161".into(),
             partition_id: 1,
             offset: 7,
+            submission_tier: None,
         };
         let record = StoredUserOperation {
             status: UserOperationStatus::Queued,
@@ -3250,6 +3334,223 @@ mod tests {
             ExecutionOutcome::Indexed { indexed: 1 },
         );
         driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_client_named_speed_signs_above_the_pace_the_relay_keeps_on_its_own() {
+        // The same batch as the test above, but the client asked for `fast`
+        // and paid 420 instead of 280. Base fee 1, tip 0: the relay's own cap
+        // is 2 and `fast` asks for 3×1 = 3, which 420 funds exactly
+        // (300 gas cost × 1.4 = 420). So the outer transaction is signed at 3
+        // — strictly faster than the 2 the untiered twin signs at, which is
+        // the whole point of the feature and the direction a reported-tier
+        // price would have got wrong.
+        let fixture = fixture_at(420, SubmissionTier::Fast);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
+
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata: calldata.clone(),
+            },
+            ExecutionOutcome::Context { context: context() },
+        );
+        // The one line an operator can read the decision off: the speed asked
+        // for, the cap the relay would have used, and what it resolved to.
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::SubmissionTierCap {
+                    tier: SubmissionTier::Fast,
+                    quoted_fee: 2,
+                    cap: 3,
+                    base_fee: 1,
+                    tip: 0,
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let signed_raw = [0x02u8, 0x01, 0x02, 0x03];
+        let signed_hash = alloy::primitives::keccak256(signed_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 100,
+                    // 3, not the 2 the untiered pipeline signs at.
+                    max_fee_per_gas: 3,
+                    max_priority_fee_per_gas: 0,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x02010203".into(),
+                    transaction_hash: signed_hash.clone(),
+                    nonce: 7,
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: CHAIN_ID,
+            lane: fixture.routed.lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: "0x02010203".into(),
+            transaction_hash: signed_hash.clone(),
+            nonce: 7,
+            user_operation_hashes: vec![fixture.hash_string.clone()],
+        };
+        driver.step(
+            ExecutionOperation::SavePreparedBundle {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: signed_raw.to_vec(),
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: signed_hash.to_ascii_uppercase(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::MarkBundleSubmitted {
+                intent,
+                gas_limit: 100,
+            },
+            ExecutionOutcome::Indexed { indexed: 1 },
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_bundle_takes_the_fastest_speed_asked_for_and_nothing_when_none_was() {
+        // Nobody asked: the tier machinery never runs, which is the structural
+        // form of "an existing client is untouched".
+        let none = [fixture(280), fixture(280)];
+        let candidates = |fixtures: &[Fixture]| -> Vec<Candidate> {
+            fixtures
+                .iter()
+                .enumerate()
+                .map(|(index, fixture)| {
+                    candidate_from_record(index, &fixture.routed, &fixture.record, 10)
+                        .expect("fixture is a valid candidate")
+                })
+                .collect()
+        };
+        assert_eq!(bundle_submission_tier(&candidates(&none)), None);
+
+        // One op asked for `fast`, its neighbour asked for nothing. An
+        // operation that named no speed already submits at `standard`, so the
+        // bundle takes `fast` and neither op is worse off than it was alone.
+        let mixed = [fixture_at(420, SubmissionTier::Fast), fixture(280)];
+        assert_eq!(
+            bundle_submission_tier(&candidates(&mixed)),
+            Some(SubmissionTier::Fast)
+        );
+
+        // All three named, slowest first: the bundle is one transaction at one
+        // price, and it takes the fastest speed anybody paid for.
+        let named = [
+            fixture_at(420, SubmissionTier::Slow),
+            fixture_at(420, SubmissionTier::Standard),
+        ];
+        assert_eq!(
+            bundle_submission_tier(&candidates(&named)),
+            Some(SubmissionTier::Standard)
+        );
+
+        // And a lone `slow` really does ask for slow — the unnamed-is-standard
+        // rule must not quietly promote it.
+        let slow = [fixture_at(420, SubmissionTier::Slow)];
+        assert_eq!(
+            bundle_submission_tier(&candidates(&slow)),
+            Some(SubmissionTier::Slow)
+        );
     }
 
     #[test]
@@ -3671,6 +3972,7 @@ mod tests {
             stream: "chain-4217".into(),
             partition_id: 1,
             offset: 7,
+            submission_tier: None,
         };
         let record = StoredUserOperation {
             status: UserOperationStatus::Queued,

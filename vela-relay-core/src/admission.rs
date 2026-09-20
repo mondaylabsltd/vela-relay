@@ -141,6 +141,11 @@ pub struct SubmitRequest {
     pub entry_point: String,
     pub user_operation: UserOperation,
     pub settlement_recipient: Option<String>,
+    /// The submission speed named by the optional third RPC parameter. It is
+    /// not part of what the user signed, so it never touches the userOpHash,
+    /// the admission fingerprint or the durable record — it rides the queue
+    /// envelope to the executor, which is the only thing that acts on it.
+    pub submission_tier: Option<crate::gas_math::SubmissionTier>,
 }
 
 #[derive(Default)]
@@ -201,6 +206,7 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
         entry_point,
         user_operation,
         settlement_recipient,
+        submission_tier,
     } = submit;
 
     if !entry_point_is_supported(&entry_point) {
@@ -273,13 +279,19 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
         }
     }
 
-    let envelope = json!({
+    let mut envelope = json!({
         "schemaVersion": 1,
         "userOperationHash": user_operation_hash,
         "chainId": chain_id,
         "entryPoint": entry_point,
         "userOperation": prepared.operation,
     });
+    // Only a named speed adds a key. An envelope from a client that named none
+    // is byte-for-byte the envelope this relay has always appended, so nothing
+    // already in the queue — or any consumer reading it — changes shape.
+    if let Some(tier) = submission_tier {
+        envelope["submissionTier"] = Value::String(tier.as_str().to_owned());
+    }
     match request(ctx, AdmissionOperation::Enqueue { envelope, retry }).await {
         AdmissionResult::Enqueued => {}
         // A timeout or transport error can happen after Iggy durably appended
@@ -1060,11 +1072,19 @@ mod tests {
     }
 
     fn submit(operation: UserOperation) -> SubmitRequest {
+        submit_at(operation, None)
+    }
+
+    fn submit_at(
+        operation: UserOperation,
+        submission_tier: Option<crate::gas_math::SubmissionTier>,
+    ) -> SubmitRequest {
         SubmitRequest {
             chain_id: LOCAL_POLICY_CHAIN,
             entry_point: ENTRY_POINT.into(),
             user_operation: operation,
             settlement_recipient: Some(RECIPIENT.into()),
+            submission_tier,
         }
     }
 
@@ -1109,6 +1129,61 @@ mod tests {
                     "chainId": LOCAL_POLICY_CHAIN,
                     "entryPoint": ENTRY_POINT,
                     "userOperation": operation,
+                }),
+                retry: false,
+            },
+            AdmissionResult::Enqueued,
+        );
+        driver.step(
+            AdmissionOperation::MarkAdmitted { hash: hash.clone() },
+            AdmissionResult::Marked { marked: true },
+        );
+        driver.assert_settled(AdmissionOutcome::Accepted {
+            user_operation_hash: hash,
+            sender_hex: "0x1111111111111111111111111111111111111111".into(),
+            entry_point: ENTRY_POINT.into(),
+        });
+    }
+
+    #[test]
+    fn a_named_speed_rides_the_envelope_without_touching_what_the_user_signed() {
+        use crate::gas_math::SubmissionTier;
+        let operation = paying_operation(10_000_000_000_000);
+        // The same operation, so the same hash: naming a speed is a request
+        // about how the RELAY submits, not a term of what the user signed, and
+        // it must never move the userOpHash or the durable record.
+        let hash = expected_hash(&operation);
+        let mut driver = Driver::submit(submit_at(operation.clone(), Some(SubmissionTier::Fast)));
+
+        driver.step(
+            AdmissionOperation::LoadSettlementAssets,
+            AdmissionResult::Assets {
+                native_decimals: 18,
+                stablecoins: Vec::new(),
+            },
+        );
+        driver.step(
+            AdmissionOperation::CreateQueued {
+                operation: QueuedUserOperation {
+                    user_operation_hash: hash.clone(),
+                    chain_id: LOCAL_POLICY_CHAIN,
+                    entry_point: ENTRY_POINT.into(),
+                    user_operation: operation.clone(),
+                },
+            },
+            AdmissionResult::Created { created: true },
+        );
+        // One extra key, and only when a speed was named — the untiered
+        // envelope pinned by the test above stays byte-for-byte what it was.
+        driver.step(
+            AdmissionOperation::Enqueue {
+                envelope: json!({
+                    "schemaVersion": 1,
+                    "userOperationHash": hash,
+                    "chainId": LOCAL_POLICY_CHAIN,
+                    "entryPoint": ENTRY_POINT,
+                    "userOperation": operation,
+                    "submissionTier": "fast",
                 }),
                 retry: false,
             },

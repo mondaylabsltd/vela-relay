@@ -11,6 +11,8 @@ use std::{
 
 use alloy::primitives::{Address, B256, Bytes, U256, address, aliases::U512, keccak256};
 
+use crate::gas_math::SubmissionTier;
+
 /// The diagnostic a held operation carries while it waits. Deliberately distinct from
 /// [`settlement_rejection_reason`] — a wallet polling the status endpoint must be able to tell
 /// "still going, waiting for gas to come down" from "this will never execute".
@@ -151,6 +153,34 @@ pub fn affordable_fee_per_gas(
         .min()?;
     let affordable = quoted_max_fee_per_gas.checked_mul(u128::from(weakest.min(10_000)))? / 10_000;
     (affordable > 0).then_some(affordable)
+}
+
+/// The outer fee cap this bundle's weakest payer actually funds, scaled from a fee its
+/// reimbursements were already evaluated at.
+///
+/// The unclamped sibling of [`affordable_fee_per_gas`]. Repricing may only ever go DOWN from the
+/// fee the relay quoted, so that function pins the ratio at 1.0. Naming a submission speed is the
+/// one case where the answer is allowed to sit ABOVE the reference fee — the client asked to go
+/// faster and already paid `3 × gas × max(C, R)` for the privilege — so this one reports the ratio
+/// as measured.
+///
+/// `None` only for an empty bundle. A bundle that paid nothing reports `0` (a cap the inclusion
+/// floor then lifts and `decide_settlement` rejects), and a ratio so large it overflows the scale
+/// saturates to `u128::MAX` — honest, because the caller only ever `min`s this against a tier cap
+/// bounded by `3 × base + tip`.
+pub fn fundable_fee_per_gas(
+    reference_fee_per_gas: u128,
+    evaluations: &[SettlementEvaluation],
+) -> Option<u128> {
+    let weakest = evaluations
+        .iter()
+        .map(SettlementEvaluation::paid_ratio_bps)
+        .min()?;
+    Some(
+        reference_fee_per_gas
+            .checked_mul(u128::from(weakest))
+            .map_or(u128::MAX, |scaled| scaled / 10_000),
+    )
 }
 
 /// The lowest fee cap worth signing: `floor_bps` of the base fee, plus the tip. Below this the
@@ -744,12 +774,18 @@ pub fn has_stablecoin_payment(
 /// Fee inputs to the settlement verdict, all supplied by the shell.
 #[derive(Clone, Copy, Debug)]
 pub struct FeeContext {
-    /// The quoted cap: `2 × base fee + tip`.
+    /// The cap this attempt signs at. The shell quotes `2 × base fee + tip`;
+    /// when the client named a speed, [`decide_submission_cap`] has already
+    /// replaced it with the resolved tier cap.
     pub quoted_fee_per_gas: u128,
     pub base_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
     /// Basis points of the base fee below which a cap is not worth signing.
     pub inclusion_floor_bps: u64,
+    /// The speed the client named, if it named one. `None` is every client
+    /// that exists today: the relay keeps its own pace and nothing about the
+    /// fee arithmetic changes.
+    pub requested_tier: Option<SubmissionTier>,
 }
 
 /// The settlement verdict for one bundle at the current market.
@@ -794,6 +830,96 @@ impl Display for SettlementDecisionError {
 }
 
 impl std::error::Error for SettlementDecisionError {}
+
+/// The outer-fee cap to sign at when the client named a submission speed.
+///
+/// `Ok(None)` means no speed was named. That is every client in the field
+/// today, and it is a hard guarantee rather than a default: not one line of
+/// the arithmetic below runs, so such an operation reaches
+/// [`decide_settlement`] with exactly the `2 × base fee + tip` cap it has
+/// always reached it with.
+///
+/// When a speed IS named the cap is
+///
+/// ```text
+/// max( min( multiplier[tier] × base + tip ,  what the reimbursements fund ) ,  inclusion floor )
+/// ```
+///
+/// - **The tier picks a base-fee multiplier, not a reported price.** See
+///   [`crate::gas_math::tier_outer_fee`]: the `fast` price this relay reports
+///   over `pimlico_getUserOperationGasPrice` sits *below* the cap it already
+///   submits at, so pricing the cap from the reported tier would make "fast"
+///   the slowest option on every chain with a real base fee.
+/// - **The upper clamp keeps the relay whole.** The signed reimbursement pays
+///   `settlement_markup × gas × cap`; a cap above what it funds would be a
+///   transaction the relay subsidises. It is clamped, never signed at a loss.
+/// - **The lower clamp wins over the upper one.** A cap the chain will not
+///   mine is a rejection dressed as a saving, and the executor has no fee-bump
+///   path to rescue it. So a request below the floor is raised to the floor,
+///   and if the reimbursement cannot fund even that, [`decide_settlement`]
+///   reaches its existing `FloorUnfundable` verdict and refuses cleanly —
+///   which is the honest answer, not a submission.
+///
+/// Rounding slop between the ratio scale here and the ceiling-rounded
+/// requirement is caught downstream: `decide_settlement` re-evaluates at this
+/// exact cap and reprices if a wei is still missing.
+pub fn decide_submission_cap(
+    recipient: Address,
+    chain_assets: &ChainAssetConfig,
+    call_datas: &[&[u8]],
+    allocations: &[U256],
+    native_usd_price: Option<U256>,
+    fees: &FeeContext,
+) -> Result<Option<u128>, SettlementDecisionError> {
+    let Some(tier) = fees.requested_tier else {
+        return Ok(None);
+    };
+    let Some(requested) =
+        crate::gas_math::tier_outer_fee(tier, fees.base_fee_per_gas, fees.max_priority_fee_per_gas)
+    else {
+        // A base fee that overflows a u128 multiply is not a market this relay
+        // can price a speed in. Keep its own pace rather than invent one.
+        return Ok(None);
+    };
+
+    // What the signed reimbursements fund, read once at the fee the shell
+    // quoted. The requirement is linear in the cap, so a single evaluation at
+    // a known fee scales to any other.
+    let costs = allocations
+        .iter()
+        .map(|gas| {
+            crate::cost::native_cost(*gas, fees.quoted_fee_per_gas)
+                .ok_or(SettlementDecisionError::CostOverflow)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let inputs = call_datas
+        .iter()
+        .zip(&costs)
+        .map(|(call_data, cost)| SettlementInput {
+            call_data,
+            gas_native_cost: *cost,
+        })
+        .collect::<Vec<_>>();
+    let evaluation = evaluate_batch(recipient, chain_assets, &inputs, native_usd_price)
+        .map_err(SettlementDecisionError::Evaluation)?;
+
+    let funded = match fundable_fee_per_gas(fees.quoted_fee_per_gas, &evaluation.operations) {
+        Some(fundable) => requested.min(fundable),
+        // An empty bundle funds nothing and asks for nothing.
+        None => requested,
+    };
+    Ok(Some(
+        match inclusion_floor_fee_per_gas(
+            fees.base_fee_per_gas,
+            fees.max_priority_fee_per_gas,
+            fees.inclusion_floor_bps,
+        ) {
+            Some(floor) => funded.max(floor),
+            // The floor itself overflowed; there is nothing to lift the cap to.
+            None => funded,
+        },
+    ))
+}
 
 /// Settles the bundle at a fee the payers can actually fund.
 ///
@@ -979,6 +1105,27 @@ mod tests {
     fn repricing_never_raises_the_quoted_fee() {
         let overpaid = evaluation(10_000, 1_000, None);
         assert_eq!(affordable_fee_per_gas(500, &[overpaid]), Some(500));
+    }
+
+    #[test]
+    fn the_fundable_cap_may_exceed_the_reference_fee_where_repricing_may_not() {
+        // The whole reason the two functions exist side by side: repricing is
+        // a rescue and may only ever go down, while a client that named a
+        // speed has already paid for headroom above the relay's own pace.
+        let overpaid = evaluation(10_000, 1_000, None);
+        assert_eq!(
+            affordable_fee_per_gas(500, std::slice::from_ref(&overpaid)),
+            Some(500)
+        );
+        assert_eq!(fundable_fee_per_gas(500, &[overpaid]), Some(5_000));
+        // The weakest payer still sets it, and paying nothing funds nothing.
+        let nothing = evaluation(0, 1_000, Some(SettlementRejection::InsufficientPayment));
+        assert_eq!(
+            fundable_fee_per_gas(500, &[evaluation(10_000, 1_000, None), nothing]),
+            Some(0)
+        );
+        // Nobody to ask.
+        assert_eq!(fundable_fee_per_gas(500, &[]), None);
     }
 
     #[test]
@@ -1386,8 +1533,8 @@ mod tests {
     // ----- decide_settlement verdict table -----
 
     use super::{
-        FeeContext, SettlementDecision, SettlementDecisionError, decide_settlement,
-        has_stablecoin_payment,
+        FeeContext, SettlementDecision, SettlementDecisionError, SubmissionTier, decide_settlement,
+        decide_submission_cap, fundable_fee_per_gas, has_stablecoin_payment,
     };
 
     fn fees(quoted: u128, base: u128, tip: u128, floor_bps: u64) -> FeeContext {
@@ -1396,6 +1543,20 @@ mod tests {
             base_fee_per_gas: base,
             max_priority_fee_per_gas: tip,
             inclusion_floor_bps: floor_bps,
+            requested_tier: None,
+        }
+    }
+
+    fn fees_at(
+        quoted: u128,
+        base: u128,
+        tip: u128,
+        floor_bps: u64,
+        tier: SubmissionTier,
+    ) -> FeeContext {
+        FeeContext {
+            requested_tier: Some(tier),
+            ..fees(quoted, base, tip, floor_bps)
         }
     }
 
@@ -1512,6 +1673,330 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, SettlementDecisionError::CostOverflow);
         assert_eq!(error.to_string(), "bundle native cost overflow");
+    }
+
+    // ----- decide_submission_cap: the client-named speed -----
+    //
+    // The fixtures below use a 100 wei base fee, a 10 wei tip and 1 gas so the
+    // arithmetic can be read off the page: the relay's own cap is
+    // 2×100 + 10 = 210, and the tiers ask for 160 / 210 / 310.
+
+    const SLOW_CAP: u128 = 160;
+    const STANDARD_CAP: u128 = 210;
+    const FAST_CAP: u128 = 310;
+
+    /// The cap `decide_submission_cap` resolves for one native payer.
+    fn cap_for(paid: u128, fees: &FeeContext) -> Option<u128> {
+        let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(paid))]);
+        decide_submission_cap(
+            RECIPIENT,
+            &native_config(5),
+            &[call_data.as_slice()],
+            &[U256::ONE],
+            None,
+            fees,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn naming_no_speed_leaves_the_relays_own_pace_untouched() {
+        // The backwards-compatibility guarantee, stated where it is decided:
+        // an operation that named no tier gets `None` back, so the executor
+        // never replaces the `2 × base + tip` cap it has always signed at —
+        // whatever the market, and whatever the payment.
+        for (base, tip, paid) in [
+            (100u128, 10u128, 10_000u128),                // generously funded
+            (100, 10, 1),                                 // barely funded
+            (0, 3_000_000_000, 10_000),                   // BSC: no base fee at all
+            (53_500_000, 13_968_750, 25_795_687_500_000), // Ethereum
+        ] {
+            let quoted = crate::gas_math::quoted_outer_fee(base, tip).unwrap();
+            assert_eq!(
+                cap_for(paid, &fees(quoted, base, tip, 15_000)),
+                None,
+                "base={base} tip={tip} paid={paid}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tier_submits_at_its_own_multiple_of_the_base_fee() {
+        // Funded far above any tier, so nothing clamps and the multiplier is
+        // the only thing speaking.
+        for (tier, expected) in [
+            (SubmissionTier::Slow, SLOW_CAP),
+            (SubmissionTier::Standard, STANDARD_CAP),
+            (SubmissionTier::Fast, FAST_CAP),
+        ] {
+            assert_eq!(
+                cap_for(10_000, &fees_at(210, 100, 10, 15_000, tier)),
+                Some(expected),
+                "{tier}"
+            );
+        }
+        // And `standard` lands on exactly the cap the relay quotes itself —
+        // the table's claim that standard IS today's behaviour.
+        assert_eq!(
+            cap_for(
+                10_000,
+                &fees_at(210, 100, 10, 15_000, SubmissionTier::Standard)
+            ),
+            Some(crate::gas_math::quoted_outer_fee(100, 10).unwrap())
+        );
+    }
+
+    #[test]
+    fn slow_lands_exactly_on_the_default_inclusion_floor() {
+        // Both are 1.5× the base fee plus the tip, and both truncate. They
+        // must agree to the wei: if `slow` rounded a step above the floor the
+        // clamp would look like a no-op that silently is not one, and a step
+        // below it would make every `slow` request get lifted.
+        for (base, tip) in [(100u128, 10u128), (53_500_000, 13_968_750), (7, 0), (0, 5)] {
+            assert_eq!(
+                crate::gas_math::tier_outer_fee(SubmissionTier::Slow, base, tip),
+                inclusion_floor_fee_per_gas(base, tip, 15_000),
+                "base={base} tip={tip}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tier_below_the_inclusion_floor_is_raised_to_the_floor_not_refused() {
+        // A 2.5× floor puts `slow`'s 1.5× under water. A price the chain will
+        // not include is a rejection dressed as a saving, so the request is
+        // lifted to the floor and submitted — never refused for being cheap.
+        let cap = cap_for(10_000, &fees_at(210, 100, 10, 25_000, SubmissionTier::Slow));
+        assert_eq!(cap, Some(260));
+        assert!(cap.unwrap() > SLOW_CAP, "the floor must have lifted it");
+
+        // And the lifted cap really is signable: the payment still funds it.
+        let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(10_000u64))]);
+        let decision = decide_settlement(
+            RECIPIENT,
+            &native_config(5),
+            &[paid.as_slice()],
+            &[U256::ONE],
+            None,
+            &fees_at(260, 100, 10, 25_000, SubmissionTier::Slow),
+        )
+        .unwrap();
+        match decision {
+            SettlementDecision::KeepQuote { evaluation } => assert!(evaluation.all_accepted()),
+            other => panic!("expected KeepQuote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tier_the_reimbursement_cannot_fund_is_capped_not_signed_at_a_loss() {
+        // 280 paid funds a 199 cap, not the 310 `fast` asks for: cost 199 ×
+        // 1.4 markup = 279 ≤ 280. The relay buys the speed the client can pay
+        // for and stops there.
+        let cap = cap_for(280, &fees_at(210, 100, 10, 15_000, SubmissionTier::Fast)).unwrap();
+        assert_eq!(cap, 199);
+        assert!(cap < FAST_CAP, "the reimbursement must have clamped it");
+        assert!(cap > 160, "and the floor must not be what clamped it");
+
+        // The proof that it is not a loss: at that exact cap every payer
+        // clears the 1.4× requirement, with no repricing needed.
+        let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(280u64))]);
+        let decision = decide_settlement(
+            RECIPIENT,
+            &native_config(5),
+            &[paid.as_slice()],
+            &[U256::ONE],
+            None,
+            &fees_at(cap, 100, 10, 15_000, SubmissionTier::Fast),
+        )
+        .unwrap();
+        match decision {
+            SettlementDecision::KeepQuote { evaluation } => {
+                assert!(evaluation.all_accepted());
+                assert_eq!(evaluation.operations[0].required_amount, U256::from(279u64));
+            }
+            other => panic!("expected KeepQuote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payment_that_cannot_fund_even_the_floor_is_floored_and_then_refused_cleanly() {
+        // 100 wei funds a 7 wei cap. Naming `fast` cannot conjure money, and
+        // the relay will not sign an unminable 7 wei transaction either: the
+        // cap is lifted to the floor, and the existing settlement gate then
+        // reaches its clean FloorUnfundable refusal. A rejected send, never a
+        // subsidised one.
+        let cap = cap_for(100, &fees_at(210, 100, 10, 15_000, SubmissionTier::Fast)).unwrap();
+        assert_eq!(cap, 160);
+
+        let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(100u64))]);
+        let decision = decide_settlement(
+            RECIPIENT,
+            &native_config(5),
+            &[paid.as_slice()],
+            &[U256::ONE],
+            None,
+            &fees_at(cap, 100, 10, 15_000, SubmissionTier::Fast),
+        )
+        .unwrap();
+        match decision {
+            SettlementDecision::FloorUnfundable {
+                affordable, floor, ..
+            } => {
+                assert!(affordable < floor, "affordable={affordable} floor={floor}");
+                assert_eq!(floor, 160);
+            }
+            other => panic!("expected FloorUnfundable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_weakest_payer_in_a_bundle_caps_the_speed_its_neighbour_asked_for() {
+        // One op funds `fast` easily, the other funds only 199. The bundle is
+        // one transaction at one price, so the poorer payer sets it — a fast
+        // neighbour can never price a slower one out of its own bundle.
+        let rich = safe_multisend(&[Entry::native(RECIPIENT, U256::from(10_000u64))]);
+        let poor = safe_multisend(&[Entry::native(RECIPIENT, U256::from(280u64))]);
+        let cap = decide_submission_cap(
+            RECIPIENT,
+            &native_config(5),
+            &[rich.as_slice(), poor.as_slice()],
+            &[U256::ONE, U256::ONE],
+            None,
+            &fees_at(210, 100, 10, 15_000, SubmissionTier::Fast),
+        )
+        .unwrap();
+        assert_eq!(cap, Some(199));
+    }
+
+    #[test]
+    fn a_chain_with_no_base_fee_prices_every_tier_at_the_tip() {
+        // BSC: `baseFeePerGas` is 0 and the whole price is the tip, so there
+        // is nothing for a multiplier to act on and all three tiers coincide
+        // with today's cap. This is exactly the chain that would HIDE a
+        // reported-price mistake, which is why it is pinned separately from
+        // the Ethereum case below rather than standing in for it.
+        let tip = 3_000_000_000u128;
+        let quoted = crate::gas_math::quoted_outer_fee(0, tip).unwrap();
+        assert_eq!(quoted, tip);
+        for tier in [
+            SubmissionTier::Slow,
+            SubmissionTier::Standard,
+            SubmissionTier::Fast,
+        ] {
+            assert_eq!(
+                cap_for(100_000_000_000, &fees_at(quoted, 0, tip, 15_000, tier)),
+                Some(tip),
+                "{tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tier_fits_inside_the_headroom_a_normal_client_payment_leaves() {
+        // The property that keeps the feature honest, measured against the
+        // real Ethereum market of 2026-09-20 (base 0.0535 gwei).
+        //
+        // The client pays `3 × gas × R` where R is the quote tier it priced
+        // against; the relay requires `1.4 × gas × cap`. So the highest cap a
+        // payment funds is `3/1.4 = 2.142857 × R`. This test walks each tier
+        // through the relay's OWN quote code and then through
+        // `decide_submission_cap`, and asserts that nothing clamps: no tier
+        // needs the relay to subsidise it, and none is repriced down.
+        use crate::gas_math::{
+            FeeHistory, GasPricePolicy, price_from_fee_history, tier_outer_fee, tiers,
+        };
+
+        let base = 53_500_000u128; // 0.0535 gwei
+        let tip = 13_968_750u128;
+        let gas = 100_000u128;
+        let quoted = crate::gas_math::quoted_outer_fee(base, tip).unwrap();
+
+        let fee_history: FeeHistory = serde_json::from_value(serde_json::json!({
+            "baseFeePerGas": [format!("0x{base:x}")],
+            "reward": [[format!("0x{tip:x}")]],
+        }))
+        .unwrap();
+        let network = price_from_fee_history(&fee_history, 120, tip).unwrap();
+        let reported = tiers(&GasPricePolicy::default(), network).unwrap();
+
+        // The trap this feature exists to avoid, pinned as a fact: the price
+        // the relay REPORTS for `fast` sits BELOW the cap it already submits
+        // at. Submitting at the reported price would make "fast" the slowest
+        // option on this chain.
+        assert_eq!(reported.fast.max_fee_per_gas, 93_802_500);
+        assert_eq!(quoted, 120_968_750);
+        assert!(reported.fast.max_fee_per_gas < quoted);
+        assert!(tier_outer_fee(SubmissionTier::Fast, base, tip).unwrap() > quoted);
+
+        // 3.13 / 3.44 / 3.76 × base: the headroom each tier's client payment
+        // leaves, in hundredths of the base fee so the expectation is exact.
+        for (tier, reported_price, headroom_centibase) in [
+            (SubmissionTier::Slow, reported.slow, 313u128),
+            (SubmissionTier::Standard, reported.standard, 344),
+            (SubmissionTier::Fast, reported.fast, 376),
+        ] {
+            let payment = 3 * gas * reported_price.max_fee_per_gas;
+            let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(payment))]);
+            let config = native_config(18);
+
+            let funded = fundable_fee_per_gas(
+                quoted,
+                &evaluate_batch(
+                    RECIPIENT,
+                    &config,
+                    &[SettlementInput {
+                        call_data: &call_data,
+                        gas_native_cost: crate::cost::native_cost(U256::from(gas), quoted).unwrap(),
+                    }],
+                    None,
+                )
+                .unwrap()
+                .operations,
+            )
+            .unwrap();
+            assert_eq!(
+                (funded * 100 + base / 2) / base,
+                headroom_centibase,
+                "{tier} headroom: {funded} wei against a {base} wei base fee"
+            );
+
+            // Nothing clamps: the cap is the tier's multiplier, verbatim.
+            let requested = tier_outer_fee(tier, base, tip).unwrap();
+            assert!(
+                requested < funded,
+                "{tier}: {requested} must fit in {funded}"
+            );
+            assert_eq!(
+                decide_submission_cap(
+                    RECIPIENT,
+                    &config,
+                    &[call_data.as_slice()],
+                    &[U256::from(gas)],
+                    None,
+                    &fees_at(quoted, base, tip, 15_000, tier),
+                )
+                .unwrap(),
+                Some(requested),
+                "{tier}"
+            );
+
+            // And settling at that cap needs no repricing and takes no loss.
+            match decide_settlement(
+                RECIPIENT,
+                &config,
+                &[call_data.as_slice()],
+                &[U256::from(gas)],
+                None,
+                &fees_at(requested, base, tip, 15_000, tier),
+            )
+            .unwrap()
+            {
+                SettlementDecision::KeepQuote { evaluation } => {
+                    assert!(evaluation.all_accepted(), "{tier}");
+                }
+                other => panic!("expected KeepQuote for {tier}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
