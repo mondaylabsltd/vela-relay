@@ -48,15 +48,53 @@ fn emit_build_info(repo_root: &str) {
     //
     // On a CI tag push `GITHUB_REF_NAME` is the tag itself, which is also the
     // only thing that works there — `actions/checkout` fetches too shallowly
-    // for `git describe` to see any tag. Otherwise `git describe` names the
-    // last release plus how far past it this build sits (`v0.9.1-3-gabc123`,
-    // `-dirty` for uncommitted changes), so a hand-rolled build can never
-    // silently claim to BE the release.
+    // for `git describe` to see any tag.
     let release = env_var("GITHUB_REF_NAME")
         .filter(|name| name.starts_with('v'))
-        .or_else(|| git(repo_root, &["describe", "--tags", "--always", "--dirty"]))
-        .unwrap_or_else(|| "unknown".into());
+        .unwrap_or_else(|| describe_release(repo_root));
     println!("cargo:rustc-env=VELA_RELAY_RELEASE={release}");
+}
+
+/// How this build relates to the last release tag: `v0.9.1` when it IS that
+/// release, `v0.9.1+2` two commits past it, `-dirty` appended for uncommitted
+/// changes. A build past a tag can therefore never silently claim to BE it.
+///
+/// Deliberately NOT `git describe`'s own string. That reads `v0.9.1-2-gf54d862`
+/// — the commit again, abbreviated to a different length than the `commit`
+/// field beside it, behind a `g` that only means "this is a git hash". One
+/// response should not state the same commit twice in two spellings; the
+/// distance is the only thing here the SHA does not already say.
+fn describe_release(repo_root: &str) -> String {
+    // `--abbrev=0` yields the bare nearest tag with no suffix.
+    let Some(tag) = git(repo_root, &["describe", "--tags", "--abbrev=0"]) else {
+        // No tag reachable at all (a shallow clone, or before the first
+        // release). The commit is already reported on its own.
+        return "unknown".into();
+    };
+
+    // Measured against HEAD, which is the tree cargo is building. Counting
+    // from `GITHUB_SHA` instead could name a commit a shallow clone does not
+    // contain, and a failure there would read as distance 0 — the build
+    // claiming to BE the release, which is the one answer that must never be
+    // guessed. So an uncountable distance says so out loud.
+    let Some(distance) = git(repo_root, &["rev-list", "--count", &format!("{tag}..HEAD")])
+        .and_then(|count| count.parse::<u32>().ok())
+    else {
+        return format!("{tag}+unknown");
+    };
+    // Any tracked-file change, staged or not. Untracked files are ignored:
+    // they are not in the build.
+    let dirty = git(repo_root, &["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|status| !status.is_empty());
+
+    let mut release = tag;
+    if distance > 0 {
+        release.push_str(&format!("+{distance}"));
+    }
+    if dirty {
+        release.push_str("-dirty");
+    }
+    release
 }
 
 fn env_var(key: &str) -> Option<String> {
