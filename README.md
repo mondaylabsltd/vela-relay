@@ -180,7 +180,29 @@ stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
 | `GET /healthz` | Liveness check; returns `204` while the process is alive. |
 | `GET /readyz` | Readiness check; returns `204` after all worker jobs are ready. |
 | `GET /health` | Service health information. |
-| `GET /version` | Version information. |
+| `GET /version` | Release tag and commit of the running build. |
+
+## Build identity
+
+`GET /` and `GET /version` both report which build is running:
+
+```json
+{ "name": "vela-relay", "status": "ok", "version": "v0.9.1", "commit": "0c559650b08d" }
+```
+
+Both fields are embedded at compile time by `build_info.rs`, which both shells'
+build scripts share, so a deployment cannot report a release it is not running:
+
+- **`version`** — the release tag. In CI on a tag push it is that tag; otherwise
+  `git describe` names the last tag plus the distance past it
+  (`v0.9.1-3-gabc123def456`), with `-dirty` for uncommitted changes. It is *not*
+  the `Cargo.toml` version, which has read `0.1.0` across every release tagged
+  so far.
+- **`commit`** — the 12-character commit SHA (the full `GITHUB_SHA` truncated in
+  CI, `git rev-parse` otherwise).
+
+Both read `unknown` when built from a source tree with no `.git` and no CI
+environment.
 
 ## Releases
 

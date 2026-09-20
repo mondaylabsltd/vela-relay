@@ -24,9 +24,15 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     let method = req.method();
 
     match (method, path.as_str()) {
-        (worker::Method::Get, "/") => {
-            Response::from_json(&json!({"name": "vela-relay", "status": "ok"}))
-        }
+        (worker::Method::Get, "/") => Response::from_json(&json!({
+            "name": "vela-relay",
+            "status": "ok",
+            // `/` is the URL an operator already has in hand, so it answers
+            // "what are you running?" without their having to know a second
+            // route exists. Identical fields to the docker shell.
+            "version": env!("VELA_RELAY_RELEASE"),
+            "commit": env!("VELA_RELAY_BUILD_SHA"),
+        })),
         (worker::Method::Get, "/health") | (worker::Method::Get, "/api/health") => {
             // Same shape as the docker shell; the runtime field truthfully
             // names this deployment's runtime (declared delta,
@@ -58,8 +64,12 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (worker::Method::Get, "/readyz") => readiness(&env),
         (worker::Method::Get, "/version") => Response::from_json(&json!({
             "name": "vela-relay",
-            "version": env!("CARGO_PKG_VERSION"),
-            "build": option_env!("VELA_RELAY_BUILD").unwrap_or("dev"),
+            // Both come from `build.rs`. Until it existed this route read an
+            // `option_env!` that nothing ever set and reported `"dev"` on
+            // every deployment, live ones included — the build identity this
+            // route exists to carry was the one thing it could not tell you.
+            "version": env!("VELA_RELAY_RELEASE"),
+            "commit": env!("VELA_RELAY_BUILD_SHA"),
         })),
         (worker::Method::Get, _) if path.starts_with("/v1/treasury/") => {
             let Some(chain_id) = path
