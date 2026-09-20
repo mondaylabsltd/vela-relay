@@ -1957,6 +1957,16 @@ impl LaneDo {
             } => worker::console_log!(
                 "repriced the outer transaction to the signed in-band budget: chain_id={chain_id} quoted_fee={quoted_fee} repriced_fee={repriced_fee} base_fee={base_fee} tip={tip}"
             ),
+            Diagnostic::SubmissionTierCap {
+                tier,
+                quoted_fee,
+                cap,
+                base_fee,
+                tip,
+            } => worker::console_log!(
+                "submitting at the client-requested speed: chain_id={chain_id} tier={} quoted_fee={quoted_fee} cap={cap} base_fee={base_fee} tip={tip}",
+                tier.as_str()
+            ),
             Diagnostic::HoldBudgetExhausted {
                 hash,
                 attempt,

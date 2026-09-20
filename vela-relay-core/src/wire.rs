@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::gas_math::SubmissionTier;
 pub use crate::task::{
     Address, Eip7702Authorization, HexData, Quantity, TransactionHash, UserOperation,
 };
@@ -347,8 +348,21 @@ impl RpcMethodSpec for GetInBandGasQuote {
 
 pub struct NoParams;
 
+/// `[userOperation, entryPoint]`, plus an optional third element naming the
+/// submission speed (`"slow" | "standard" | "fast"`).
+///
+/// The third element is a NAME, never a wei amount: the relay resolves it
+/// against the base fee it reads at submit time, so a quote that went stale
+/// between signing and inclusion can never set the price. Omitting it is the
+/// whole of today's wire and keeps today's behaviour exactly; a name this
+/// relay does not know fails `validate_call` with `invalid params` before any
+/// handler runs, rather than silently becoming a speed nobody asked for.
 #[derive(Debug, Deserialize)]
-pub struct SendUserOperationParams(pub UserOperation, pub Address);
+pub struct SendUserOperationParams(
+    pub UserOperation,
+    pub Address,
+    #[serde(default)] pub Option<SubmissionTier>,
+);
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct EstimateUserOperationGasParams(
@@ -682,6 +696,96 @@ mod tests {
         assert_eq!(
             bytes(&RpcResponse::<Value>::error(json!(2), error)),
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found","data":"eth_chainId"}}"#
+        );
+    }
+
+    /// A minimal, structurally valid in-band v0.7 operation. Only the shape
+    /// matters here: these tests are about the params array around it.
+    fn user_operation() -> Value {
+        json!({
+            "sender": "0x1111111111111111111111111111111111111111",
+            "nonce": "0x0",
+            "factory": null,
+            "factoryData": null,
+            "callData": "0x",
+            "callGasLimit": "0x1",
+            "verificationGasLimit": "0x1",
+            "preVerificationGas": "0x1",
+            "maxFeePerGas": "0x0",
+            "maxPriorityFeePerGas": "0x0",
+            "paymaster": null,
+            "paymasterVerificationGasLimit": null,
+            "paymasterPostOpGasLimit": null,
+            "paymasterData": null,
+            "signature": "0x1234",
+            "eip7702Auth": null
+        })
+    }
+
+    #[test]
+    fn a_send_may_name_a_submission_speed_and_every_client_today_may_omit_it() {
+        use super::{SendUserOperationParams, SubmissionTier};
+        let entry_point = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
+
+        // The wire every client in the field speaks: two elements, no tier.
+        // This must keep working untouched, and must read as "named nothing"
+        // rather than as any default.
+        let params: SendUserOperationParams =
+            serde_json::from_value(json!([user_operation(), entry_point])).unwrap();
+        assert_eq!(params.2, None);
+        assert!(
+            validate_call(
+                "eth_sendUserOperation",
+                json!([user_operation(), entry_point])
+            )
+            .is_ok()
+        );
+
+        // And the new wire: a third element naming the speed.
+        for (name, tier) in [
+            ("slow", SubmissionTier::Slow),
+            ("standard", SubmissionTier::Standard),
+            ("fast", SubmissionTier::Fast),
+        ] {
+            let params: SendUserOperationParams =
+                serde_json::from_value(json!([user_operation(), entry_point, name])).unwrap();
+            assert_eq!(params.2, Some(tier));
+            assert!(
+                validate_call(
+                    "eth_sendUserOperation",
+                    json!([user_operation(), entry_point, name])
+                )
+                .is_ok(),
+                "{name}"
+            );
+        }
+        // An explicit null is "named nothing", not a parse failure.
+        let params: SendUserOperationParams =
+            serde_json::from_value(json!([user_operation(), entry_point, null])).unwrap();
+        assert_eq!(params.2, None);
+    }
+
+    #[test]
+    fn refuses_a_submission_speed_this_relay_does_not_know() {
+        // A name the relay cannot price must fail the request before any
+        // handler runs — never fall back to a speed nobody asked for, and
+        // never let the client name a wei amount instead of a speed.
+        let entry_point = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
+        let error = validate_call(
+            "eth_sendUserOperation",
+            json!([user_operation(), entry_point, "turbo"]),
+        )
+        .expect_err("unknown tier");
+        assert_eq!(
+            bytes(&RpcResponse::<Value>::error(json!(9), error)),
+            r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32602,"message":"invalid params","data":"unknown variant `turbo`, expected one of `slow`, `standard`, `fast`"}}"#
+        );
+        assert!(
+            validate_call(
+                "eth_sendUserOperation",
+                json!([user_operation(), entry_point, 1_000_000_000u64]),
+            )
+            .is_err()
         );
     }
 

@@ -128,6 +128,96 @@ pub fn quoted_outer_fee(base_fee_per_gas: u128, max_priority_fee_per_gas: u128) 
         .checked_add(max_priority_fee_per_gas)
 }
 
+/// The submission speed a client may name on `eth_sendUserOperation`.
+///
+/// The client names the TIER, never a wei amount. A quote that went stale
+/// between signing and inclusion therefore cannot mis-set the price: the relay
+/// resolves the name against the base fee it reads at submit time, so the
+/// worst a stale quote can do is buy a speed the reimbursement no longer funds
+/// — which [`crate::settlement::decide_submission_cap`] then clamps away.
+///
+/// Ordered `Slow < Standard < Fast` so a bundle can submit at the fastest
+/// speed any of its operations asked for.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmissionTier {
+    Slow,
+    /// The pace the relay keeps on its own, which is why it is the default:
+    /// resolving `Standard` reproduces [`quoted_outer_fee`] exactly.
+    #[default]
+    Standard,
+    Fast,
+}
+
+impl SubmissionTier {
+    /// Basis points of the base fee this tier caps the outer transaction at.
+    ///
+    /// These multiply the BASE FEE for the submit cap. They are deliberately
+    /// unrelated to the `slow`/`standard`/`fast` prices reported by
+    /// `pimlico_getUserOperationGasPrice` (~1.0/1.1/1.2 × a ~1.2 × base
+    /// network price): that quote tells the CLIENT what to pay, this
+    /// multiplier tells the chain how badly the relay wants the block.
+    pub const fn base_fee_bps(self) -> u64 {
+        match self {
+            Self::Slow => 15_000,
+            Self::Standard => 20_000,
+            Self::Fast => 30_000,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+impl Display for SubmissionTier {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The outer-fee cap a named speed asks for: `multiplier × base fee + tip`.
+///
+/// **This is not the reported tier price, and confusing the two inverts the
+/// feature.** The relay reports `fast` at ~1.2 × base — measured 0.0938 gwei
+/// against a 0.0535 gwei Ethereum base fee on 2026-09-20 — while its submit
+/// cap is already `2 × base` = 0.1070 gwei. Submitting at the reported `fast`
+/// price would therefore make a "fast" send *slower* than today's default on
+/// every EIP-1559 chain. (BSC hides the mistake: its `baseFeePerGas` is 0 and
+/// the whole price is the tip, so the two numbers coincide there — never
+/// validate this on BSC alone.)
+///
+/// A higher cap is not a higher cost: the chain only ever charges
+/// `base fee + tip`, so the extra multiple is bought only during a spike, and
+/// only up to what the in-band reimbursement funds.
+///
+/// The basis-point scale is applied through a widening multiply so the
+/// intermediate never decides the answer: `Standard` must resolve to exactly
+/// `quoted_outer_fee` for EVERY base fee, or "absent" and "standard" could
+/// disagree about today's behaviour at the edges. Division truncates, matching
+/// `settlement::inclusion_floor_fee_per_gas`, so `Slow` and the default 1.5×
+/// floor land on the same wei rather than a rounding step apart.
+///
+/// `None` on overflow — the caller then keeps the relay's own pace, so an
+/// unpriceable market costs a client its requested speed and nothing else.
+pub fn tier_outer_fee(
+    tier: SubmissionTier,
+    base_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Option<u128> {
+    let scaled = U256::from(base_fee_per_gas).checked_mul(U256::from(tier.base_fee_bps()))?
+        / U256::from(10_000u64);
+    u128::try_from(scaled)
+        .ok()?
+        .checked_add(max_priority_fee_per_gas)
+}
+
 /// The legacy-endpoint tip fallback: `eth_gasPrice − base fee`. `None` when
 /// the gas price is below the base fee (a node inconsistency worth refusing).
 pub fn tip_from_legacy_gas_price(gas_price: U256, base_fee: U256) -> Option<U256> {
@@ -266,6 +356,102 @@ mod tests {
         assert_eq!(
             tip_from_legacy_gas_price(U256::from(90u64), U256::from(100u64)),
             None
+        );
+    }
+
+    #[test]
+    fn the_standard_tier_is_exactly_the_cap_the_relay_already_quoted() {
+        use super::{SubmissionTier, quoted_outer_fee, tier_outer_fee};
+        // The backwards-compatibility anchor: naming `standard` must resolve
+        // to the same wei the executor has always submitted at, so "absent"
+        // and "standard" can never disagree about today's behaviour. Swept
+        // across a real base fee, a zero base fee (BSC) and a bare tip.
+        for (base, tip) in [
+            (53_500_000_000u128, 1_000_000_000u128), // Ethereum, 0.0535 gwei
+            (0, 3_000_000_000),                      // BSC: no base fee at all
+            (1, 0),
+            (u128::MAX / 4, 7), // absurd, but the two must still agree
+            (u128::MAX, 0),     // and agree on refusing, too
+        ] {
+            assert_eq!(
+                tier_outer_fee(SubmissionTier::Standard, base, tip),
+                quoted_outer_fee(base, tip),
+                "base={base} tip={tip}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tier_multiplies_the_base_fee_and_adds_the_whole_tip() {
+        use super::{SubmissionTier, tier_outer_fee};
+        let base = 100_000_000_000u128; // 100 gwei
+        let tip = 3_000_000_000u128; //   3 gwei
+        assert_eq!(
+            tier_outer_fee(SubmissionTier::Slow, base, tip),
+            Some(153_000_000_000)
+        );
+        assert_eq!(
+            tier_outer_fee(SubmissionTier::Standard, base, tip),
+            Some(203_000_000_000)
+        );
+        assert_eq!(
+            tier_outer_fee(SubmissionTier::Fast, base, tip),
+            Some(303_000_000_000)
+        );
+        // On a chain with no base fee (BSC) every tier is the tip: there is
+        // nothing to multiply, and the tip is the whole price.
+        for tier in [
+            SubmissionTier::Slow,
+            SubmissionTier::Standard,
+            SubmissionTier::Fast,
+        ] {
+            assert_eq!(tier_outer_fee(tier, 0, tip), Some(tip));
+        }
+        assert_eq!(tier_outer_fee(SubmissionTier::Fast, u128::MAX, 0), None);
+    }
+
+    #[test]
+    fn a_tier_name_round_trips_and_an_unknown_one_is_refused() {
+        use super::SubmissionTier;
+        for (name, tier) in [
+            ("slow", SubmissionTier::Slow),
+            ("standard", SubmissionTier::Standard),
+            ("fast", SubmissionTier::Fast),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<SubmissionTier>(json!(name)).unwrap(),
+                tier
+            );
+            assert_eq!(serde_json::to_value(tier).unwrap(), json!(name));
+            assert_eq!(tier.as_str(), name);
+            assert_eq!(tier.to_string(), name);
+        }
+        // The refusal a client gets for a name this relay does not know: a
+        // parse failure naming the three it does, never a silent fallback.
+        let error = serde_json::from_value::<SubmissionTier>(json!("turbo")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown variant `turbo`, expected one of `slow`, `standard`, `fast`"
+        );
+        // And a wei amount is not a tier name either — the client may never
+        // name an absolute price.
+        assert!(serde_json::from_value::<SubmissionTier>(json!(1_000)).is_err());
+    }
+
+    #[test]
+    fn tiers_order_from_slow_to_fast_so_a_bundle_can_take_the_fastest() {
+        use super::SubmissionTier;
+        assert!(SubmissionTier::Slow < SubmissionTier::Standard);
+        assert!(SubmissionTier::Standard < SubmissionTier::Fast);
+        assert_eq!(
+            [
+                SubmissionTier::Standard,
+                SubmissionTier::Fast,
+                SubmissionTier::Slow
+            ]
+            .into_iter()
+            .max(),
+            Some(SubmissionTier::Fast)
         );
     }
 

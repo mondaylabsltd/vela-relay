@@ -161,6 +161,16 @@ fn parse_routed(
         .ok_or("UserOperation sender is missing")?
         .to_owned();
     let lane = vela_relay_core::vault::relayer_index_for_sender(&sender, pool_width) as u8;
+    // Absent on every envelope written before submission tiers existed; a name
+    // this relay does not know fails the envelope rather than quietly
+    // submitting at a speed nobody chose.
+    let submission_tier = match payload.get("submissionTier") {
+        Some(value) => Some(
+            serde_json::from_value::<vela_relay_core::gas_math::SubmissionTier>(value.clone())
+                .map_err(|error| format!("invalid queue envelope: submissionTier {error}"))?,
+        ),
+        None => None,
+    };
 
     Ok(vela_relay_core::task::RoutedUserOperation {
         schema_version: schema_version as u32,
@@ -173,6 +183,7 @@ fn parse_routed(
         stream: "vela-relay-ops".into(),
         partition_id: 0,
         offset: 0,
+        submission_tier,
     })
 }
 

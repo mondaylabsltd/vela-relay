@@ -320,6 +320,12 @@ pub struct DelayedUserOperation {
     pub stream: String,
     pub partition_id: u32,
     pub offset: u64,
+    /// The speed the client named. It survives the park/redrive round trip so
+    /// an operation that waited out a gas spike is still submitted at the
+    /// speed it paid for. Absent for every payload parked before tiers
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_tier: Option<vela_relay_core::gas_math::SubmissionTier>,
 }
 
 #[derive(Clone, Debug)]
@@ -1902,6 +1908,7 @@ mod tests {
             stream: "chain-42161".into(),
             partition_id: 0,
             offset: 99,
+            submission_tier: None,
         };
         let identifier = delayed_operation_identifier(&operation);
         assert_eq!(
@@ -1928,6 +1935,31 @@ mod tests {
         .unwrap();
         assert_eq!(decoded[0].identifier, identifier);
         assert_eq!(decoded[0].operation, operation);
+
+        // A parked operation keeps the speed its client paid for, so the hold
+        // ladder redrives it at that speed rather than at whatever pace the
+        // relay would have picked on its own. A payload that named no speed
+        // serializes exactly as it always did, so nothing already sitting in
+        // the delayed inbox changes shape.
+        assert!(
+            !serde_json::to_string(&operation)
+                .unwrap()
+                .contains("submissionTier")
+        );
+        let mut fast = operation.clone();
+        fast.submission_tier = Some(vela_relay_core::gas_math::SubmissionTier::Fast);
+        let round_tripped: DelayedUserOperation =
+            serde_json::from_str(&serde_json::to_string(&fast).unwrap()).unwrap();
+        assert_eq!(round_tripped, fast);
+        // But the canonical fingerprint stays blind to it. That fingerprint
+        // guards what the user SIGNED against one payload overwriting another;
+        // a preference about how fast the relay submits is not part of that
+        // identity, and letting it in would turn a harmless re-request into a
+        // store-level payload conflict.
+        assert_eq!(
+            canonical_delayed_payload(&operation).unwrap(),
+            canonical_delayed_payload(&fast).unwrap()
+        );
 
         assert!(SAVE_DELAYED_OPERATION_SCRIPT.contains("canonical ~= ARGV[1]"));
         assert!(SAVE_DELAYED_OPERATION_SCRIPT.contains("existing ~= ARGV[2]"));

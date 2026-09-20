@@ -24,11 +24,13 @@ required = max( markup × gas_native_cost ,  floor )
 
 - **`markup`** — default **14000 bps = 1.4×** (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`,
   hard lower bound 1.0×). The relay recovers 1.4× the gas it spends.
-- **`gas_native_cost`** = the operation's allocated gas × the **quoted per-gas
-  fee**, and that fee is `max_fee_per_gas = 2 × base_fee + tip`
+- **`gas_native_cost`** = the operation's allocated gas × the **submit cap**,
+  which by default is `max_fee_per_gas = 2 × base_fee + tip`
   (`gas_math::quoted_outer_fee`). The `2×` is **inclusion headroom, not cost** —
   the chain only ever charges `base_fee + tip`; the extra base-fee multiple lets
-  the outer transaction survive a rising base fee without a re-sign.
+  the outer transaction survive a rising base fee without a re-sign. A client
+  may raise or lower this multiple by naming a submission speed (§2a); when it
+  names none, the cap is exactly the `2×` above.
 - **`floor`** — a dust guard: `0.00001` native coin, or `0.01` of a stablecoin
   (≈ **1 cent**). This is NOT the price; it only bites when `1.4 × gas` rounds
   below it (near-zero-gas ops). Both the quote layer and the settlement layer
@@ -71,6 +73,82 @@ Because the floor uses `max(cost, dust_floor)` on the stablecoin path, a payment
 below the *dust* floor can never be repriced into acceptance (the requirement is
 pinned at the floor at every fee) — a case now pinned by
 `a_stablecoin_below_the_floor_cannot_be_repriced_into_acceptance`.
+
+## 2a. Submission speed — the client may name a tier
+
+Repricing (§2) only ever moves the cap **down**. A client that wants its
+operation in *sooner* may name a submission speed on `eth_sendUserOperation`, as
+an **optional third parameter**:
+
+```jsonc
+["eth_sendUserOperation", [ <userOperation>, <entryPoint>, "fast" ]]
+```
+
+The value is a **tier NAME** (`"slow" | "standard" | "fast"`), never a wei
+amount. The relay resolves the name against the base fee it reads at submit
+time, so a quote that went stale between signing and inclusion can never set the
+price. An unknown name is refused with `-32602 invalid params` before any
+handler runs; omitting the parameter is today's wire and today's behaviour,
+byte for byte.
+
+```
+absent  ⇒ cap = 2 × base_fee + tip                    (exactly §1, unchanged)
+present ⇒ cap = max( min( multiplier[tier] × base_fee + tip ,
+                          what the reimbursements fund ) ,
+                     inclusion_floor )
+```
+
+| tier | multiplier on `base_fee` | note |
+|---|---|---|
+| `slow` | **1.5×** | equals the default inclusion floor exactly |
+| `standard` | **2.0×** | identical to the cap with no tier named |
+| `fast` | **3.0×** | the default the vela-wallet client sends |
+
+**The tier multiplies the base fee; it is NOT the reported tier price.** The
+prices returned by `pimlico_getUserOperationGasPrice` (`slow`/`standard`/`fast`
+= 1.0/1.1/1.2 × a ~`1.2 × base` network price) tell the **client what to pay**
+(§3). The submit cap tells the **chain how badly the relay wants the block**.
+Measured on Ethereum 2026-09-20 with `base = 0.0535` gwei, the reported `fast`
+price is **0.0938 gwei while the submit cap is already 0.1070 gwei** — so
+submitting at the reported `fast` price would make a fast send *slower* than a
+default one, on every EIP-1559 chain. BSC hides this (its `baseFeePerGas` is 0
+and the whole price is the tip, so the two coincide); never validate a speed
+change on BSC alone.
+
+A higher cap is **not** a higher cost in a calm market: the chain charges
+`base_fee + tip` whatever the cap says. It binds only during a spike — which is
+exactly when the client wanted the headroom.
+
+**The two clamps, and which wins.**
+
+- *Upper — what the reimbursement funds.* The signed payment must still cover
+  `markup × gas × cap` (§1). The cap is therefore held to the **weakest payer in
+  the bundle**, so a `fast` neighbour can never price a slower operation out of
+  its own transaction, and the relay never signs a cap it would subsidise.
+- *Lower — the inclusion floor, and it wins over the upper clamp.* A cap the
+  chain will not mine is a rejection dressed as a saving, and the executor has
+  no fee-bump path to rescue it. So a request below the floor is **raised** to
+  the floor; if the reimbursement cannot fund even that, the operation reaches
+  §2's existing `FloorUnfundable` verdict and takes the ordinary shortfall
+  path — held in the delayed inbox while the market may still come back, then
+  rejected once the hold budget is exhausted. Never signed at a loss.
+
+**Headroom — why no tier needs a subsidy.** The client pays `3 × gas × max(C,R)`
+(§3) and the relay requires `1.4 × gas × cap`, so the highest cap a payment
+funds is `3 / 1.4 = 2.14 × R`. Against the measured Ethereum market above that
+is **3.13 / 3.44 / 3.76 × base_fee** for a client pricing off the `slow` /
+`standard` / `fast` quote tier — all comfortably above the 1.5 / 2.0 / 3.0 ×
+caps, so in normal conditions no tier is clamped or repriced. Pinned by
+`every_tier_fits_inside_the_headroom_a_normal_client_payment_leaves`.
+
+**Where it lives.** `gas_math::{SubmissionTier, tier_outer_fee}` (the names and
+the multiplier), `settlement::decide_submission_cap` (the clamps),
+`execution::bundle_submission_tier` (one transaction, one price: a bundle takes
+the fastest speed any member named, and a member that named none counts as
+`standard`). The tier rides the **queue envelope**, not the UserOperation: it is
+not part of what the user signed, so it never enters the `userOpHash`, the
+admission fingerprint or the durable record. Tempo (§5) prices gas in pathUSD
+with no base fee to multiply and ignores the tier.
 
 ## 3. What a CLIENT should pay (and why it must exceed the relay minimum)
 
@@ -195,7 +273,9 @@ Tempo chains have no native gas coin; the relay prices gas directly in pathUSD
 `$0.01` floor (`marked_tempo_cost`), and signs the outer transaction with Tempo's
 `0x76` envelope paying fees in pathUSD. The client mirrors this with a separate
 Tempo model (2× margin plus an explicit gas/split cushion annotated "must match
-vela-relay", added after a real sub-floor deploy rejection).
+vela-relay", added after a real sub-floor deploy rejection). A submission tier
+(§2a) has nothing to act on here — there is no base fee to multiply — so Tempo
+ignores it.
 
 ## 6. Summary
 
@@ -204,6 +284,12 @@ vela-relay", added after a real sub-floor deploy rejection).
 - Repricing turns the `2×base` headroom into a live safety valve: a short-but-
   honest payment is repriced down to a fundable fee rather than rejected, down to
   the 1.5×base inclusion floor.
+- A client may name a submission speed (`slow`/`standard`/`fast`) as an optional
+  third `eth_sendUserOperation` parameter. The name selects a **base-fee
+  multiplier for the submit cap** (1.5/2.0/3.0×) — not the reported quote-tier
+  price, which sits *below* today's cap and would invert the feature. Naming
+  nothing is byte-for-byte today's behaviour; the cap is clamped down to what
+  the bundle's weakest reimbursement funds and up to the inclusion floor.
 - A client must pay above the relay minimum to survive gas drift; vela-wallet
   pays a flat 3× on `max(C, R)` — its own chain measurement `C`, floored by the
   relay quote `R` — giving roughly a +70% base-fee-spike tolerance before a clean,

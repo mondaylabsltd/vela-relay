@@ -908,6 +908,12 @@ struct QueueEnvelope {
     chain_id: u64,
     entry_point: String,
     user_operation: Value,
+    /// Absent on every envelope written before submission tiers existed, and
+    /// on every client that still does not name one. A name this relay does
+    /// not know fails the whole envelope into the dead-letter path rather than
+    /// quietly submitting at a speed nobody chose.
+    #[serde(default)]
+    submission_tier: Option<vela_relay_core::gas_math::SubmissionTier>,
 }
 
 fn parse_routed_operation(
@@ -951,6 +957,7 @@ fn parse_routed_operation(
         stream: stream.name.clone(),
         partition_id,
         offset,
+        submission_tier: envelope.submission_tier,
     })
 }
 
@@ -1190,6 +1197,40 @@ mod tests {
         assert_eq!(operation.partition_id, 0);
         assert_eq!(operation.offset, 12);
         assert_eq!(operation.user_operation_hash, "0xhash");
+        // Every envelope already in the queue was written without a tier; it
+        // must keep routing, and must read as "named nothing".
+        assert_eq!(operation.submission_tier, None);
+    }
+
+    #[test]
+    fn carries_a_named_submission_speed_from_the_queue_envelope() {
+        let envelope = |tier: &str| {
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "userOperationHash": "0xhash",
+                "chainId": 42161,
+                "entryPoint": "0xentrypoint",
+                "userOperation": {
+                    "sender": "0x0000000000000000000000000000000000000015",
+                    "nonce": "0x1"
+                },
+                "submissionTier": tier
+            }))
+            .unwrap()
+        };
+        let stream = ChainStream {
+            chain_id: 42_161,
+            name: "chain-42161".into(),
+        };
+
+        let operation = parse_routed_operation(&stream, 0, 12, &envelope("fast")).unwrap();
+        assert_eq!(
+            operation.submission_tier,
+            Some(vela_relay_core::gas_math::SubmissionTier::Fast)
+        );
+        // A speed this relay cannot price fails the whole envelope into the
+        // dead-letter path rather than submitting at one nobody chose.
+        assert!(parse_routed_operation(&stream, 0, 12, &envelope("turbo")).is_err());
     }
 
     #[test]
