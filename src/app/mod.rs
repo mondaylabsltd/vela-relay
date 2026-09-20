@@ -203,6 +203,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_landing_and_version_routes_name_the_running_build() {
+        // What an operator reads off a deployment to know what is on it. The
+        // point is that both fields are BAKED IN at compile time: a response
+        // cannot claim a release the binary is not, and cannot go stale while
+        // the process keeps running.
+        for path in ["/", "/version"] {
+            let response = router(
+                &http_config(),
+                AppState::with_settlement_recipient(&[], None),
+            )
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(body["name"], "vela-relay");
+            assert_eq!(body["version"], env!("VELA_RELAY_RELEASE"));
+            assert_eq!(body["commit"], env!("VELA_RELAY_BUILD_SHA"));
+            // The version reported must be the RELEASE, never the package
+            // version: that has read 0.1.0 across every tag this repository
+            // has cut, so reporting it would answer the operator's question
+            // with a number that cannot change.
+            assert_ne!(body["version"], env!("CARGO_PKG_VERSION"));
+            // And neither field may be a placeholder standing in for a real
+            // build — the failure mode that made the Worker report "dev" on
+            // every live deployment.
+            for field in ["version", "commit"] {
+                let value = body[field].as_str().expect(field);
+                assert!(!value.is_empty(), "{path} {field}");
+                assert_ne!(value, "unknown", "{path} {field}");
+                assert_ne!(value, "dev", "{path} {field}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn permits_cross_origin_requests() {
         let state = AppState::with_settlement_recipient(&[], None);
         let response = router(&http_config(), state)

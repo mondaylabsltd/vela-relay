@@ -26,8 +26,13 @@ platform deltas.
 - **Transport headers**: HTTP/2 at the edge lowercases header names; the
   `x-vela-rpc-domain` header value and `content-type` are preserved. Bodies
   are the parity surface.
-- **`/version`**: build identity field reflects each deployment's build
-  metadata (already environment-specific between CI and local docker builds).
+- **`/` and `/version`**: both carry `version` (release tag) and `commit`
+  (short SHA), produced by the `build_info.rs` both shells' build scripts
+  share. The VALUES are environment-specific — two deployments built from the
+  same commit agree, a CI tag build and a local one need not — so the fields
+  are shape-parity, not byte-parity. (Before the CF shell had a build script
+  at all, its `/version` reported a hardcoded `"build": "dev"` on every
+  deployment, live ones included.)
 - **`/readyz` semantics**: the docker deployment's four job names gate
   readiness in-process. The CF deployment has no resident process; `/readyz`
   reports binding availability (queue, DO namespaces, KV) — shape-compatible,
