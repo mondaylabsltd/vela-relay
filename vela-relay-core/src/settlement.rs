@@ -2258,18 +2258,22 @@ mod tests {
         // tier through the relay's OWN quote code and then through
         // `decide_submission_fees`, and asserts that nothing clamps: no tier
         // needs the relay to subsidise it, and none is repriced down.
-        use crate::gas_math::{FeeHistory, price_from_fee_history, tier_outer_fee, tiers};
+        use crate::gas_math::{
+            FeeHistory, price_from_fee_history, quote_market_tip, tier_outer_fee, tiers,
+        };
 
         let base = 53_500_000u128; // 0.0535 gwei
         let tip = 13_968_750u128;
         let gas = 100_000u128;
         let quoted = crate::gas_math::quoted_outer_fee(base, tip).unwrap();
 
+        // `tip` is the node's `eth_maxPriorityFeePerGas`, resolved the way
+        // both the quote and the executor resolve it.
         let fee_history: FeeHistory = serde_json::from_value(serde_json::json!({
             "baseFeePerGas": [format!("0x{base:x}")],
-            "reward": [[format!("0x{tip:x}")]],
         }))
         .unwrap();
+        let tip = quote_market_tip(&fee_history, Some(tip), None, 200).unwrap();
         let network = price_from_fee_history(&fee_history, tip).unwrap();
         let reported = tiers(network).unwrap();
 

@@ -38,7 +38,7 @@ Call `POST /{chainId}` with the following request body:
 }
 ```
 
-The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it uses `eth_feeHistory` to calculate a 120%-of-base-fee cap plus a median priority fee. If fee history is unavailable, it falls back to `eth_maxPriorityFeePerGas`, then to `eth_gasPrice` for legacy-compatible pricing.
+The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it takes the base fee from `eth_feeHistory` and the tip from `eth_maxPriorityFeePerGas` (then `eth_gasPrice` minus the latest base fee) — the same tip rule the executor signs with, `gas_math::market_tip`. If fee history is unavailable, it falls back to `eth_gasPrice` for legacy-compatible pricing. `docs/fees.md` §2b has the per-tier arithmetic.
 
 The manager returns slow (100%), standard (110%), and fast (120%) tiers. `maxFeePerGas` and `maxPriorityFeePerGas` are scaled independently, while preserving `maxFeePerGas >= maxPriorityFeePerGas`.
 

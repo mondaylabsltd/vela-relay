@@ -135,7 +135,7 @@ Gas Price (effective): 281.060118904 Gwei   (= base + 30.35)
 
 `775.52505875 = 3 × 248.39168625 + 30.35`, so the 3× **cap** was applied exactly
 right — that machinery always worked. But `maxPriorityFeePerGas` was the bare
-market median, and `min(30.35, 775.525 − 250.710) = 30.35` gwei is precisely
+market tip, and `min(30.35, 775.525 − 250.710) = 30.35` gwei is precisely
 what a `slow` send would have offered the builder. The user paid `fast` and got
 `slow`'s place in the block. Under the two-lever tier the same market signs:
 
@@ -150,11 +150,11 @@ Pinned by `a_fast_send_now_outbids_the_slow_one_on_the_receipt_that_proved_the_d
 
 **`slow`'s tip is 1.00× — the market tip, and a floor that is never scaled
 below.** This is deliberate and load-bearing. The relay has **no per-chain
-minimum-tip knowledge**: it takes whatever the median of `eth_feeHistory`'s
-reward column or `eth_maxPriorityFeePerGas` reports (`gas_price/manager.rs`).
-Several chains enforce a hard minimum gas price inside the client — bor on
-Polygon is the canonical one — and a transaction tipping under it is **rejected
-outright**, not merely mined late. A `slow` that shaved the tip would therefore
+minimum-tip knowledge**: it takes whatever the node's `eth_maxPriorityFeePerGas`
+reports (`gas_math::market_tip`, §2b), and that answer carries the minimum a
+chain enforces inside its client — bor on Polygon is the canonical one. A
+transaction tipping under that minimum is **rejected outright**, not merely
+mined late. A `slow` that shaved the tip would therefore
 buy a high rejection rate rather than a saving. `slow` earns its discount from
 the lower **cap** (and hence the lower reimbursement basis derived from it),
 never from underpaying the builder. Do not "simplify" this to a tip below
@@ -266,11 +266,91 @@ tip** for `slow` / `standard` / `fast`. The tip terms cancel in
 `relayerFeePerGas`, which is why the headroom is purely the base-fee part.
 
 **The reported `maxPriorityFeePerGas` is per tier, and it is the number the
-relay signs with.** Both come from the same `tier_outer_fee`, so a wallet can
-never be shown one tip and charged for another. That coherence is the quote-side
-half of the defect in §2a: a reported tip that did not match the signed one
-would mislead the tier picker exactly as a signed tip that did not match the
-tier misled the builder.
+relay signs with.** Both come from the same `tier_outer_fee`, applied to the
+same market tip, so a wallet can never be shown one tip and charged for
+another. That coherence is the quote-side half of the defect in §2a: a
+reported tip that did not match the signed one would mislead the tier picker
+exactly as a signed tip that did not match the tier misled the builder.
+
+**The market tip is one reading, resolved one way.** `gas_math::market_tip` is
+called by the quote (`pimlico_getUserOperationGasPrice`, docker and Worker)
+and by the executor (`transaction_context`, docker and Worker, and the
+simulation-contract deployer):
+
+1. the node's `eth_maxPriorityFeePerGas`, whatever it returns — **zero
+   included**;
+2. only when that call gave no quantity: `eth_gasPrice −` the **latest**
+   block's base fee.
+
+`eth_maxPriorityFeePerGas` is the node's own answer to what clears, so it
+carries a chain's enforced minimum, which is what makes `slow`'s unscaled
+`1.00×` safe (§2a). Step 2 subtracts the latest block's base fee because
+`eth_gasPrice` is built as `suggested tip + head base fee`: on Polygon on
+2026-09-21, `278.534895357 − 250.761673410 = 27.773221947` gwei,
+`eth_maxPriorityFeePerGas` to the wei. The quote takes that base fee from the
+fee history it already holds (the second-to-last `baseFeePerGas`); subtracting
+the last one, the next block's projection, would have read 30.729 gwei. A zero
+is an answer, not an absence: Arbitrum reports `0x0`, and the executor has
+always signed it.
+
+**2026-09-21 — the quote's tip was not the signed tip.** Until then the quote
+took the median of `eth_feeHistory`'s 50th-percentile reward column, fell back
+to `eth_maxPriorityFeePerGas` only when that median was zero, and to
+`base_fee / 200` after that; the executor always signed
+`eth_maxPriorityFeePerGas` (else `eth_gasPrice − base`). They are different
+statistics — what recent
+blocks' median transaction tipped, against what the node says clears — and on
+Polygon they were three times apart. A live `standard` send:
+
+```
+quoted:  maxFeePerGas 600.7 gwei | maxPriorityFeePerGas 107.7 gwei    (slow 86.2, fast 172.4)
+signed:  Max 536.5544999 Gwei    | Max Priority 34.71688084 Gwei       (= 1.25 × 27.773504672)
+         Gas Price (effective) 282.5 gwei
+```
+
+The wallet showed a `standard` tip of 107.7 gwei and priced `R` on it — `R`
+carries the tip whole — while the relay paid the builder 34.72. The three
+tiers the picker compared were not the tips any send would buy. One batch per
+chain from a public endpoint (drpc) the same day shows how far the two
+statistics wander:
+
+| chain | old quote tip (reward median, else its fallbacks) | `eth_maxPriorityFeePerGas` — signed then, quoted now |
+|---|---|---|
+| Polygon | 86.072 gwei | 27.773 gwei |
+| Ethereum | 0.2 gwei | 27,224 wei |
+| Optimism | 100,000 wei | 1,000,000 wei (the call timed out; `eth_gasPrice − base`) |
+| Base | 1,000,000 wei | 1,000,000 wei |
+| Arbitrum | 100,380 wei (median and node both 0, so `base / 200`) | 0 |
+
+The fix is the shared function: both paths call `market_tip`, so a reported
+tier tip and a signed one come from the same reading by construction. Pinned
+by `the_tip_reported_for_a_tier_is_the_tip_the_executor_signs_given_the_same_rpc_answers`
+(every tier, over the markets above plus the no-answer and rising-base-fee
+shapes) and `the_polygon_quote_reports_the_tip_the_executor_signed_not_the_fee_history_median`
+(the verbatim Polygon batch, and the receipt's 34.71688084 gwei to the wei).
+
+**Where the quote and the executor still differ, and why.**
+
+- *The base fee.* The quote prices every tier on the **next** block's base fee
+  (the last `baseFeePerGas`); the executor on the **latest** block's, read
+  again at submit time. The tip does not depend on it; the cap does, by at
+  most one block's 12.5% move, and a quote is always older than its
+  submission anyway.
+- *No tip at all.* When `eth_maxPriorityFeePerGas` gives no quantity and
+  `eth_gasPrice` is unusable (absent, or below the base fee), the executor
+  refuses to build the transaction and the operation waits for a later pass.
+  Only the quote falls back, to `base_fee / 200` (`gas_math::quote_market_tip`),
+  rather than going dark — a price for a market the relay will not sign in at
+  that moment.
+- *No fee history.* A chain whose `eth_feeHistory` fails is quoted from
+  `eth_gasPrice` alone as an all-tip market (base 0); the executor needs an
+  EIP-1559 base fee in the latest block and refuses without one. Unchanged.
+- *Transport.* The quote reads through the request's failover chain (the
+  caller's `x-vela-rpc-url`, then Alchemy, then the public list); the executor
+  through its own RPC, whose quantity parser also refuses a non-canonical
+  answer (`0x01`) the quote's accepts. The same rule over different nodes can
+  still read different numbers; the rule no longer adds a difference of its
+  own.
 
 **Where the 0.6 comes from, and what it applies to.** Before per-tier pricing
 the relay reported one network price, `1.2 × base`, and submitted at one cap,
@@ -344,7 +424,8 @@ property of this pricing. Pinned by
 market set that deliberately includes both degenerate shapes (`base = 0` and
 `tip = 0`).
 
-**Where it lives.** `gas_math::{tier_price, tier_tip, tier_network_fee,
+**Where it lives.** `gas_math::{market_tip, quote_market_tip}` (the tip),
+`gas_math::{tier_price, tier_tip, tier_network_fee,
 REIMBURSEMENT_BASIS_BPS}` and `gas_math::tiers`, reported through
 `wire::GasPriceTier` by both shells (`src/app/rpc/handlers/user_operation_gas_price.rs`
 and `vela-relay-cf/src/http.rs`, which share one conversion shape). A generic
@@ -539,6 +620,11 @@ speed.)
   defect this design closes. `slow`'s tip is floored at the market tip because
   the relay has no per-chain minimum-tip knowledge and an under-tip is rejected
   outright, not merely mined late; `slow` saves on the cap instead.
+- **The market tip is the node's `eth_maxPriorityFeePerGas`**, else
+  `eth_gasPrice −` the latest base fee — one function, `gas_math::market_tip`,
+  for the quote and the executor alike. Until 2026-09-21 the quote used
+  `eth_feeHistory`'s median reward instead, and on Polygon quoted a
+  `standard` tip of 107.7 gwei the relay then signed at 34.72.
 - **A tier is that pair, and its quoted price derives from it.**
   `pimlico_getUserOperationGasPrice` reports, per tier, `maxFeePerGas` = the cap
   (`1.5/2.0/3.0 × base + tip[tier]`), `maxPriorityFeePerGas` = `tip[tier]` —

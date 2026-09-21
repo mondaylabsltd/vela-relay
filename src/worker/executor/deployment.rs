@@ -237,8 +237,10 @@ impl SimulationContractDeployer {
         else {
             return SimulationDeploymentState::Unavailable;
         };
-        let tip = match response_quantity(&responses, 2) {
-            Some(tip) => tip,
+        // The same market-tip rule the quote and the bundle executor share.
+        let max_priority_fee_per_gas = response_quantity(&responses, 2);
+        let legacy_gas_price = match max_priority_fee_per_gas {
+            Some(_) => None,
             None => {
                 let Ok(gas_price) = self.rpc.call(chain_id, "eth_gasPrice", json!([])).await else {
                     return SimulationDeploymentState::Unavailable;
@@ -246,11 +248,15 @@ impl SimulationContractDeployer {
                 let Some(gas_price) = gas_price.as_str().and_then(parse_quantity) else {
                     return SimulationDeploymentState::Unavailable;
                 };
-                let Some(tip) = gas_price.checked_sub(base_fee) else {
-                    return SimulationDeploymentState::Unavailable;
-                };
-                tip
+                Some(gas_price)
             }
+        };
+        let Some(tip) = vela_relay_core::gas_math::market_tip(
+            max_priority_fee_per_gas,
+            legacy_gas_price,
+            base_fee,
+        ) else {
+            return SimulationDeploymentState::Unavailable;
         };
         let (Ok(estimated_gas), Ok(base_fee), Ok(tip), Some(nonce), Some(balance)) = (
             u64::try_from(estimated_gas),
