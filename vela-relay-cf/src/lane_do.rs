@@ -2123,20 +2123,24 @@ async fn transaction_context(
         .and_then(Value::as_str)
         .and_then(parse_quantity)
         .ok_or_else(|| "latest block has no EIP-1559 base fee".to_owned())?;
-    let tip = match response_quantity_optional(&responses, 2) {
-        Some(tip) => tip,
-        None => {
-            let gas_price = trusted
+    // The market tip, by the one rule the quote shares
+    // (`gas_math::market_tip`); `eth_gasPrice` only when the node named none.
+    let max_priority_fee_per_gas = response_quantity_optional(&responses, 2);
+    let legacy_gas_price = match max_priority_fee_per_gas {
+        Some(_) => None,
+        None => Some(
+            trusted
                 .call(chain_id, "eth_gasPrice", json!([]))
                 .await
                 .map_err(|error| error.to_string())?
                 .as_str()
                 .and_then(parse_quantity)
-                .ok_or_else(|| "eth_gasPrice returned an invalid quantity".to_owned())?;
-            vela_relay_core::gas_math::tip_from_legacy_gas_price(gas_price, base_fee)
-                .ok_or_else(|| "gas price is below the latest base fee".to_owned())?
-        }
+                .ok_or_else(|| "eth_gasPrice returned an invalid quantity".to_owned())?,
+        ),
     };
+    let tip =
+        vela_relay_core::gas_math::market_tip(max_priority_fee_per_gas, legacy_gas_price, base_fee)
+            .ok_or_else(|| "gas price is below the latest base fee".to_owned())?;
     let base_fee = u128::try_from(base_fee).map_err(|_| "base fee exceeds uint128".to_owned())?;
     let tip = u128::try_from(tip).map_err(|_| "priority fee exceeds uint128".to_owned())?;
     let max_fee_per_gas = vela_relay_core::gas_math::quoted_outer_fee(base_fee, tip)

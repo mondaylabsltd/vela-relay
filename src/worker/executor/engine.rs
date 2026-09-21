@@ -703,11 +703,15 @@ impl ExecutorEngine {
             .and_then(Value::as_str)
             .and_then(parse_quantity)
             .ok_or_else(|| ExecutorItemError("latest block has no EIP-1559 base fee".into()))?;
-        let tip = match response_quantity_optional(&responses, 2) {
-            Some(tip) => tip,
-            None => {
-                let gas_price = self
-                    .rpc
+        // The market tip, resolved by the one rule the quote shares
+        // (`gas_math::market_tip`), so the tip a tier was quoted at is the tip
+        // it is signed with. `eth_gasPrice` is read only when the node named
+        // no tip.
+        let max_priority_fee_per_gas = response_quantity_optional(&responses, 2);
+        let legacy_gas_price = match max_priority_fee_per_gas {
+            Some(_) => None,
+            None => Some(
+                self.rpc
                     .call(chain_id, "eth_gasPrice", json!([]))
                     .await
                     .map_err(rpc_item_error)?
@@ -715,13 +719,15 @@ impl ExecutorEngine {
                     .and_then(parse_quantity)
                     .ok_or_else(|| {
                         ExecutorItemError("eth_gasPrice returned an invalid quantity".into())
-                    })?;
-                vela_relay_core::gas_math::tip_from_legacy_gas_price(gas_price, base_fee)
-                    .ok_or_else(|| {
-                        ExecutorItemError("gas price is below the latest base fee".into())
-                    })?
-            }
+                    })?,
+            ),
         };
+        let tip = vela_relay_core::gas_math::market_tip(
+            max_priority_fee_per_gas,
+            legacy_gas_price,
+            base_fee,
+        )
+        .ok_or_else(|| ExecutorItemError("gas price is below the latest base fee".into()))?;
         let base_fee = u128::try_from(base_fee)
             .map_err(|_| ExecutorItemError("base fee exceeds uint128".into()))?;
         let tip = u128::try_from(tip)

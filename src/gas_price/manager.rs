@@ -7,8 +7,8 @@ use tokio::sync::oneshot;
 // All price arithmetic lives in the decision core; this manager owns polling,
 // caching, coalescing, and RPC failover.
 use vela_relay_core::gas_math::{
-    FeeHistory, fallback_priority_fee, legacy_price_from_result, median_priority_fee,
-    parse_quantity, price_from_fee_history, tiers,
+    FeeHistory, legacy_price_from_result, parse_quantity, price_from_fee_history, quote_market_tip,
+    tiers,
 };
 pub use vela_relay_core::gas_math::{
     GasPrice, GasPriceError, GasPricePolicy, GasPriceTiers, NetworkGasPrice,
@@ -22,6 +22,9 @@ use super::{
 };
 
 const FEE_HISTORY_BLOCK_COUNT: &str = "0x5";
+// Still requested, so the call stays byte-identical to the one every upstream
+// has been answering, but the reward column is no longer read: the tip is the
+// node's `eth_maxPriorityFeePerGas` (`gas_math::market_tip`).
 const FEE_HISTORY_PERCENTILES: [u8; 3] = [25, 50, 75];
 const DEFAULT_HISTORY_SIZE: usize = 32;
 const RESPONSE_BUDGET: Duration = Duration::from_millis(2_800);
@@ -119,16 +122,26 @@ impl GasPriceManager {
         chain_id: u64,
         user_rpc_url: Option<&HeaderValue>,
     ) -> Result<(NetworkGasPrice, String), GasPriceError> {
-        if let Ok(response) = rpc::call(
-            chain_id,
-            user_rpc_url,
-            "eth_feeHistory",
-            json!([FEE_HISTORY_BLOCK_COUNT, "latest", FEE_HISTORY_PERCENTILES]),
-        )
-        .await
-        {
+        // The tip is read beside the fee history, not after it: it is needed
+        // on every EIP-1559 quote now, and in parallel it costs no extra
+        // round trip.
+        let (fee_history, max_priority_fee_per_gas) = tokio::join!(
+            rpc::call(
+                chain_id,
+                user_rpc_url,
+                "eth_feeHistory",
+                json!([FEE_HISTORY_BLOCK_COUNT, "latest", FEE_HISTORY_PERCENTILES]),
+            ),
+            quantity(chain_id, user_rpc_url, "eth_maxPriorityFeePerGas"),
+        );
+        if let Ok(response) = fee_history {
             match self
-                .eip1559_price(response.value, chain_id, user_rpc_url)
+                .eip1559_price(
+                    response.value,
+                    max_priority_fee_per_gas,
+                    chain_id,
+                    user_rpc_url,
+                )
                 .await
             {
                 Ok(price) => return Ok((price, response.domain)),
@@ -146,52 +159,32 @@ impl GasPriceManager {
         tiers(network_price)
     }
 
+    /// The next block's base fee from the fee history, and the tip resolved
+    /// exactly as the executor resolves the one it signs with
+    /// (`gas_math::quote_market_tip` → `gas_math::market_tip`).
     async fn eip1559_price(
         &self,
         result: Value,
+        max_priority_fee_per_gas: Option<u128>,
         chain_id: u64,
         user_rpc_url: Option<&HeaderValue>,
     ) -> Result<NetworkGasPrice, GasPriceError> {
         let fee_history = serde_json::from_value::<FeeHistory>(result)
             .map_err(|_| GasPriceError::InvalidUpstreamResponse)?;
-        let base_fee = fee_history
-            .base_fee_per_gas
-            .last()
-            .ok_or(GasPriceError::InvalidUpstreamResponse)
-            .and_then(|value| parse_quantity(value))?;
-
-        let priority_fee = match median_priority_fee(&fee_history.reward) {
-            Some(priority_fee) if priority_fee > 0 => priority_fee,
-            _ => self.priority_fee(chain_id, user_rpc_url, base_fee).await?,
+        // `eth_gasPrice` is consulted only when the node named no tip — the
+        // executor's rule, and the only case `market_tip` reads it.
+        let legacy_gas_price = match max_priority_fee_per_gas {
+            Some(_) => None,
+            None => quantity(chain_id, user_rpc_url, "eth_gasPrice").await,
         };
-
-        price_from_fee_history(&fee_history, priority_fee)
-    }
-
-    async fn priority_fee(
-        &self,
-        chain_id: u64,
-        user_rpc_url: Option<&HeaderValue>,
-        base_fee: u128,
-    ) -> Result<u128, GasPriceError> {
-        if let Ok(response) = rpc::call(
-            chain_id,
-            user_rpc_url,
-            "eth_maxPriorityFeePerGas",
-            Value::Array(Vec::new()),
-        )
-        .await
-            && let Some(value) = response.value.as_str()
-            && let Ok(priority_fee) = parse_quantity(value)
-            && priority_fee > 0
-        {
-            return Ok(priority_fee);
-        }
-
-        Ok(fallback_priority_fee(
-            base_fee,
+        let tip = quote_market_tip(
+            &fee_history,
+            max_priority_fee_per_gas,
+            legacy_gas_price,
             self.policy.priority_fee_divisor,
-        ))
+        )?;
+
+        price_from_fee_history(&fee_history, tip)
     }
 
     async fn legacy_gas_price(
@@ -209,6 +202,16 @@ impl GasPriceManager {
         .map_err(|()| GasPriceError::NoPriceAvailable)?;
         Ok((legacy_price_from_result(response.value)?, response.domain))
     }
+}
+
+/// One no-argument quantity read (`eth_maxPriorityFeePerGas`,
+/// `eth_gasPrice`). `None` when the call failed or did not return a quantity —
+/// the "no answer" `gas_math::market_tip` distinguishes from a zero.
+async fn quantity(chain_id: u64, user_rpc_url: Option<&HeaderValue>, method: &str) -> Option<u128> {
+    let response = rpc::call(chain_id, user_rpc_url, method, Value::Array(Vec::new()))
+        .await
+        .ok()?;
+    parse_quantity(response.value.as_str()?).ok()
 }
 
 async fn wait_for_cached_quote(

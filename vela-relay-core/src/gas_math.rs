@@ -22,8 +22,9 @@ use serde_json::Value;
 /// apart. See [`tiers`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GasPricePolicy {
-    /// Divides the base fee for the fallback tip, used only when neither
-    /// fee-history rewards nor `eth_maxPriorityFeePerGas` yields one.
+    /// Divides the base fee for the quote's last-resort tip, used only when
+    /// [`market_tip`] yields none — a market the executor refuses to submit
+    /// in. See [`quote_market_tip`].
     pub priority_fee_divisor: u128,
 }
 
@@ -47,7 +48,8 @@ pub struct GasPrice {
     /// `tip_bps × market tip`. Reported rather than echoing the raw market
     /// tip, because a builder orders by the effective tip and a quote that
     /// showed one tip while the relay signed another would charge the wallet
-    /// for priority it never bought. See [`tier_tip`].
+    /// for priority it never bought. See [`tier_tip`]; the market tip itself
+    /// is [`market_tip`], the one resolution the executor signs from too.
     pub max_priority_fee_per_gas: u128,
     /// What the client must reimburse against — `R` in `docs/fees.md` §3.
     /// `0.6 × multiplier × base fee + tip`.
@@ -103,29 +105,57 @@ impl Display for GasPriceError {
 
 impl Error for GasPriceError {}
 
+/// The part of an `eth_feeHistory` answer the quote reads: the base fees.
+///
+/// The `reward` column is deliberately NOT read. Its median was the quote's
+/// tip until 2026-09-21, and it is not the tip the relay signs with — see
+/// [`market_tip`]. Unknown fields are ignored, so the column may still arrive.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeHistory {
     pub base_fee_per_gas: Vec<String>,
-    #[serde(default)]
-    pub reward: Vec<Vec<String>>,
 }
 
-/// The latest base fee `eth_feeHistory` reported, paired with the tip the
-/// caller resolved. No multiplier is applied here any more: the base fee is
-/// carried raw so each tier can scale it by its own cap multiplier.
+impl FeeHistory {
+    /// The LAST `baseFeePerGas`: the projected base fee of the block after
+    /// the newest one. The quote prices every tier's cap and reimbursement
+    /// basis with this.
+    pub fn next_block_base_fee(&self) -> Result<u128, GasPriceError> {
+        self.base_fee_per_gas
+            .last()
+            .ok_or(GasPriceError::InvalidUpstreamResponse)
+            .and_then(|value| parse_quantity(value))
+    }
+
+    /// The newest block's OWN base fee — the second-to-last `baseFeePerGas`,
+    /// the number `eth_getBlockByNumber("latest")` reports and the executor
+    /// reads. `eth_gasPrice` is built as `suggested tip + this`, so it is the
+    /// base fee [`market_tip`] subtracts; the next block's projection would be
+    /// off by up to 12.5% of the base fee in either direction.
+    ///
+    /// A history of one entry has no second-to-last and yields that entry.
+    pub fn latest_block_base_fee(&self) -> Result<u128, GasPriceError> {
+        let entries = &self.base_fee_per_gas;
+        entries
+            .len()
+            .checked_sub(2)
+            .and_then(|index| entries.get(index))
+            .or_else(|| entries.last())
+            .ok_or(GasPriceError::InvalidUpstreamResponse)
+            .and_then(|value| parse_quantity(value))
+    }
+}
+
+/// The next block's base fee `eth_feeHistory` reported, paired with the tip
+/// the caller resolved ([`quote_market_tip`]). No multiplier is applied here
+/// any more: the base fee is carried raw so each tier can scale it by its own
+/// cap multiplier.
 pub fn price_from_fee_history(
     fee_history: &FeeHistory,
     priority_fee: u128,
 ) -> Result<NetworkGasPrice, GasPriceError> {
-    let base_fee_per_gas = fee_history
-        .base_fee_per_gas
-        .last()
-        .ok_or(GasPriceError::InvalidUpstreamResponse)
-        .and_then(|value| parse_quantity(value))?;
-
     Ok(NetworkGasPrice {
-        base_fee_per_gas,
+        base_fee_per_gas: fee_history.next_block_base_fee()?,
         max_priority_fee_per_gas: priority_fee,
     })
 }
@@ -269,11 +299,11 @@ impl SubmissionTier {
     ///
     /// **`Slow` is 10_000 bps — the market tip, never less — and that floor is
     /// load-bearing.** This relay has no per-chain minimum-tip knowledge: it
-    /// takes whatever `eth_feeHistory`'s median reward or
-    /// `eth_maxPriorityFeePerGas` reports (the shell's `GasPriceManager`).
-    /// Several chains enforce a hard minimum gas price in the client — bor on
-    /// Polygon is the canonical one — and a transaction tipping under it is
-    /// rejected outright rather than merely mined late. A `Slow` that shaved
+    /// takes whatever the node's `eth_maxPriorityFeePerGas` reports
+    /// ([`market_tip`], shared by the quote and the executor). That answer
+    /// respects the minimum a chain enforces in its client — bor on Polygon
+    /// is the canonical one — and a transaction tipping under that minimum
+    /// is rejected outright rather than merely mined late. A `Slow` that shaved
     /// the tip would therefore buy a high rejection rate, not a saving.
     /// `Slow` earns its discount from the lower CAP (and so from the lower
     /// reimbursement basis [`SubmissionTier::network_fee_bps`] derives from
@@ -521,30 +551,89 @@ pub fn tip_from_legacy_gas_price(gas_price: U256, base_fee: U256) -> Option<U256
     gas_price.checked_sub(base_fee)
 }
 
-/// The fallback tip when neither fee-history rewards nor
-/// `eth_maxPriorityFeePerGas` yields a usable value.
-pub fn fallback_priority_fee(base_fee: u128, priority_fee_divisor: u128) -> u128 {
-    base_fee.div_ceil(priority_fee_divisor).max(1)
+/// The market tip every tier scales — resolved ONE way, by the quote
+/// (`pimlico_getUserOperationGasPrice`, through [`quote_market_tip`]) and by
+/// the executor that signs the outer transaction alike:
+///
+/// 1. **`eth_maxPriorityFeePerGas`**, whatever quantity it returns — zero
+///    included. It is the node's own answer to "what tip clears", so it
+///    carries a chain's enforced minimum (bor's on Polygon), which is what
+///    lets `Slow` sign it unscaled ([`SubmissionTier::tip_bps`]). A zero is
+///    an answer, not an absence: Arbitrum reports `0x0` (measured
+///    2026-09-21), and the executor has always signed that zero.
+/// 2. Only when that call yielded no quantity at all (it failed, or did not
+///    return a hex quantity): **`eth_gasPrice −` the latest block's base
+///    fee** ([`tip_from_legacy_gas_price`]). `eth_gasPrice` is built as
+///    `suggested tip + head base fee`, so subtracting the head block's base
+///    fee recovers exactly the tip step 1 would have given — on Polygon on
+///    2026-09-21, `278.534895357 − 250.761673410 = 27.773221947` gwei,
+///    `eth_maxPriorityFeePerGas` to the wei.
+///
+/// `None` when neither yields a tip — no gas price either, or one below the
+/// base fee. The executor then refuses to build the transaction; only the
+/// quote has a further last resort, and [`quote_market_tip`] documents it.
+///
+/// A caller fetches `eth_gasPrice` only when `max_priority_fee_per_gas` is
+/// `None`, because step 2 is never consulted otherwise; passing `None` for
+/// `legacy_gas_price` in that case is exact, not an approximation.
+///
+/// **Why one function.** Until 2026-09-21 the quote took the median of
+/// `eth_feeHistory`'s 50th-percentile reward column while the executor
+/// signed `eth_maxPriorityFeePerGas`. On Polygon those read ~86 and ~27.8
+/// gwei: the wallet was shown — and priced its reimbursement on — a
+/// `standard` tip of 107.7 gwei while the relay signed 34.71688084. Both
+/// paths now call this, so they cannot drift apart again.
+pub fn market_tip(
+    max_priority_fee_per_gas: Option<U256>,
+    legacy_gas_price: Option<U256>,
+    latest_block_base_fee: U256,
+) -> Option<U256> {
+    max_priority_fee_per_gas
+        .or_else(|| tip_from_legacy_gas_price(legacy_gas_price?, latest_block_base_fee))
 }
 
-pub fn median_priority_fee(rewards: &[Vec<String>]) -> Option<u128> {
-    let mut values = rewards
-        .iter()
-        .filter_map(|reward| reward.get(reward.len() / 2))
-        .filter_map(|value| parse_quantity(value).ok())
-        .collect::<Vec<_>>();
-
-    if values.is_empty() {
-        return None;
+/// The tip the quote prices every tier from: [`market_tip`], fed the same
+/// readings the executor takes, with the latest block's base fee taken from
+/// the fee history the quote already holds
+/// ([`FeeHistory::latest_block_base_fee`]).
+///
+/// **One step the executor does not have.** When [`market_tip`] yields
+/// nothing, the executor has no tip to sign with and refuses to submit (the
+/// batch item fails and the operation waits for a later pass). The quote
+/// keeps its long-standing last resort instead of going dark:
+/// [`fallback_priority_fee`], `base fee / priority_fee_divisor`, on the next
+/// block's base fee. That is a price for a market the relay will not sign in
+/// right now, and it is the one place the reported tip and the signed tip can
+/// still differ; the executor re-reads the market when it does sign.
+///
+/// `Err` only when the fee history carries no base fee to read.
+pub fn quote_market_tip(
+    fee_history: &FeeHistory,
+    max_priority_fee_per_gas: Option<u128>,
+    legacy_gas_price: Option<u128>,
+    priority_fee_divisor: u128,
+) -> Result<u128, GasPriceError> {
+    let latest_block_base_fee = fee_history.latest_block_base_fee()?;
+    match market_tip(
+        max_priority_fee_per_gas.map(U256::from),
+        legacy_gas_price.map(U256::from),
+        U256::from(latest_block_base_fee),
+    )
+    // Cannot fail: the tip is one of the u128 inputs or a difference below one.
+    .and_then(|tip| u128::try_from(tip).ok())
+    {
+        Some(tip) => Ok(tip),
+        None => Ok(fallback_priority_fee(
+            fee_history.next_block_base_fee()?,
+            priority_fee_divisor,
+        )),
     }
+}
 
-    values.sort_unstable();
-    let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
-        Some(values[middle - 1].saturating_add(values[middle]) / 2)
-    } else {
-        Some(values[middle])
-    }
+/// The quote's last-resort tip, used only when [`market_tip`] yields none
+/// ([`quote_market_tip`]). The executor has no equivalent.
+pub fn fallback_priority_fee(base_fee: u128, priority_fee_divisor: u128) -> u128 {
+    base_fee.div_ceil(priority_fee_divisor).max(1)
 }
 
 pub fn parse_quantity(value: &str) -> Result<u128, GasPriceError> {
@@ -583,12 +672,14 @@ pub fn legacy_price_from_result(result: Value) -> Result<NetworkGasPrice, GasPri
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::U256;
     use serde_json::json;
 
     use super::{
-        FeeHistory, NetworkGasPrice, OuterFee, SubmissionTier, legacy_price_from_result,
-        median_priority_fee, parse_quantity, price_from_fee_history, quoted_outer_fee,
-        tier_network_fee, tier_outer_fee, tier_price, tier_tip, tiers,
+        FeeHistory, GasPricePolicy, NetworkGasPrice, OuterFee, SubmissionTier,
+        fallback_priority_fee, legacy_price_from_result, market_tip, parse_quantity,
+        price_from_fee_history, quote_market_tip, quoted_outer_fee, tier_network_fee,
+        tier_outer_fee, tier_price, tier_tip, tiers,
     };
 
     const TIERS: [SubmissionTier; 3] = [
@@ -598,11 +689,113 @@ mod tests {
     ];
 
     /// The market every worked example below is measured against: Polygon
-    /// (chain 137) on 2026-09-21, read from `polygon.drpc.org`
-    /// `eth_feeHistory` — the last `baseFeePerGas`, and the median of the
-    /// 50th-percentile reward column, exactly as the shell reads them.
-    const POLYGON_BASE: u128 = 244_954_314_472; // 244.954314 gwei
-    const POLYGON_TIP: u128 = 83_033_825_793; //   83.033826 gwei
+    /// (chain 137) on 2026-09-21, one JSON-RPC batch to `polygon.drpc.org`
+    /// (block 94190979) — the last `baseFeePerGas` of `eth_feeHistory` and
+    /// `eth_maxPriorityFeePerGas`, exactly as the shell reads them
+    /// ([`quote_market_tip`]) and the executor signs from ([`market_tip`]).
+    const POLYGON_BASE: u128 = 247_805_843_619; // 247.805843619 gwei, next block
+    const POLYGON_TIP: u128 = 27_773_221_947; //   27.773221947 gwei
+
+    /// The rest of the same batch. The latest block's own base fee (the
+    /// second-to-last `baseFeePerGas`, and `eth_getBlockByNumber("latest")`'s),
+    /// `eth_gasPrice`, and the median of `eth_feeHistory`'s 50th-percentile
+    /// reward column — the number the quote used as its tip before
+    /// 2026-09-21, 3.1× the tip the relay signs.
+    const POLYGON_LATEST_BASE: u128 = 250_761_673_410; // 250.761673410 gwei
+    const POLYGON_GAS_PRICE: u128 = 278_534_895_357; //  278.534895357 gwei
+    const POLYGON_REWARD_MEDIAN: u128 = 86_071_986_761; // 86.071986761 gwei
+
+    /// That batch's `eth_feeHistory("0x5", "latest", [25, 50, 75])` answer,
+    /// verbatim — reward column and all, so a test can show it is ignored.
+    fn polygon_fee_history_answer() -> serde_json::Value {
+        json!({
+            "oldestBlock": "0x59d3d7f",
+            "reward": [
+                ["0x13dc09ac00", "0x13dc09ac00", "0x22566ac185"],
+                ["0x13dc09ac00", "0x13dc09ac00", "0x19304bf0bb"],
+                ["0xd3f758004", "0x140a4a4a49", "0x1e449a9400"],
+                ["0x12d25d220b", "0x1dc78d901b", "0x29529db4b2"],
+                ["0x14a2b33740", "0x16017bd628", "0x1e449a9400"]
+            ],
+            "baseFeePerGas": [
+                "0x3a2533c666", "0x3a6909b679", "0x39c7f52c07",
+                "0x3a06b2b0b2", "0x3a628f7ac2", "0x39b26118a3"
+            ],
+            "gasUsedRatio": [0.19374966875, 0.20186779375, 0.19409771875, 0.20936705, 0.1596438875]
+        })
+    }
+
+    fn polygon_fee_history() -> FeeHistory {
+        serde_json::from_value(polygon_fee_history_answer()).unwrap()
+    }
+
+    /// A fee history holding just the two base fees the relay reads:
+    /// `[latest block's, next block's]`.
+    fn fee_history(latest_block_base_fee: u128, next_block_base_fee: u128) -> FeeHistory {
+        serde_json::from_value(json!({
+            "baseFeePerGas": [
+                format!("0x{latest_block_base_fee:x}"),
+                format!("0x{next_block_base_fee:x}"),
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// What the quote reports as `tier`'s `maxPriorityFeePerGas`, given the
+    /// node's answers — the shell's flow in `GasPriceManager::eip1559_price`
+    /// and the Worker's `arms::gas_price::eip1559_price`, minus transport.
+    fn quoted_tip(
+        tier: SubmissionTier,
+        fee_history: &FeeHistory,
+        max_priority_fee_per_gas: Option<u128>,
+        gas_price: Option<u128>,
+    ) -> u128 {
+        let tip = quote_market_tip(
+            fee_history,
+            max_priority_fee_per_gas,
+            // Fetched only when the node named no tip, as both shells do.
+            max_priority_fee_per_gas
+                .is_none()
+                .then_some(gas_price)
+                .flatten(),
+            GasPricePolicy::default().priority_fee_divisor,
+        )
+        .unwrap();
+        let row = tiers(price_from_fee_history(fee_history, tip).unwrap()).unwrap();
+        match tier {
+            SubmissionTier::Slow => row.slow,
+            SubmissionTier::Standard => row.standard,
+            SubmissionTier::Fast => row.fast,
+        }
+        .max_priority_fee_per_gas
+    }
+
+    /// What the executor signs `tier` with, given the same answers — the
+    /// docker engine's and the Worker lane's `transaction_context`, then
+    /// `settlement::decide_submission_fees`, whose tip is `tier_outer_fee`'s
+    /// and is never clamped. `None` where the executor refuses to submit.
+    fn signed_tip(
+        tier: SubmissionTier,
+        latest_block_base_fee: u128,
+        max_priority_fee_per_gas: Option<u128>,
+        gas_price: Option<u128>,
+    ) -> Option<u128> {
+        let tip = market_tip(
+            max_priority_fee_per_gas.map(U256::from),
+            max_priority_fee_per_gas
+                .is_none()
+                .then_some(gas_price)
+                .flatten()
+                .map(U256::from),
+            U256::from(latest_block_base_fee),
+        )?;
+        let tip = u128::try_from(tip).unwrap();
+        Some(
+            tier_outer_fee(tier, latest_block_base_fee, tip)
+                .unwrap()
+                .max_priority_fee_per_gas,
+        )
+    }
 
     /// The **receipt** that proved the defect: a `fast` send mined on Polygon.
     ///
@@ -612,7 +805,7 @@ mod tests {
     /// ```
     ///
     /// `775.52505875 = 3 × 248.39168625 + 30.35`, so the 3× CAP was applied
-    /// exactly right — and `maxPriorityFeePerGas` was the bare market median.
+    /// exactly right — and `maxPriorityFeePerGas` was the bare market tip.
     /// The builder saw `min(30.35, 775.525 − 250.710) = 30.35` gwei, the same
     /// number a `slow` send would have offered. That is the whole defect in
     /// one receipt, and `a_fast_send_now_outbids_the_slow_one_on_the_receipt_that_proved_the_defect`
@@ -622,7 +815,7 @@ mod tests {
     const RECEIPT_EFFECTIVE_GAS_PRICE: u128 = 281_060_118_904; // 281.060118904 gwei
 
     #[test]
-    fn reads_the_base_fee_and_the_tip_out_of_fee_history_without_scaling_either() {
+    fn pairs_the_next_blocks_base_fee_with_the_resolved_tip_without_scaling_either() {
         let fee_history: FeeHistory = serde_json::from_value(json!({
             "baseFeePerGas": ["0x50", "0x64"],
             "reward": [["0x1", "0xa", "0x14"]]
@@ -631,13 +824,248 @@ mod tests {
 
         // The LAST entry is the next block's projected base fee, and it is
         // carried raw: applying a multiplier here is what used to throw the
-        // base fee away and leave every tier with the same price.
+        // base fee away and leave every tier with the same price. The tip is
+        // whatever the caller resolved — never the reward column.
         assert_eq!(
-            price_from_fee_history(&fee_history, 10).unwrap(),
+            price_from_fee_history(&fee_history, 7).unwrap(),
             NetworkGasPrice {
                 base_fee_per_gas: 100,
-                max_priority_fee_per_gas: 10,
+                max_priority_fee_per_gas: 7,
             }
+        );
+    }
+
+    #[test]
+    fn the_market_tip_is_the_nodes_own_answer_and_only_then_the_gas_price_derivation() {
+        let base = U256::from(POLYGON_LATEST_BASE);
+        let gas_price = U256::from(POLYGON_GAS_PRICE);
+
+        // 1. `eth_maxPriorityFeePerGas` wins whenever it answered, and the
+        //    gas price is then never consulted — passing it changes nothing.
+        assert_eq!(
+            market_tip(Some(U256::from(POLYGON_TIP)), None, base),
+            Some(U256::from(POLYGON_TIP))
+        );
+        assert_eq!(
+            market_tip(Some(U256::from(POLYGON_TIP)), Some(U256::from(1u64)), base),
+            Some(U256::from(POLYGON_TIP))
+        );
+        // Zero is an answer, not an absence (Arbitrum reports `0x0`); the
+        // executor has always signed it, so the quote reports it too.
+        assert_eq!(
+            market_tip(Some(U256::ZERO), Some(gas_price), base),
+            Some(U256::ZERO)
+        );
+
+        // 2. Only with no answer: `eth_gasPrice − the latest block's base
+        //    fee`. On the live Polygon batch that recovers the node's own tip
+        //    to the wei — which is why it is the fallback, and why it must
+        //    subtract the LATEST block's base fee.
+        assert_eq!(
+            market_tip(None, Some(gas_price), base),
+            Some(U256::from(POLYGON_TIP))
+        );
+
+        // No tip at all: a gas price under the base fee, or none. The
+        // executor refuses here; see `quote_market_tip` for the quote.
+        assert_eq!(market_tip(None, Some(base - U256::from(1u64)), base), None);
+        assert_eq!(market_tip(None, None, base), None);
+    }
+
+    #[test]
+    fn the_latest_block_base_fee_is_the_one_eth_gas_price_is_built_on() {
+        let history = polygon_fee_history();
+        assert_eq!(history.next_block_base_fee().unwrap(), POLYGON_BASE);
+        assert_eq!(
+            history.latest_block_base_fee().unwrap(),
+            POLYGON_LATEST_BASE
+        );
+
+        // `eth_gasPrice = suggested tip + head base fee`, exactly, on the
+        // live batch. Subtracting the NEXT block's projection instead would
+        // have derived 30.729 gwei — a 10.6% over-report of a tip the
+        // executor, which reads the latest block, would never sign.
+        assert_eq!(POLYGON_GAS_PRICE - POLYGON_LATEST_BASE, POLYGON_TIP);
+        assert_eq!(POLYGON_GAS_PRICE - POLYGON_BASE, 30_729_051_738);
+
+        // A history of one entry has no second-to-last; an empty one has
+        // nothing to read at all.
+        let single: FeeHistory =
+            serde_json::from_value(json!({ "baseFeePerGas": ["0x64"] })).unwrap();
+        assert_eq!(single.latest_block_base_fee().unwrap(), 100);
+        assert_eq!(single.next_block_base_fee().unwrap(), 100);
+        let empty: FeeHistory = serde_json::from_value(json!({ "baseFeePerGas": [] })).unwrap();
+        assert!(empty.latest_block_base_fee().is_err());
+        assert!(empty.next_block_base_fee().is_err());
+        assert!(quote_market_tip(&empty, Some(1), None, 200).is_err());
+    }
+
+    #[test]
+    fn the_tip_reported_for_a_tier_is_the_tip_the_executor_signs_given_the_same_rpc_answers() {
+        // The property the whole quote exists to keep: fed the SAME node
+        // answers, the tip `pimlico_getUserOperationGasPrice` reports for a
+        // tier and the tip the executor signs that tier with are one wei
+        // count. Markets measured 2026-09-21 unless noted.
+        type NodeAnswers = (
+            &'static str,
+            u128,         // the latest block's base fee
+            u128,         // the next block's base fee
+            Option<u128>, // eth_maxPriorityFeePerGas
+            Option<u128>, // eth_gasPrice
+        );
+        let markets: [NodeAnswers; 8] = [
+            (
+                "polygon",
+                POLYGON_LATEST_BASE,
+                POLYGON_BASE,
+                Some(POLYGON_TIP),
+                Some(POLYGON_GAS_PRICE),
+            ),
+            // The same batch with `eth_maxPriorityFeePerGas` lost: both
+            // paths derive the tip from `eth_gasPrice`, and land on it anyway.
+            (
+                "polygon, no tip answer",
+                POLYGON_LATEST_BASE,
+                POLYGON_BASE,
+                None,
+                Some(POLYGON_GAS_PRICE),
+            ),
+            // Tips are a zero there. The old quote reported `base / 200`
+            // (100_380 wei) — a tip the executor never signed.
+            (
+                "arbitrum",
+                20_076_000,
+                20_076_000,
+                Some(0),
+                Some(20_076_000),
+            ),
+            (
+                "base",
+                5_000_000,
+                5_000_000,
+                Some(1_000_000),
+                Some(6_000_000),
+            ),
+            // `eth_maxPriorityFeePerGas` timed out on the public endpoint;
+            // `eth_gasPrice − base` is op-geth's 0.001 gwei minimum.
+            ("optimism", 584, 584, None, Some(1_000_584)),
+            // The node suggests 27_224 wei; the reward median was 0.2 gwei.
+            (
+                "ethereum",
+                262_374_330,
+                249_829_334,
+                Some(27_224),
+                Some(262_401_554),
+            ),
+            (
+                "bsc shape: no base fee",
+                0,
+                0,
+                Some(50_000_000),
+                Some(50_000_000),
+            ),
+            ("a rising base fee", 100, 112, None, Some(107)),
+        ];
+
+        for (chain, latest, next, reported, gas_price) in markets {
+            let history = fee_history(latest, next);
+            for tier in TIERS {
+                assert_eq!(
+                    Some(quoted_tip(tier, &history, reported, gas_price)),
+                    signed_tip(tier, latest, reported, gas_price),
+                    "{chain}/{tier}: the quote reported a tip the executor would not sign"
+                );
+            }
+        }
+
+        // The one documented difference: no tip answer and no usable gas
+        // price. The executor refuses to submit — there is no signed tip to
+        // agree with — and only the quote falls back, to `base / 200` on the
+        // next block's base fee.
+        for gas_price in [None, Some(POLYGON_LATEST_BASE - 1)] {
+            for tier in TIERS {
+                assert_eq!(signed_tip(tier, POLYGON_LATEST_BASE, None, gas_price), None);
+            }
+            assert_eq!(
+                quote_market_tip(
+                    &polygon_fee_history(),
+                    None,
+                    gas_price,
+                    GasPricePolicy::default().priority_fee_divisor
+                ),
+                Ok(fallback_priority_fee(POLYGON_BASE, 200))
+            );
+        }
+    }
+
+    #[test]
+    fn the_polygon_quote_reports_the_tip_the_executor_signed_not_the_fee_history_median() {
+        // The defect, measured on Polygon on 2026-09-21. The quote reported
+        // `standard` at maxFeePerGas 600.7 / maxPriorityFeePerGas 107.7 gwei
+        // (slow 86.2, fast 172.4 — 1.00 / 1.25 / 2.00 × an ~86.2 gwei
+        // fee-history median), while the mined outer transaction signed:
+        //
+        //   Max Priority: 34.71688084 Gwei   (1.25 × eth_maxPriorityFeePerGas)
+        //   Max:          536.5544999 Gwei   (2 × base + that tip)
+        //
+        // The wallet was shown, and priced its reimbursement `R` on, a tip
+        // 3.1× the one the relay paid the builder.
+        let history = polygon_fee_history();
+
+        // The fixture's reward column really is what the old quote read:
+        // the median of the 50th-percentile column.
+        let mut column = polygon_fee_history_answer()["reward"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|percentiles| parse_quantity(percentiles[1].as_str().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        column.sort_unstable();
+        assert_eq!(column[column.len() / 2], POLYGON_REWARD_MEDIAN);
+
+        // Now the quote reads the node's own tip, the reward column is inert,
+        // and `standard` reports 1.25 × 27.773221947 gwei, rounded up.
+        let tip = quote_market_tip(&history, Some(POLYGON_TIP), None, 200).unwrap();
+        assert_eq!(tip, POLYGON_TIP);
+        let row = tiers(price_from_fee_history(&history, tip).unwrap()).unwrap();
+        assert_eq!(row.slow.max_priority_fee_per_gas, 27_773_221_947);
+        assert_eq!(row.standard.max_priority_fee_per_gas, 34_716_527_434);
+        assert_eq!(row.fast.max_priority_fee_per_gas, 55_546_443_894);
+        // …not the 107.59 gwei the median would have reported for it.
+        assert_eq!(
+            tier_tip(SubmissionTier::Standard, POLYGON_REWARD_MEDIAN),
+            Some(107_589_983_452)
+        );
+        assert_ne!(row.standard.max_priority_fee_per_gas, 107_589_983_452);
+        // The executor, fed the latest block the same batch reported, signs
+        // exactly what was quoted.
+        assert_eq!(
+            signed_tip(
+                SubmissionTier::Standard,
+                POLYGON_LATEST_BASE,
+                Some(POLYGON_TIP),
+                None
+            ),
+            Some(row.standard.max_priority_fee_per_gas)
+        );
+
+        // And the receipt itself. Its 34.71688084 gwei is `tier_tip` of
+        // exactly one reading, 27.773504672 gwei — the executor's
+        // `eth_maxPriorityFeePerGas` at submit time. A quote fed that reading
+        // now reports that `standard` tip to the wei.
+        let at_submit = 27_773_504_672u128;
+        assert_eq!(
+            tier_tip(SubmissionTier::Standard, at_submit),
+            Some(34_716_880_840)
+        );
+        assert_eq!(
+            quoted_tip(
+                SubmissionTier::Standard,
+                &history,
+                Some(at_submit),
+                Some(POLYGON_GAS_PRICE)
+            ),
+            34_716_880_840
         );
     }
 
@@ -946,7 +1374,10 @@ mod tests {
         ("ethereum", 45_517_289, 5_757_642),
         ("bsc", 0, 50_000_000), // tip-dominated: base = 0
         ("base", 5_000_000, 1_000_000),
-        ("arbitrum", 20_000_000, 100_000), // the thinnest tip measured
+        // No priority market: `eth_maxPriorityFeePerGas` is `0x0`. (This
+        // row used to read tip 100_000 — `base / 200`, the quote's fallback,
+        // a tip the executor never signed.)
+        ("arbitrum", 20_076_000, 0),
         ("optimism", 536, 57),
         ("zero tip", 1_000_000_000, 0), // base-dominated: tip = 0
         ("one wei tip", 1_000_000_000, 1),
@@ -1155,15 +1586,15 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(tiers.slow.max_fee_per_gas, 450_465_297_501);
-        assert_eq!(tiers.slow.max_priority_fee_per_gas, 83_033_825_793);
-        assert_eq!(tiers.slow.network_fee_per_gas, 303_492_708_818);
-        assert_eq!(tiers.standard.max_fee_per_gas, 593_700_911_186);
-        assert_eq!(tiers.standard.max_priority_fee_per_gas, 103_792_282_242);
-        assert_eq!(tiers.standard.network_fee_per_gas, 397_737_459_609);
-        assert_eq!(tiers.fast.max_fee_per_gas, 900_930_595_002);
-        assert_eq!(tiers.fast.max_priority_fee_per_gas, 166_067_651_586);
-        assert_eq!(tiers.fast.network_fee_per_gas, 606_985_417_636);
+        assert_eq!(tiers.slow.max_fee_per_gas, 399_481_987_375);
+        assert_eq!(tiers.slow.max_priority_fee_per_gas, 27_773_221_947);
+        assert_eq!(tiers.slow.network_fee_per_gas, 250_798_481_205);
+        assert_eq!(tiers.standard.max_fee_per_gas, 530_328_214_672);
+        assert_eq!(tiers.standard.max_priority_fee_per_gas, 34_716_527_434);
+        assert_eq!(tiers.standard.network_fee_per_gas, 332_083_539_777);
+        assert_eq!(tiers.fast.max_fee_per_gas, 798_963_974_751);
+        assert_eq!(tiers.fast.max_priority_fee_per_gas, 55_546_443_894);
+        assert_eq!(tiers.fast.network_fee_per_gas, 501_596_962_409);
 
         // `standard`'s BASE-FEE term is, to the wei, the single price the
         // relay reported for this market before per-tier pricing; only the
@@ -1177,21 +1608,9 @@ mod tests {
         // `standard` because `standard` buys a bigger tip on top of the same
         // 2 × base cap.
         let untiered = quoted_outer_fee(POLYGON_BASE, POLYGON_TIP).unwrap();
-        assert_eq!(untiered, 572_942_454_737);
+        assert_eq!(untiered, 523_384_909_185);
         assert!(tiers.slow.max_fee_per_gas < untiered);
         assert!(untiered < tiers.standard.max_fee_per_gas);
-    }
-
-    #[test]
-    fn uses_the_median_priority_fee_from_fee_history_rewards() {
-        let rewards: Vec<Vec<String>> = serde_json::from_value(json!([
-            ["0x1", "0x4", "0x9"],
-            ["0x1", "0x6", "0x9"],
-            ["0x1", "0x8", "0x9"]
-        ]))
-        .unwrap();
-
-        assert_eq!(median_priority_fee(&rewards), Some(6));
     }
 
     #[test]
