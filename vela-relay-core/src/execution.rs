@@ -444,15 +444,22 @@ pub enum ExecutionDiagnostic {
     /// info: "submitting at the client-requested speed"
     ///
     /// `cap` is what the tier resolved to after the clamps, so `cap` below
-    /// `tier × base + tip` is the reimbursement or the inclusion floor
+    /// `base_fee_bps × base + tip` is the reimbursement or the inclusion floor
     /// speaking — the one line that explains why a paid-for speed was not
     /// delivered verbatim.
+    ///
+    /// `tip` is the tip actually signed (`tip_bps × market_tip`) and
+    /// `market_tip` the raw reading it was scaled from. Both are logged
+    /// because a tier that moved the cap and not the tip is the defect this
+    /// diagnostic exists to make visible: `tip == market_tip` on anything but
+    /// `slow` means the scaling was lost.
     SubmissionTierCap {
         tier: SubmissionTier,
         quoted_fee: u128,
         cap: u128,
         base_fee: u128,
         tip: u128,
+        market_tip: u128,
     },
     /// warn: "in-band reimbursement stayed unaffordable for the whole hold budget"
     HoldBudgetExhausted {
@@ -1439,12 +1446,18 @@ async fn execute_with_lane_lease(
         requested_tier: bundle_submission_tier(&survivors),
     };
     // A client may name how fast it wants its operation in. Resolving the name
-    // here, against the base fee the shell just read, is what makes a stale
-    // quote harmless: the client never names a price, only a speed. When it
-    // named nothing this returns `None` and the fee below is the one the
+    // here, against the base fee and tip the shell just read, is what makes a
+    // stale quote harmless: the client never names a price, only a speed. When
+    // it named nothing this returns `None` and the fees below are the ones the
     // executor has always used.
+    //
+    // BOTH levers are assigned. The cap alone buys resilience to a base-fee
+    // spike; the tip is what a block builder orders by, so assigning only the
+    // cap — as this did — left every tier with the same effective tip and made
+    // `fast` cost more for no priority at all.
+    let market_tip = fees.max_priority_fee_per_gas;
     if let Some(tier) = fees.requested_tier
-        && let Some(cap) = crate::settlement::decide_submission_cap(
+        && let Some(outer) = crate::settlement::decide_submission_fees(
             treasury,
             &chain_assets.assets,
             &call_datas,
@@ -1459,14 +1472,20 @@ async fn execute_with_lane_lease(
             ExecutionDiagnostic::SubmissionTierCap {
                 tier,
                 quoted_fee: fees.quoted_fee_per_gas,
-                cap,
+                cap: outer.max_fee_per_gas,
                 base_fee: fees.base_fee_per_gas,
-                tip: fees.max_priority_fee_per_gas,
+                tip: outer.max_priority_fee_per_gas,
+                market_tip,
             },
         )
         .await;
-        fees.quoted_fee_per_gas = cap;
-        context.max_fee_per_gas = cap;
+        fees.quoted_fee_per_gas = outer.max_fee_per_gas;
+        // The floor `decide_settlement` may reprice down to is computed from
+        // this tip, so carrying it into `fees` is what stops a reprice giving
+        // back the priority the client paid for.
+        fees.max_priority_fee_per_gas = outer.max_priority_fee_per_gas;
+        context.max_fee_per_gas = outer.max_fee_per_gas;
+        context.max_priority_fee_per_gas = outer.max_priority_fee_per_gas;
     }
     let settlement = match decide_settlement(
         treasury,
@@ -1680,14 +1699,34 @@ async fn execute_with_lane_lease(
     }
     ensure_lane_lease(ctx).await?;
 
+    // The one invariant every path above must leave true: the cap covers the
+    // base fee plus the whole signed tip. Below `base + tip` a builder sees
+    // only `cap − base` of priority, so the tier the client paid for would be
+    // silently truncated; below `base` the transaction is not includable at
+    // all, and geth refuses `maxPriorityFeePerGas > maxFeePerGas` outright.
+    // Every producer of these two numbers — the untiered quote, the tier
+    // resolution and the reprice — is bounded to satisfy it, so this is
+    // unreachable; it fails the batch rather than sign a transaction that
+    // cannot deliver what was charged for.
+    let outer_fee = crate::gas_math::OuterFee {
+        max_fee_per_gas: context.max_fee_per_gas,
+        max_priority_fee_per_gas: context.max_priority_fee_per_gas,
+    };
+    if !outer_fee.delivers_full_tip_at(context.base_fee_per_gas) {
+        return Err(format!(
+            "outer fee cap {} cannot carry the {} tip at base fee {}",
+            context.max_fee_per_gas, context.max_priority_fee_per_gas, context.base_fee_per_gas
+        ));
+    }
+
     let signed = match request(
         ctx,
         ExecutionOperation::SignBundle {
             request: BundleSignRequest {
                 nonce: context.nonce,
                 gas_limit,
-                max_fee_per_gas: context.max_fee_per_gas,
-                max_priority_fee_per_gas: context.max_priority_fee_per_gas,
+                max_fee_per_gas: outer_fee.max_fee_per_gas,
+                max_priority_fee_per_gas: outer_fee.max_priority_fee_per_gas,
                 entry_point,
                 calldata: calldata.to_vec(),
             },
@@ -3418,7 +3457,12 @@ mod tests {
                     quoted_fee: 2,
                     cap: 3,
                     base_fee: 1,
+                    // This market has no tip at all, so `2 ×` it is still 0
+                    // and only the cap can differ. The tip-scaling half of a
+                    // tier is exercised by
+                    // `a_named_speed_signs_the_tiers_tip_not_the_market_one`.
                     tip: 0,
+                    market_tip: 0,
                 },
             },
             ExecutionOutcome::Done,
@@ -3454,6 +3498,203 @@ mod tests {
                     nonce: 7,
                 },
             },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: CHAIN_ID,
+            lane: fixture.routed.lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: "0x02010203".into(),
+            transaction_hash: signed_hash.clone(),
+            nonce: 7,
+            user_operation_hashes: vec![fixture.hash_string.clone()],
+        };
+        driver.step(
+            ExecutionOperation::SavePreparedBundle {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: signed_raw.to_vec(),
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: signed_hash.to_ascii_uppercase(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::MarkBundleSubmitted {
+                intent,
+                gas_limit: 100,
+            },
+            ExecutionOutcome::Indexed { indexed: 1 },
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_named_speed_signs_the_tiers_tip_not_the_market_one() {
+        // The defect, at the layer that caused it: the tier used to replace
+        // only `context.max_fee_per_gas`, so the `BundleSignRequest` below
+        // carried the raw market tip and the block builder — which orders by
+        // `min(maxPriorityFeePerGas, maxFeePerGas − baseFee)` — saw exactly
+        // what a `slow` send would have offered. This walks a real market
+        // (base 100, market tip 40) through the whole pipeline and pins BOTH
+        // numbers in the signed request.
+        //
+        // fast: cap = 3 × 100 + 2 × 40 = 380, tip = 80.
+        // Funding: 100 gas at the untiered quote 240 costs 24_000, × 1.4 =
+        // 33_600 required; 60_000 paid funds a 428 cap, so nothing clamps.
+        let fixture = fixture_at(60_000, SubmissionTier::Fast);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
+
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata: calldata.clone(),
+            },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    estimated_gas: U256::from(100u64),
+                    base_fee_per_gas: 100,
+                    max_fee_per_gas: 240, // the untiered 2 × 100 + 40
+                    max_priority_fee_per_gas: 40,
+                    nonce: 7,
+                    relayer_balance: U256::from(1_000_000u64),
+                },
+            },
+        );
+        // The operator's one line: the tip actually signed beside the market
+        // tip it was scaled from. `tip == market_tip` on anything but `slow`
+        // would mean the scaling was lost again.
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::SubmissionTierCap {
+                    tier: SubmissionTier::Fast,
+                    quoted_fee: 240,
+                    cap: 380,
+                    base_fee: 100,
+                    tip: 80,
+                    market_tip: 40,
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let signed_raw = [0x02u8, 0x01, 0x02, 0x03];
+        let signed_hash = alloy::primitives::keccak256(signed_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 100,
+                    // Both levers, not one. 380 = 3 × 100 + 80, and the tip
+                    // is `fast`'s 80 — the market 40 would have bought the
+                    // same block as `slow`.
+                    max_fee_per_gas: 380,
+                    max_priority_fee_per_gas: 80,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x02010203".into(),
+                    transaction_hash: signed_hash.clone(),
+                    nonce: 7,
+                },
+            },
+        );
+        // `min(80, 380 − 100) = 80`: what the builder is paid, and the number
+        // that was identical at every tier before this change.
+        assert!(
+            crate::gas_math::OuterFee {
+                max_fee_per_gas: 380,
+                max_priority_fee_per_gas: 80,
+            }
+            .delivers_full_tip_at(100)
         );
         driver.step(
             ExecutionOperation::EnsureLaneLease,

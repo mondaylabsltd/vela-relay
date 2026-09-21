@@ -10,7 +10,9 @@ use vela_relay_core::gas_math::{
     FeeHistory, fallback_priority_fee, legacy_price_from_result, median_priority_fee,
     parse_quantity, price_from_fee_history, tiers,
 };
-pub use vela_relay_core::gas_math::{GasPrice, GasPriceError, GasPricePolicy, GasPriceTiers};
+pub use vela_relay_core::gas_math::{
+    GasPrice, GasPriceError, GasPricePolicy, GasPriceTiers, NetworkGasPrice,
+};
 
 use crate::utils::rpc;
 
@@ -116,7 +118,7 @@ impl GasPriceManager {
         &self,
         chain_id: u64,
         user_rpc_url: Option<&HeaderValue>,
-    ) -> Result<(GasPrice, String), GasPriceError> {
+    ) -> Result<(NetworkGasPrice, String), GasPriceError> {
         if let Ok(response) = rpc::call(
             chain_id,
             user_rpc_url,
@@ -137,8 +139,11 @@ impl GasPriceManager {
         self.legacy_gas_price(chain_id, user_rpc_url).await
     }
 
-    pub fn tiers(&self, network_price: GasPrice) -> Result<GasPriceTiers, GasPriceError> {
-        tiers(&self.policy, network_price)
+    /// The three reported tiers. No policy is involved any more: a tier is
+    /// the cap it submits at, and every number reported for it derives from
+    /// that cap (`gas_math::tiers`).
+    pub fn tiers(&self, network_price: NetworkGasPrice) -> Result<GasPriceTiers, GasPriceError> {
+        tiers(network_price)
     }
 
     async fn eip1559_price(
@@ -146,7 +151,7 @@ impl GasPriceManager {
         result: Value,
         chain_id: u64,
         user_rpc_url: Option<&HeaderValue>,
-    ) -> Result<GasPrice, GasPriceError> {
+    ) -> Result<NetworkGasPrice, GasPriceError> {
         let fee_history = serde_json::from_value::<FeeHistory>(result)
             .map_err(|_| GasPriceError::InvalidUpstreamResponse)?;
         let base_fee = fee_history
@@ -160,7 +165,7 @@ impl GasPriceManager {
             _ => self.priority_fee(chain_id, user_rpc_url, base_fee).await?,
         };
 
-        price_from_fee_history(&fee_history, self.policy.base_fee_multiplier, priority_fee)
+        price_from_fee_history(&fee_history, priority_fee)
     }
 
     async fn priority_fee(
@@ -193,7 +198,7 @@ impl GasPriceManager {
         &self,
         chain_id: u64,
         user_rpc_url: Option<&HeaderValue>,
-    ) -> Result<(GasPrice, String), GasPriceError> {
+    ) -> Result<(NetworkGasPrice, String), GasPriceError> {
         let response = rpc::call(
             chain_id,
             user_rpc_url,

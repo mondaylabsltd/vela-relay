@@ -1963,8 +1963,9 @@ impl LaneDo {
                 cap,
                 base_fee,
                 tip,
+                market_tip,
             } => worker::console_log!(
-                "submitting at the client-requested speed: chain_id={chain_id} tier={} quoted_fee={quoted_fee} cap={cap} base_fee={base_fee} tip={tip}",
+                "submitting at the client-requested speed: chain_id={chain_id} tier={} quoted_fee={quoted_fee} cap={cap} base_fee={base_fee} tip={tip} market_tip={market_tip}",
                 tier.as_str()
             ),
             Diagnostic::HoldBudgetExhausted {

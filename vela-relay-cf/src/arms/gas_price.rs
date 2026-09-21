@@ -7,8 +7,9 @@ use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vela_relay_core::gas_math::{
-    FeeHistory, GasPrice, GasPriceError, GasPricePolicy, GasPriceTiers, fallback_priority_fee,
-    legacy_price_from_result, median_priority_fee, parse_quantity, price_from_fee_history, tiers,
+    FeeHistory, GasPriceError, GasPricePolicy, GasPriceTiers, NetworkGasPrice,
+    fallback_priority_fee, legacy_price_from_result, median_priority_fee, parse_quantity,
+    price_from_fee_history, tiers,
 };
 use worker::{Date, Delay, Env};
 
@@ -42,6 +43,12 @@ pub async fn user_operation_gas_prices(
     // KV is a cache only (FR-006): a stale-window miss just refetches. The
     // 5 s logical TTL matches the docker cache; KV's minimum expiry is 60 s,
     // so freshness is enforced by the embedded timestamp.
+    //
+    // A `GasPriceTiers` written by an older build lacks `networkFeePerGas`
+    // and `relayerFeePerGas`, so the deserialize below fails and this falls
+    // through to a refetch rather than serving a row with the missing field
+    // defaulted to zero. That is the right failure for a deploy: at most one
+    // extra upstream call per chain, and never a quote whose `R` is absent.
     let cache_key = format!("gasprice:{chain_id}");
     if user_rpc_url.is_none()
         && let Ok(kv) = env.kv(KV_BINDING)
@@ -84,7 +91,7 @@ async fn fetch_user_operation_gas_prices(
     let (network_price, rpc_domain) =
         network_gas_price(config, env, chain_id, user_rpc_url, &policy).await?;
     Ok(GasPriceQuote {
-        tiers: tiers(&policy, network_price)?,
+        tiers: tiers(network_price)?,
         rpc_domain,
     })
 }
@@ -95,7 +102,7 @@ async fn network_gas_price(
     chain_id: u64,
     user_rpc_url: Option<&str>,
     policy: &GasPricePolicy,
-) -> Result<(GasPrice, String), GasPriceError> {
+) -> Result<(NetworkGasPrice, String), GasPriceError> {
     if let Ok(response) = rpc::call(
         config,
         env,
@@ -124,7 +131,7 @@ async fn eip1559_price(
     chain_id: u64,
     user_rpc_url: Option<&str>,
     policy: &GasPricePolicy,
-) -> Result<GasPrice, GasPriceError> {
+) -> Result<NetworkGasPrice, GasPriceError> {
     let fee_history = serde_json::from_value::<FeeHistory>(result)
         .map_err(|_| GasPriceError::InvalidUpstreamResponse)?;
     let base_fee = fee_history
@@ -138,7 +145,7 @@ async fn eip1559_price(
         _ => priority_fee_probe(config, env, chain_id, user_rpc_url, base_fee, policy).await?,
     };
 
-    price_from_fee_history(&fee_history, policy.base_fee_multiplier, priority_fee)
+    price_from_fee_history(&fee_history, priority_fee)
 }
 
 async fn priority_fee_probe(
@@ -173,7 +180,7 @@ async fn legacy_gas_price(
     env: &Env,
     chain_id: u64,
     user_rpc_url: Option<&str>,
-) -> Result<(GasPrice, String), GasPriceError> {
+) -> Result<(NetworkGasPrice, String), GasPriceError> {
     let response = rpc::call(
         config,
         env,

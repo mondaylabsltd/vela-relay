@@ -163,24 +163,17 @@ mod tests {
     use tokio::sync::Barrier;
 
     use super::{CacheRequest, GasPriceCache};
-    use crate::gas_price::{GasPrice, GasPriceQuote, GasPriceTiers};
+    use vela_relay_core::gas_math::{NetworkGasPrice, tiers};
+
+    use crate::gas_price::GasPriceQuote;
 
     fn quote() -> GasPriceQuote {
         GasPriceQuote {
-            tiers: GasPriceTiers {
-                slow: GasPrice {
-                    max_fee_per_gas: 1,
-                    max_priority_fee_per_gas: 1,
-                },
-                standard: GasPrice {
-                    max_fee_per_gas: 2,
-                    max_priority_fee_per_gas: 2,
-                },
-                fast: GasPrice {
-                    max_fee_per_gas: 3,
-                    max_priority_fee_per_gas: 3,
-                },
-            },
+            tiers: tiers(NetworkGasPrice {
+                base_fee_per_gas: 100,
+                max_priority_fee_per_gas: 10,
+            })
+            .unwrap(),
             rpc_domain: "rpc.example.com".into(),
         }
     }

@@ -522,6 +522,8 @@ fn gas_price_result(
         vela_relay_core::wire::GasPriceTier {
             max_fee_per_gas: format!("0x{:x}", price.max_fee_per_gas),
             max_priority_fee_per_gas: format!("0x{:x}", price.max_priority_fee_per_gas),
+            network_fee_per_gas: format!("0x{:x}", price.network_fee_per_gas),
+            relayer_fee_per_gas: format!("0x{:x}", price.relayer_fee_per_gas),
         }
     }
     vela_relay_core::wire::UserOperationGasPrice {

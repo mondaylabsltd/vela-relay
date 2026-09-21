@@ -54,6 +54,8 @@ fn to_rpc_tier(gas_price: GasPrice) -> GasPriceTier {
     GasPriceTier {
         max_fee_per_gas: quantity(gas_price.max_fee_per_gas),
         max_priority_fee_per_gas: quantity(gas_price.max_priority_fee_per_gas),
+        network_fee_per_gas: quantity(gas_price.network_fee_per_gas),
+        relayer_fee_per_gas: quantity(gas_price.relayer_fee_per_gas),
     }
 }
 
@@ -65,33 +67,52 @@ fn quantity(value: u128) -> String {
 mod tests {
     use serde_json::json;
 
-    use crate::gas_price::{GasPrice, GasPriceError, GasPriceTiers};
+    use vela_relay_core::gas_math::{NetworkGasPrice, tiers};
+
+    use crate::gas_price::GasPriceError;
 
     use super::{response_error, to_rpc_result};
 
     #[test]
     fn converts_gas_price_tiers_to_the_pimlico_response_shape() {
-        let result = to_rpc_result(GasPriceTiers {
-            slow: GasPrice {
-                max_fee_per_gas: 100,
-                max_priority_fee_per_gas: 10,
-            },
-            standard: GasPrice {
-                max_fee_per_gas: 110,
-                max_priority_fee_per_gas: 11,
-            },
-            fast: GasPrice {
-                max_fee_per_gas: 120,
-                max_priority_fee_per_gas: 12,
-            },
-        });
+        // Straight through the tier arithmetic, so the wire shape is checked
+        // against the numbers a client will actually be quoted rather than
+        // against invented ones: base 100, market tip 40.
+        //
+        // `maxPriorityFeePerGas` differs per tier, and that is the point: it
+        // is the tip the relay will SIGN that tier with (1.0 / 1.25 / 2.0 ×
+        // the market tip), not the raw market reading. A wallet shown one tip
+        // and charged for another is the same defect as a tier that moved the
+        // cap and left the tip alone.
+        let result = to_rpc_result(
+            tiers(NetworkGasPrice {
+                base_fee_per_gas: 100,
+                max_priority_fee_per_gas: 40,
+            })
+            .unwrap(),
+        );
 
         assert_eq!(
             serde_json::to_value(result).unwrap(),
             json!({
-                "slow": { "maxFeePerGas": "0x64", "maxPriorityFeePerGas": "0xa" },
-                "standard": { "maxFeePerGas": "0x6e", "maxPriorityFeePerGas": "0xb" },
-                "fast": { "maxFeePerGas": "0x78", "maxPriorityFeePerGas": "0xc" }
+                "slow": {
+                    "maxFeePerGas": "0xbe",           // 1.5 × 100 + 40 = 190
+                    "maxPriorityFeePerGas": "0x28",   // 1.00 × 40      =  40
+                    "networkFeePerGas": "0x82",       // 0.9 × 100 + 40 = 130
+                    "relayerFeePerGas": "0x3c"        // 0.6 × 100      =  60
+                },
+                "standard": {
+                    "maxFeePerGas": "0xfa",           // 2.0 × 100 + 50 = 250
+                    "maxPriorityFeePerGas": "0x32",   // 1.25 × 40      =  50
+                    "networkFeePerGas": "0xaa",       // 1.2 × 100 + 50 = 170
+                    "relayerFeePerGas": "0x50"        // 0.8 × 100      =  80
+                },
+                "fast": {
+                    "maxFeePerGas": "0x17c",          // 3.0 × 100 + 80 = 380
+                    "maxPriorityFeePerGas": "0x50",   // 2.00 × 40      =  80
+                    "networkFeePerGas": "0x104",      // 1.8 × 100 + 80 = 260
+                    "relayerFeePerGas": "0x78"        // 1.2 × 100      = 120
+                }
             })
         );
     }

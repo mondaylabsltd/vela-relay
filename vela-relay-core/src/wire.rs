@@ -555,11 +555,22 @@ pub enum InBandGasQuoteAsset {
     Erc20,
 }
 
+/// One tier of `pimlico_getUserOperationGasPrice`. The last two fields are
+/// the Vela extension the in-band fee contract is built on
+/// (`docs/fees.md` §2b): a generic bundler omits them, this relay never does.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GasPriceTier {
+    /// The cap the relay will submit this tier at.
     pub max_fee_per_gas: Quantity,
     pub max_priority_fee_per_gas: Quantity,
+    /// `R`: what the client's in-band reimbursement must be priced against.
+    /// Absent, vela-core silently falls back to its own chain measurement and
+    /// every tier costs the same — the defect this field exists to close.
+    pub network_fee_per_gas: Quantity,
+    /// `maxFeePerGas − networkFeePerGas`, the inclusion headroom above the
+    /// reimbursement basis. Reported so no client has to infer it.
+    pub relayer_fee_per_gas: Quantity,
 }
 
 pub use crate::task::UserOperationStatus as UserOperationStatusKind;
