@@ -50,7 +50,10 @@ mod tests {
         assert!(quantity_is_below("0x0", NATIVE_TREASURY_FLOOR));
         assert!(quantity_is_below("0x5af3107a3fff", NATIVE_TREASURY_FLOOR));
         assert!(!quantity_is_below("0x5af3107a4000", NATIVE_TREASURY_FLOOR));
-        assert!(!quantity_is_below("0x10000000000000000", NATIVE_TREASURY_FLOOR));
+        assert!(!quantity_is_below(
+            "0x10000000000000000",
+            NATIVE_TREASURY_FLOOR
+        ));
     }
 
     /// The case that sent a person to a spinner: a treasury with nothing in it
