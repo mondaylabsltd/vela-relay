@@ -77,7 +77,12 @@ mod tests {
     /// what decides a value the protocol defines.
     #[test]
     fn prices_every_dollar_native_chain_without_the_market() {
-        for chain_id in [GNOSIS_CHAIN_ID, ARC_CHAIN_ID, ARC_TESTNET_CHAIN_ID, STABLE_CHAIN_ID] {
+        for chain_id in [
+            GNOSIS_CHAIN_ID,
+            ARC_CHAIN_ID,
+            ARC_TESTNET_CHAIN_ID,
+            STABLE_CHAIN_ID,
+        ] {
             assert!(
                 pegged_native_usd_price(chain_id).is_some(),
                 "chain {chain_id} must be pegged, not quoted"

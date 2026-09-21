@@ -57,7 +57,7 @@ pub mod settlement;
 pub mod signing;
 pub mod simulation;
 pub mod task;
-pub mod treasury;
 pub mod tempo;
+pub mod treasury;
 pub mod vault;
 pub mod wire;

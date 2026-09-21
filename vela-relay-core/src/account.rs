@@ -83,7 +83,10 @@ mod tests {
             Some("0x14fb1fb21751e29f7ec48dc450017552e3d1ea5c".into())
         );
         assert_eq!(normalize_address("0x1234"), None);
-        assert_eq!(normalize_address("14fb1fb21751e29f7ec48dc450017552e3d1ea5c"), None);
+        assert_eq!(
+            normalize_address("14fb1fb21751e29f7ec48dc450017552e3d1ea5c"),
+            None
+        );
     }
 
     #[test]

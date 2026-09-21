@@ -153,7 +153,9 @@ fn error(status: StatusCode, message: &'static str) -> Response {
 mod tests {
     use serde_json::json;
 
-    use super::{AccountInfo, account_status, entry_point_nonce_params, parse_nonce, parse_quantity};
+    use super::{
+        AccountInfo, account_status, entry_point_nonce_params, parse_nonce, parse_quantity,
+    };
     use vela_relay_core::account::AccountStatus;
 
     #[test]
