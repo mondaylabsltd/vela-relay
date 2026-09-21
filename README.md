@@ -60,8 +60,11 @@ Copy the example configuration and replace every placeholder. Keep the resulting
 
 ```sh
 cp .env.example .env
-cargo run --release
+cargo run --release --bin vela-relay
 ```
+
+`--bin vela-relay` is required: the package also ships `deploy-simulations`, so a bare
+`cargo run` cannot pick one.
 
 The minimal configuration is:
 
@@ -225,8 +228,41 @@ For Docker Hub publishing, configure the repository Actions settings:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --locked
-cargo test --locked
+cargo clippy --workspace --exclude vela-relay-cf --all-targets --locked
+cargo test --workspace --exclude vela-relay-cf --locked
+cargo check -p vela-relay-cf --target wasm32-unknown-unknown   # the Worker shell
 ```
 
+`--workspace` is load-bearing. Without it cargo builds only the root package, which leaves
+every `vela-relay-core` test unrun — that is where settlement, gas math and execution live.
+`--exclude vela-relay-cf` is required in return: that crate is wasm-only, and natively it
+compiles to an empty crate.
+
 The integration test that requires a running Iggy service is intentionally ignored by default.
+
+### Running against local infrastructure
+
+The relay needs Iggy and Redis. To develop without touching shared infrastructure, run
+throwaway containers and point the relay at them with the executor off:
+
+```sh
+docker run -d --name vela-dev-redis -p 127.0.0.1:6391:6379 redis:7-alpine
+docker run -d --name vela-dev-iggy --security-opt seccomp=unconfined \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=dev-local-only \
+  -p 127.0.0.1:5191:8090 apache/iggy:latest
+
+VELA_RELAY_REDIS_URL="redis://127.0.0.1:6391/0" \
+VELA_RELAY_IGGY_URL="iggy+tcp://iggy:dev-local-only@127.0.0.1:5191?reconnection_retries=5&heartbeat_interval=3s" \
+VELA_RELAY_EXECUTOR_ENABLED=false \
+VELA_RELAY_LISTEN_ADDR="127.0.0.1:4599" \
+  cargo run --bin vela-relay
+```
+
+`VELA_RELAY_EXECUTOR_ENABLED=false` makes the instance intake-only. **It defaults to `true`**,
+and an enabled executor joins the shared consumer group, claims real queued operations, and
+signs and broadcasts real transactions with `OPERATOR_SECRET` — so a development run against
+production Iggy and Redis competes with the deployed relay for live work.
+
+Note that the process loads `.env` from its working directory, so a `cargo run` from the
+repository root picks up whatever is configured there. Explicit environment variables win over
+`.env` values, but any key you do not override still applies.

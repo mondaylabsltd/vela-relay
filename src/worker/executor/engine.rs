@@ -1708,6 +1708,7 @@ impl BatchShell<'_> {
                         cap,
                         base_fee,
                         tip,
+                        market_tip,
                     } => {
                         tracing::info!(
                             chain_id,
@@ -1716,6 +1717,7 @@ impl BatchShell<'_> {
                             cap,
                             base_fee,
                             tip,
+                            market_tip,
                             "submitting at the client-requested speed"
                         );
                     }
