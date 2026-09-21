@@ -95,7 +95,10 @@ operations and no prepared intents on the removed lanes).
 
 Executor RPC resolution per chain: explicit `VELA_RELAY_EXECUTOR_RPC_URLS`
 (JSON map, http/https) → Alchemy (when `ALCHEMY_API_KEY` is set) → the
-controlled directory (https, non-local). A chain with no resolvable executor
+chain directory (https, non-local). The directory is
+`VELA_RELAY_CHAIN_DIRECTORY_URL` (a `vars` entry; default
+`https://ethereum-data.getvela.app`), the same setting as the docker shell;
+metadata is cached in KV for an hour. A chain with no resolvable executor
 RPC defers its work with the frozen "chain has no trusted executor RPC"
 diagnostic — admission still accepts and records.
 

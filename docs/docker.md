@@ -13,7 +13,8 @@ curl --fail http://127.0.0.1:4567/readyz
 ```
 
 `OPERATOR_SECRET` is required when the executor is enabled. Trusted execution RPCs resolve
-automatically from Vela's controlled chain directory; `ALCHEMY_API_KEY` and
+automatically from the chain directory (`VELA_RELAY_CHAIN_DIRECTORY_URL`, default
+`https://ethereum-data.getvela.app`; see the README); `ALCHEMY_API_KEY` and
 `VELA_RELAY_EXECUTOR_RPC_URLS` are optional higher-priority overrides. The executor is enabled
 by default; set `VELA_RELAY_EXECUTOR_ENABLED=false` for an enqueue-only Relay.
 

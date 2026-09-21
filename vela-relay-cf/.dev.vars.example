@@ -5,6 +5,7 @@ VELA_RELAY_EXECUTOR_ENABLED=false
 VELA_RELAY_EXECUTION_CHAINS=
 # OPERATOR_SECRET=<throwaway dev key — required only when execution is enabled>
 # ALCHEMY_API_KEY=
+# VELA_RELAY_CHAIN_DIRECTORY_URL=https://ethereum-data.getvela.app   # default
 # VELA_RELAY_EXECUTOR_RPC_URLS={"42161":["https://arb1.arbitrum.io/rpc"]}
 # VELA_RELAY_EXECUTOR_RPC_TIMEOUT_SECS=5
 # VELA_RELAY_EXECUTOR_LEASE_TTL_SECS=30

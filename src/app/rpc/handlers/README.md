@@ -71,7 +71,7 @@ RPC sources are tried in this order:
 
 1. The HTTPS URL supplied by the `x-vela-rpc-url` request header.
 2. Alchemy when `ALCHEMY_API_KEY` is set and the numeric EVM `chainId` is present in the Alchemy Chain Resource Directory registry. The registry includes all 80 networks currently listed at `https://www.alchemy.com/rpc`; non-EVM entries are retained for future use but are outside this ERC-4337 JSON-RPC API's scope.
-3. HTTPS URLs from `https://ethereum-data.getvela.app/chains/eip155-{chainId}.json`, in the published order.
+3. HTTPS URLs from the chain directory's `{base}/chains/eip155-{chainId}.json`, in the published order. The base is `VELA_RELAY_CHAIN_DIRECTORY_URL`, `https://ethereum-data.getvela.app` when unset.
 
 Each upstream request has a one-second deadline. The full gas-price calculation, including `eth_feeHistory`, priority-fee fallback, legacy fallback, and every source switch, has a 2.8-second internal budget. This leaves time for the HTTP response to reach the caller within three seconds. If no source succeeds in that budget, the handler returns JSON-RPC error `-32000` with the message `gas price RPC request timed out` instead of waiting longer.
 

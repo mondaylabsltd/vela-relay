@@ -12,6 +12,11 @@ use tokio::net::TcpListener;
 fn main() -> Result<(), AppError> {
     let config = Config::from_env()?;
     utils::logging::init(&config.logging)?;
+    utils::rpc::set_chain_directory(config.chain_directory.clone());
+    tracing::info!(
+        chain_directory = config.chain_directory.base_url(),
+        "chain directory configured"
+    );
     if let Some(address) = config.settlement_recipient.as_deref() {
         tracing::info!(vault_address = address, "settlement vault initialized");
     }

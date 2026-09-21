@@ -2,7 +2,7 @@
 //! (Constitution II). Bounds mirror the docker parser where they apply; the
 //! Iggy fixed-routing width pin deliberately does NOT (research.md R11).
 
-use vela_relay_core::vault;
+use vela_relay_core::{chain_directory::ChainDirectory, vault};
 use worker::Env;
 
 #[derive(Clone)]
@@ -105,6 +105,10 @@ impl CfConfig {
             Some(value) => parse_bool("VELA_RELAY_EXECUTOR_ENABLED", &value)?,
             None => true,
         };
+
+        // Read per fetch by `arms::market`; checked here so a bad value fails
+        // every request instead of only the uncached ones.
+        chain_directory(env)?;
 
         let operator_secret = secret(env, "OPERATOR_SECRET");
         if executor_enabled && operator_secret.is_none() {
@@ -334,6 +338,12 @@ fn usize_var(env: &Env, name: &str, default: usize) -> Result<usize, String> {
             .parse::<usize>()
             .map_err(|error| format!("invalid {name}: {error}")),
     }
+}
+
+/// Same setting and rule as the docker shell; absent = Vela's directory.
+pub fn chain_directory(env: &Env) -> Result<ChainDirectory, String> {
+    ChainDirectory::from_setting(var(env, "VELA_RELAY_CHAIN_DIRECTORY_URL").as_deref())
+        .map_err(|error| format!("invalid VELA_RELAY_CHAIN_DIRECTORY_URL: {error}"))
 }
 
 fn var(env: &Env, name: &str) -> Option<String> {
