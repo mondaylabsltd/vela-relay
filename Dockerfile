@@ -11,10 +11,23 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
+# Everything the root package's build reads, and nothing else:
+#   - the workspace members, because cargo loads EVERY member's manifest
+#     before it builds anything (a missing one fails with "failed to load
+#     manifest for workspace member"); keep this in step with `members` in
+#     Cargo.toml;
+#   - build.rs and the build_info.rs it `include!`s (both shells' build
+#     scripts share that one file, so it sits at the root, not in src);
+#   - contracts/alto, `include_str!`d by src/worker/executor/deployment.rs.
+COPY Cargo.toml Cargo.lock build.rs build_info.rs ./
 COPY src ./src
+COPY vela-relay-core ./vela-relay-core
+COPY vela-relay-cf ./vela-relay-cf
+COPY contracts ./contracts
 
-RUN cargo build --release --locked
+# --bin vela-relay: the package also ships `deploy-simulations`, an operator
+# tool the image has no use for.
+RUN cargo build --release --locked --bin vela-relay
 
 
 FROM debian:bookworm-slim AS runtime

@@ -6,8 +6,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # `.env` is gitignored, so a fresh clone does not have one: marking it
+    # optional keeps `docker compose build`/`config` working there. The relay
+    # still needs it to run — see "Docker" in README.md (cp .env.example .env,
+    # then fill it in).
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       VELA_RELAY_LISTEN_ADDR: 0.0.0.0:4567
     ports:

@@ -170,6 +170,10 @@ docker compose up --build -d
 curl --fail http://127.0.0.1:4567/readyz
 ```
 
+`.env` is gitignored, so `compose.yaml` marks it optional: a fresh clone can
+build and `docker compose config` without one. The relay still needs it to run —
+copy it first, as above.
+
 When Iggy or Redis runs on the Docker host, use `host.docker.internal` in their URLs instead of
 `127.0.0.1`. For a published release image, set `VELA_RELAY_IMAGE` in `.env`, then run:
 
