@@ -32,6 +32,8 @@
 //!   affordability.
 //! - [`tempo`] — Tempo chain constants and pathUSD calldata builders.
 //! - [`alchemy`] — the static Alchemy network registry.
+//! - [`chain_directory`] — the chain-metadata directory address and the
+//!   per-chain metadata URL.
 //!
 //! Nondeterministic inputs (wall-clock time, generated identifiers, chain
 //! context, market prices, policy values) always enter through an event or an
@@ -44,6 +46,7 @@ pub mod admission;
 pub mod alchemy;
 pub mod alert;
 pub mod broadcast;
+pub mod chain_directory;
 pub mod cost;
 pub mod estimate;
 pub mod execution;

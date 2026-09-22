@@ -78,13 +78,31 @@ OPERATOR_SECRET=your-operator-secret
 connections inherit it automatically. For a producer-only instance, set
 `VELA_RELAY_EXECUTOR_ENABLED=false`; then an operator secret is not needed.
 
-For execution, Relay resolves RPC endpoints automatically from Vela's controlled chain directory.
-If `ALCHEMY_API_KEY` is set, its endpoint is tried first for networks Alchemy supports. You can
-optionally prepend an explicit trusted endpoint for a particular chain:
+For execution, Relay resolves RPC endpoints automatically from a chain directory — by default
+Vela's, at `https://ethereum-data.getvela.app`. If `ALCHEMY_API_KEY` is set, its endpoint is tried
+first for networks Alchemy supports. You can optionally prepend an explicit trusted endpoint for a
+particular chain:
 
 ```dotenv
 VELA_RELAY_EXECUTOR_RPC_URLS={"42161":"https://your-rpc.example"}
 ```
+
+### Chain directory
+
+The directory is where Relay reads each network's details: its public RPC endpoints, its native
+asset, and the stablecoins it accepts as payment. It is a deployment of
+[ethereum-data](https://github.com/atshelchin/ethereum-data) serving
+`{base}/chains/eip155-{chainId}.json`. To run Relay without any Vela-operated service, run your
+own and point Relay at it:
+
+```dotenv
+VELA_RELAY_CHAIN_DIRECTORY_URL=https://chains.example.org
+```
+
+The value is a base URL (`http` or `https`, optionally with a path prefix, no query string).
+When it is unset, Relay uses `https://ethereum-data.getvela.app`. The directory decides which RPC
+endpoints and payment tokens Relay trusts, so use one you control. Fetched entries are cached for
+an hour, so restart (Docker) or wait out the cache (Workers KV) after switching.
 
 For native-gas chains, a low relayer balance triggers a durable treasury top-up. The target is
 the greater of the next bundle prefund multiplied by `5` and the configured float target. If

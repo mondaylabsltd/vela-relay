@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use worker::{Delay, Env, Fetch, Headers, Method, Request, RequestInit};
 
-const RPC_LIST_URL: &str = "https://ethereum-data.getvela.app/chains/eip155-";
 const METADATA_REQUEST_ATTEMPTS: usize = 3;
 const METADATA_CACHE_TTL_SECS: u64 = 60 * 60;
 const KV_BINDING: &str = "CACHE";
@@ -113,7 +112,7 @@ async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, Strin
         return Ok(metadata);
     }
 
-    let url = format!("{RPC_LIST_URL}{chain_id}.json");
+    let url = crate::config::chain_directory(env)?.metadata_url(chain_id);
     let mut last_error = None;
     for attempt in 1..=METADATA_REQUEST_ATTEMPTS {
         match fetch_json(&url).await {

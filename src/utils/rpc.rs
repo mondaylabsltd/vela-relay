@@ -9,10 +9,10 @@ use axum::http::HeaderValue;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use vela_relay_core::chain_directory::ChainDirectory;
 
 pub const USER_RPC_URL_HEADER: &str = "x-vela-rpc-url";
 
-const RPC_LIST_URL: &str = "https://ethereum-data.getvela.app/chains/eip155-";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -27,6 +27,7 @@ static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static METADATA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static FAILED_RPCS: OnceLock<FailedRpcCache> = OnceLock::new();
 static CHAIN_METADATA_CACHE: OnceLock<Mutex<HashMap<u64, CachedChainMetadata>>> = OnceLock::new();
+static CHAIN_DIRECTORY: OnceLock<ChainDirectory> = OnceLock::new();
 
 #[derive(Debug, PartialEq)]
 pub struct RpcCallResult {
@@ -282,6 +283,15 @@ fn http_client() -> &'static Client {
     })
 }
 
+/// Set once at startup from `VELA_RELAY_CHAIN_DIRECTORY_URL`; later calls are ignored.
+pub fn set_chain_directory(directory: ChainDirectory) {
+    let _ = CHAIN_DIRECTORY.set(directory);
+}
+
+fn chain_directory() -> &'static ChainDirectory {
+    CHAIN_DIRECTORY.get_or_init(ChainDirectory::default)
+}
+
 fn metadata_http_client() -> &'static Client {
     METADATA_HTTP_CLIENT.get_or_init(|| {
         Client::builder()
@@ -324,7 +334,7 @@ async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMet
         return Ok(metadata);
     }
 
-    let url = format!("{RPC_LIST_URL}{chain_id}.json");
+    let url = chain_directory().metadata_url(chain_id);
     let mut last_error = None;
     for attempt in 1..=METADATA_REQUEST_ATTEMPTS {
         match fetch_chain_metadata_once(client, &url).await {

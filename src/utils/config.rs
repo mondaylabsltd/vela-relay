@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use vela_relay_core::chain_directory::ChainDirectory;
+
 /// Default in-band reimbursement multiplier: 1.4x the simulated outer transaction cost.
 pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
 
@@ -43,6 +45,8 @@ pub struct Config {
     pub redis: RedisConfig,
     pub executor: ExecutorConfig,
     pub settlement_recipient: Option<String>,
+    /// Where chain metadata (RPC endpoints, native asset, stablecoins) is read from.
+    pub chain_directory: ChainDirectory,
 }
 
 #[derive(Clone, Debug)]
@@ -268,8 +272,15 @@ impl Config {
             },
             executor: executor_config()?,
             settlement_recipient: settlement_recipient()?,
+            chain_directory: chain_directory()?,
         })
     }
+}
+
+fn chain_directory() -> Result<ChainDirectory, ConfigError> {
+    let value = optional_value("VELA_RELAY_CHAIN_DIRECTORY_URL")?;
+    ChainDirectory::from_setting(value.as_deref())
+        .map_err(|error| ConfigError(format!("invalid VELA_RELAY_CHAIN_DIRECTORY_URL: {error}")))
 }
 
 fn executor_config() -> Result<ExecutorConfig, ConfigError> {

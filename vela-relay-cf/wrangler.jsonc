@@ -56,6 +56,9 @@
     // MANDATORY + globally disjoint only when key material is shared across
     // deployments (FR-010).
     "VELA_RELAY_EXECUTION_CHAINS": ""
+    // Optional; absent = https://ethereum-data.getvela.app. Base URL of the
+    // chain directory (RPCs, native asset, accepted stablecoins per chain).
+    // "VELA_RELAY_CHAIN_DIRECTORY_URL": "https://chains.example.org"
   }
   // Secrets (never in this file): OPERATOR_SECRET, ALCHEMY_API_KEY,
   // TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — set via `wrangler secret put`.
