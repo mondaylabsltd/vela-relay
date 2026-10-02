@@ -151,6 +151,13 @@ trusted `debug_traceCall` fallback), then submits `handleOps` in a signed `0x76`
 the relayer float is low, the treasury automatically sends a durable pathUSD top-up through a
 separate self-paying `0x76` transaction.
 
+The treasury probe (`GET /v1/treasury/4217`) accordingly reads the treasury's pathUSD `balanceOf`,
+never `eth_getBalance` (Tempo answers that with a placeholder, not money), and reports
+`"asset": "pathUSD"` with the balance and floor in micro-pathUSD. The floor is 0.55 pathUSD: the
+0.2 reserve the executor never spends, one 0.3 top-up of an empty relayer, and 0.05 for that
+top-up's gas. Below it the probe answers `bootstrapNeeded: true`, so the wallet stops before
+signing rather than submitting a send the relay cannot fund.
+
 Tempo uses the same automatic controlled-directory RPC resolution. No Tempo-specific RPC
 configuration is needed. Add an explicit endpoint only when you want it tried ahead of the
 directory endpoints:
@@ -198,6 +205,7 @@ stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /{chain_id}` | ERC-4337 JSON-RPC endpoint for a chain, for example `POST /42161`. |
+| `GET /v1/treasury/{chain_id}` | Whether the relay treasury can fund gas on a chain (`bootstrapNeeded`); the wallet asks before signing. |
 | `GET /healthz` | Liveness check; returns `204` while the process is alive. |
 | `GET /readyz` | Readiness check; returns `204` after all worker jobs are ready. |
 | `GET /health` | Service health information. |

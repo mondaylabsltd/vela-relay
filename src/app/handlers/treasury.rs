@@ -9,28 +9,11 @@ use serde_json::{Value, json};
 
 use crate::{app::AppState, utils::rpc};
 
-use vela_relay_core::treasury::{NATIVE_TREASURY_FLOOR, quantity_is_below};
+use vela_relay_core::treasury::{self, ProbeFailure};
 
 #[derive(Serialize)]
 struct TreasuryAddress {
     address: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TreasuryStatus {
-    chain_id: u64,
-    address: String,
-    asset: TreasuryAsset,
-    balance: String,
-    floor: &'static str,
-    bootstrap_needed: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "lowercase")]
-enum TreasuryAsset {
-    Native,
 }
 
 pub async fn address(State(state): State<AppState>) -> Response {
@@ -50,6 +33,10 @@ pub async fn address(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// `GET /v1/treasury/{chain_id}`. The core decides which balance to read (the
+/// native coin, or pathUSD on Tempo) and what it means; this handler performs
+/// the one read and renders the core's answer — the same bytes the Cloudflare
+/// shell renders.
 pub async fn status(
     State(state): State<AppState>,
     Path(chain_id): Path<u64>,
@@ -61,51 +48,38 @@ pub async fn status(
             "settlement recipient is not configured",
         );
     };
+    let read = match treasury::balance_read(chain_id, address) {
+        Ok(read) => read,
+        Err(failure) => return probe_failure(failure),
+    };
 
-    let balance = match rpc::call(
+    let result = rpc::call(
         chain_id,
         headers.get(rpc::USER_RPC_URL_HEADER),
-        "eth_getBalance",
-        json!([address, "latest"]),
+        read.method,
+        read.params,
     )
     .await
-    {
-        Ok(result) => result,
-        Err(()) => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "treasury RPC is unavailable",
-            );
-        }
-    };
-    let balance = match parse_quantity(&balance.value) {
-        Ok(balance) => balance,
-        Err(()) => {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "treasury RPC returned an invalid balance",
-            );
-        }
-    };
+    .map(|result| result.value);
 
-    (
-        StatusCode::OK,
-        Json(TreasuryStatus {
-            chain_id,
-            address: address.into(),
-            asset: TreasuryAsset::Native,
-            bootstrap_needed: quantity_is_below(&balance, NATIVE_TREASURY_FLOOR),
-            balance,
-            floor: NATIVE_TREASURY_FLOOR,
-        }),
-    )
-        .into_response()
+    respond(chain_id, address, result)
 }
 
-/// The JSON hop only; the grammar itself is the core's, shared with the
-/// Cloudflare shell so both report the same floor (`treasury::parse_quantity`).
-fn parse_quantity(value: &Value) -> Result<String, ()> {
-    vela_relay_core::treasury::parse_quantity(value.as_str().ok_or(())?)
+/// The RPC result → HTTP hop. A balance we could not read is NOT a balance of
+/// zero: both an unreachable RPC and an unreadable answer are a 503.
+fn respond(chain_id: u64, address: &str, result: Result<Value, ()>) -> Response {
+    let status = result
+        .map_err(|()| ProbeFailure::RpcUnavailable)
+        .and_then(|value| treasury::treasury_status(chain_id, address, &value));
+
+    match status {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(failure) => probe_failure(failure),
+    }
+}
+
+fn probe_failure(failure: ProbeFailure) -> Response {
+    error(StatusCode::SERVICE_UNAVAILABLE, failure.message())
 }
 
 fn error(status: StatusCode, message: &'static str) -> Response {
@@ -114,16 +88,21 @@ fn error(status: StatusCode, message: &'static str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use axum::{http::StatusCode, response::Response};
+    use serde_json::{Value, json};
 
-    use super::{NATIVE_TREASURY_FLOOR, parse_quantity, quantity_is_below};
+    use super::respond;
     use crate::utils::config::DEFAULT_TREASURY_FLOOR_WEI;
+    use vela_relay_core::treasury::{NATIVE_TREASURY_FLOOR, balance_read, quantity_is_below};
 
-    #[test]
-    fn validates_and_normalizes_rpc_quantities() {
-        assert_eq!(parse_quantity(&json!("0x000F")), Ok("0x000f".into()));
-        assert!(parse_quantity(&json!("0x")).is_err());
-        assert!(parse_quantity(&json!("15")).is_err());
+    const TREASURY: &str = "0x3e59292e18417f814112f731e7163534c6d2fe3c";
+
+    async fn body(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
     #[test]
@@ -139,5 +118,86 @@ mod tests {
             "0x10000000000000000",
             NATIVE_TREASURY_FLOOR
         ));
+    }
+
+    /// The production answer of 2026-10-03, corrected: Tempo's treasury held no
+    /// pathUSD, so it needs a bootstrap — whatever `eth_getBalance` says.
+    #[tokio::test]
+    async fn tempo_answers_with_the_treasurys_path_usd() {
+        assert_eq!(balance_read(4_217, TREASURY).unwrap().method, "eth_call");
+
+        let (status, body) = body(respond(
+            4_217,
+            TREASURY,
+            Ok(json!(format!("0x{}", "0".repeat(64)))),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "chainId": 4217,
+                "address": TREASURY,
+                "asset": "pathUSD",
+                "balance": "0x0",
+                "floor": "0x86470",
+                "bootstrapNeeded": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn other_chains_keep_the_native_answer() {
+        assert_eq!(
+            balance_read(196, TREASURY).unwrap().method,
+            "eth_getBalance"
+        );
+
+        let (status, body) = body(respond(196, TREASURY, Ok(json!("0x0")))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "chainId": 196,
+                "address": TREASURY,
+                "asset": "native",
+                "balance": "0x0",
+                "floor": "0x5af3107a4000",
+                "bootstrapNeeded": true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_balance_is_a_503_never_a_zero() {
+        for (chain_id, result, message) in [
+            (4_217, Err(()), "treasury RPC is unavailable"),
+            (196, Err(()), "treasury RPC is unavailable"),
+            (
+                4_217,
+                Ok(json!("0x")),
+                "treasury RPC returned an invalid balance",
+            ),
+            (
+                // Tempo's native placeholder is not a pathUSD balance.
+                4_217,
+                Ok(json!(
+                    "0x9612084f0316e0ebd5182f398e5195a51b5ca47667d4c9b26c9b26c9b26c9b2"
+                )),
+                "treasury RPC returned an invalid balance",
+            ),
+            (
+                196,
+                Ok(json!("15")),
+                "treasury RPC returned an invalid balance",
+            ),
+        ] {
+            let (status, body) = body(respond(chain_id, TREASURY, result)).await;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, json!({ "error": message }));
+        }
     }
 }
