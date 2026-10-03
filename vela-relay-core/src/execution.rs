@@ -2736,10 +2736,71 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
 /// Clear a funding transfer the chain will never include, so the next pass
 /// signs another; `Err` defers the batch through the transient channel with
 /// the chain's own reason.
+/// A prepared top-up with no receipt is waited on only while some node holds
+/// it. One that no node has can never be included as it is — and a broadcast
+/// reply is no evidence that a node has it: on Arbitrum
+/// `arbitrum.meowrpc.com` answers `eth_sendRawTransaction` with a hash for a
+/// transfer from an empty account, so the relay took its refused 21 000-gas
+/// top-up for accepted and waited on it for good (2026-10-04, v0.9.8: the
+/// treasury nonce never left 0, and a swap sat in "funding"). Ask the chain
+/// instead, and when nothing has it, clear it: the next pass signs a fresh
+/// top-up at the SAME nonce from the treasury's state then — one that cannot
+/// fund twice, and that sees the relayer already funded if the old one did
+/// land after all.
+///
+/// Only an intent from an earlier pass gets here (a fresh one is broadcast and
+/// left until the next delivery, seconds later), so a node that is merely
+/// slow to see a real transfer costs at most one re-sign.
+async fn await_or_discard_unseen_funding(
+    ctx: &Ctx,
+    intent: &PreparedFundingIntent,
+) -> Result<(), String> {
+    match request(
+        ctx,
+        ExecutionOperation::ProbeTransactionKnown {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await?
+    {
+        ExecutionOutcome::Known { known: true } => Ok(()),
+        ExecutionOutcome::Known { known: false } => {
+            discard_funding(
+                ctx,
+                intent,
+                format!(
+                    "no node has the treasury relayer top-up {}; it will be signed again",
+                    intent.transaction_hash
+                ),
+            )
+            .await
+        }
+        _ => Err("unexpected shell response".to_owned()),
+    }
+}
+
 async fn discard_refused_funding(
     ctx: &Ctx,
     intent: &PreparedFundingIntent,
     reason: &str,
+) -> Result<(), String> {
+    discard_funding(
+        ctx,
+        intent,
+        format!(
+            "the chain refused the treasury relayer top-up {}; it will be signed again: {reason}",
+            intent.transaction_hash
+        ),
+    )
+    .await
+}
+
+/// Clear a prepared top-up so the next pass signs another; `Err` defers the
+/// batch through the transient channel carrying `why`.
+async fn discard_funding(
+    ctx: &Ctx,
+    intent: &PreparedFundingIntent,
+    why: String,
 ) -> Result<(), String> {
     if let ExecutionOutcome::Failed { message } = request(
         ctx,
@@ -2751,10 +2812,7 @@ async fn discard_refused_funding(
     {
         return Err(message);
     }
-    Err(format!(
-        "the chain refused the treasury relayer top-up {}; it will be signed again: {reason}",
-        intent.transaction_hash
-    ))
+    Err(why)
 }
 
 async fn forget_funding_broadcast(ctx: &Ctx, intent: &PreparedFundingIntent) {
@@ -2797,7 +2855,7 @@ async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(),
         _ => return Err("unexpected shell response".to_owned()),
     };
     let Some(receipt) = receipt else {
-        return Ok(());
+        return await_or_discard_unseen_funding(ctx, intent).await;
     };
     let Some(success) = receipt_succeeded(&receipt) else {
         return Err("funding transaction receipt has invalid status".to_owned());
@@ -4597,6 +4655,193 @@ mod tests {
             ExecutionOutcome::Done,
         );
         // "funding" is an expected hand-off: diagnostic, no Telegram.
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "funding",
+                reason: "waiting for relayer funding transaction confirmation".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: "UserOperation execution was deferred".into(),
+        }]);
+    }
+
+    /// An underfunded relayer's batch, walked to the moment the treasury
+    /// lease is held — where the funding program starts.
+    fn walk_to_treasury_lease(fixture: &Fixture) -> Driver {
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = walk_to_bundle_simulation(fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata,
+            },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    relayer_balance: U256::from(100u64),
+                    ..context()
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireTreasuryLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver
+    }
+
+    /// A stuck top-up resumed from an earlier pass: not re-sent (seen), no
+    /// receipt — and then the question of whether any node has it.
+    fn resume_without_receipt(driver: &mut Driver, intent: &crate::task::PreparedFundingIntent) {
+        driver.step(
+            ExecutionOperation::LoadPreparedFunding,
+            ExecutionOutcome::FundingIntent {
+                intent: Some(intent.clone()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: intent.transaction_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: true },
+        );
+        driver.step(
+            ExecutionOperation::AcquireReceiptProbe {
+                transaction_hash: intent.transaction_hash.clone(),
+            },
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::FetchTransactionReceipt {
+                transaction_hash: intent.transaction_hash.clone(),
+            },
+            ExecutionOutcome::Receipt { receipt: None },
+        );
+    }
+
+    fn stuck_top_up() -> crate::task::PreparedFundingIntent {
+        crate::task::PreparedFundingIntent {
+            chain_id: CHAIN_ID,
+            relayer: policy().relayer.to_string(),
+            amount_wei: 900,
+            raw_transaction: "0x020909".into(),
+            transaction_hash: alloy::primitives::keccak256([0x02u8, 0x09, 0x09]).to_string(),
+            nonce: 0,
+        }
+    }
+
+    /// Production, 2026-10-04 (v0.9.8): an Arbitrum endpoint answered the
+    /// refused 21 000-gas top-up's broadcast with a hash, so it read as
+    /// accepted and was waited on for good — the treasury nonce stayed 0 and a
+    /// swap sat in "funding". No receipt, and no node has it: it is cleared so
+    /// the next pass signs again at the same nonce.
+    #[test]
+    fn a_top_up_no_node_has_is_signed_again_whatever_the_broadcast_said() {
+        let fixture = fixture(280);
+        let mut driver = walk_to_treasury_lease(&fixture);
+        let stuck = stuck_top_up();
+        resume_without_receipt(&mut driver, &stuck);
+        driver.step(
+            ExecutionOperation::ProbeTransactionKnown {
+                transaction_hash: stuck.transaction_hash.clone(),
+            },
+            ExecutionOutcome::Known { known: false },
+        );
+        driver.step(
+            ExecutionOperation::ClearFundingIntent {
+                transaction_hash: stuck.transaction_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ReleaseTreasuryLease,
+            ExecutionOutcome::Done,
+        );
+        let reason = format!(
+            "no node has the treasury relayer top-up {}; it will be signed again",
+            stuck.transaction_hash
+        );
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: reason.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: reason.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred { reason },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: "UserOperation execution was deferred".into(),
+        }]);
+    }
+
+    /// A top-up a node does hold is genuinely pending: waited on, untouched.
+    #[test]
+    fn a_top_up_a_node_holds_is_waited_on() {
+        let fixture = fixture(280);
+        let mut driver = walk_to_treasury_lease(&fixture);
+        let pending = stuck_top_up();
+        resume_without_receipt(&mut driver, &pending);
+        driver.step(
+            ExecutionOperation::ProbeTransactionKnown {
+                transaction_hash: pending.transaction_hash.clone(),
+            },
+            ExecutionOutcome::Known { known: true },
+        );
+        driver.step(
+            ExecutionOperation::ReleaseTreasuryLease,
+            ExecutionOutcome::Done,
+        );
         driver.step(
             ExecutionOperation::RecordDeferred {
                 hash: fixture.hash_string.clone(),
