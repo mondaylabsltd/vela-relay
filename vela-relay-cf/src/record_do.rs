@@ -82,6 +82,9 @@ impl DurableObject for RecordDo {
             RecordCommand::Patch { patch } => RecordReply::Patched {
                 patched: self.apply_patch(&patch).await?,
             },
+            RecordCommand::GiveUp { now_ms } => RecordReply::Patched {
+                patched: self.give_up(now_ms).await?,
+            },
             RecordCommand::MarkBundleMemberSubmitted {
                 bundle_chain_id,
                 transaction_hash,
@@ -166,6 +169,27 @@ impl RecordDo {
             serde_json::from_value(record_json)
                 .map_err(|error| worker::Error::RustError(error.to_string()))?;
         self.state.storage().put(RECORD_KEY, &merged).await?;
+        Ok(true)
+    }
+
+    /// A dead-lettered operation gives up — when the core says so — and its
+    /// record lives one more TTL from now, so a wallet that comes back within
+    /// the hour reads "rejected" rather than nothing at all.
+    async fn give_up(&self, now_ms: u64) -> Result<bool> {
+        let Some(record) = self.record().await else {
+            return Ok(false);
+        };
+        let Some(patch) = vela_relay_core::lifecycle::dead_letter_patch(&record, now_ms) else {
+            return Ok(false);
+        };
+        if !self.apply_patch(&patch).await? {
+            return Ok(false);
+        }
+        self.state
+            .storage()
+            .put(EXPIRES_KEY, now_ms + RECORD_TTL_MS)
+            .await?;
+        self.schedule_alarm().await?;
         Ok(true)
     }
 
