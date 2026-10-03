@@ -725,6 +725,16 @@ impl LaneDo {
                         method: "eth_getBalance",
                         params: json!([context.policy.treasury.to_string(), "pending"]),
                     },
+                    // Docker parity: the chain's own price of the transfer
+                    // (Arbitrum charges more than 21 000); the core buffers it.
+                    RpcBatchCall {
+                        method: "eth_estimateGas",
+                        params: json!([{
+                            "from": context.policy.treasury.to_string(),
+                            "to": context.policy.relayer.to_string(),
+                            "value": "0x1",
+                        }]),
+                    },
                 ];
                 match context.trusted.batch(chain_id, &calls).await {
                     Ok(responses) => {
@@ -741,7 +751,17 @@ impl LaneDo {
                                     Ok((nonce, balance))
                                 });
                         match treasury_context {
-                            Ok((nonce, balance)) => Out::TreasuryContext { nonce, balance },
+                            Ok((nonce, balance)) => Out::TreasuryContext {
+                                nonce,
+                                balance,
+                                raw_gas_estimate: response_quantity(
+                                    &responses,
+                                    2,
+                                    "treasury top-up eth_estimateGas",
+                                )
+                                .ok()
+                                .and_then(|gas| u64::try_from(gas).ok()),
+                            },
                             Err(message) => Out::Failed { message },
                         }
                     }
@@ -2388,8 +2408,8 @@ fn sign_tempo_bundle(
 }
 
 /// Docker engine `SignTreasuryTransfer` arm: a plain-value EIP-1559 transfer
-/// from the treasury to this lane's relayer, gas pinned to the core's
-/// `TOP_UP_GAS_LIMIT`.
+/// from the treasury to this lane's relayer, with the gas limit the core
+/// chose (`funding::native_top_up_gas_limit`).
 fn sign_treasury_transfer(
     context: &BatchContext<'_>,
     chain_id: u64,
@@ -2413,7 +2433,7 @@ fn sign_treasury_transfer(
         vela_relay_core::signing::TransactionPlan {
             chain_id,
             nonce: request.nonce,
-            gas_limit: vela_relay_core::funding::TOP_UP_GAS_LIMIT,
+            gas_limit: request.gas_limit,
             max_fee_per_gas: request.max_fee_per_gas,
             max_priority_fee_per_gas: request.max_priority_fee_per_gas,
             to: context.policy.relayer,

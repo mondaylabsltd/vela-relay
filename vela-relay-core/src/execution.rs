@@ -149,6 +149,8 @@ pub struct SignedBundle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreasurySignRequest {
     pub nonce: u64,
+    /// [`crate::funding::native_top_up_gas_limit`] — never a constant.
+    pub gas_limit: u64,
     pub amount: U256,
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
@@ -280,6 +282,9 @@ pub enum ExecutionOperation {
     ClearFundingIntent {
         transaction_hash: String,
     },
+    /// The treasury's nonce and balance, and the chain's raw `eth_estimateGas`
+    /// of a plain transfer to this lane's relayer — `None` when the estimate
+    /// failed (the core then signs with the floor).
     FetchTreasuryContext,
     /// Tempo variant: also estimates the pathUSD transfer's gas (raw, the
     /// buffer is applied here).
@@ -563,6 +568,7 @@ pub enum ExecutionOutcome {
     TreasuryContext {
         nonce: u64,
         balance: U256,
+        raw_gas_estimate: Option<u64>,
     },
     TempoTreasuryContext {
         nonce: u64,
@@ -2312,14 +2318,20 @@ async fn native_funding_locked(
         top_up_max,
     )
     .map_err(|error| error.to_string())?;
-    let (nonce, treasury_balance) =
+    let (nonce, treasury_balance, raw_gas_estimate) =
         match request(ctx, ExecutionOperation::FetchTreasuryContext).await? {
-            ExecutionOutcome::TreasuryContext { nonce, balance } => (nonce, balance),
+            ExecutionOutcome::TreasuryContext {
+                nonce,
+                balance,
+                raw_gas_estimate,
+            } => (nonce, balance, raw_gas_estimate),
             ExecutionOutcome::Failed { message } => return Err(message),
             _ => return Err("unexpected shell response".to_owned()),
         };
-    let protected_treasury = native_top_up_reserve(max_fee_per_gas, policy.treasury_floor_wei)
-        .map_err(|error| error.to_string())?;
+    let gas_limit = crate::funding::native_top_up_gas_limit(raw_gas_estimate);
+    let protected_treasury =
+        native_top_up_reserve(gas_limit, max_fee_per_gas, policy.treasury_floor_wei)
+            .map_err(|error| error.to_string())?;
     let top_up_gas_cost = protected_treasury - U256::from(policy.treasury_floor_wei);
     // If the treasury can satisfy this bundle but not the preferred float,
     // make a partial top-up. The next bundle will replenish the float when
@@ -2370,6 +2382,7 @@ async fn native_funding_locked(
         ExecutionOperation::SignTreasuryTransfer {
             request: TreasurySignRequest {
                 nonce,
+                gas_limit,
                 amount,
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
@@ -2694,6 +2707,16 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
                     },
                 )
                 .await;
+            } else if crate::broadcast::is_definitive_broadcast_rejection(&reason) {
+                // The chain refuses this transfer as signed — its gas limit
+                // below the chain's intrinsic cost, its fee cap below the base
+                // fee, more than the treasury holds — and no node knows it, so
+                // it can never be included. Kept, it was sent again on every
+                // pass and every operation on the chain waited behind it
+                // (Arbitrum, 2026-10-03: 21 000 gas, treasury nonce still 0).
+                // The next pass signs a fresh one at the SAME nonce: only one
+                // of the two can ever be included, so this cannot fund twice.
+                return discard_refused_funding(ctx, intent, &reason).await;
             } else {
                 let _ = request(
                     ctx,
@@ -2708,6 +2731,30 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
             Ok(())
         }
     }
+}
+
+/// Clear a funding transfer the chain will never include, so the next pass
+/// signs another; `Err` defers the batch through the transient channel with
+/// the chain's own reason.
+async fn discard_refused_funding(
+    ctx: &Ctx,
+    intent: &PreparedFundingIntent,
+    reason: &str,
+) -> Result<(), String> {
+    if let ExecutionOutcome::Failed { message } = request(
+        ctx,
+        ExecutionOperation::ClearFundingIntent {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await?
+    {
+        return Err(message);
+    }
+    Err(format!(
+        "the chain refused the treasury relayer top-up {}; it will be signed again: {reason}",
+        intent.transaction_hash
+    ))
 }
 
 async fn forget_funding_broadcast(ctx: &Ctx, intent: &PreparedFundingIntent) {
@@ -4461,11 +4508,15 @@ mod tests {
             ExecutionOperation::LoadPreparedFunding,
             ExecutionOutcome::FundingIntent { intent: None },
         );
+        // Arbitrum's estimate of a plain transfer (2026-10-03): the 21 000
+        // floor is refused there, so the transfer is signed with the
+        // estimate plus 1.2x — and the reserve counts that gas, not 21 000.
         driver.step(
             ExecutionOperation::FetchTreasuryContext,
             ExecutionOutcome::TreasuryContext {
                 nonce: 3,
                 balance: U256::from(100_000u64),
+                raw_gas_estimate: Some(21_397),
             },
         );
         driver.step(
@@ -4478,6 +4529,7 @@ mod tests {
             ExecutionOperation::SignTreasuryTransfer {
                 request: super::TreasurySignRequest {
                     nonce: 3,
+                    gas_limit: 25_676,
                     amount: U256::from(900u64),
                     max_fee_per_gas: 2,
                     max_priority_fee_per_gas: 0,
@@ -4553,6 +4605,160 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: "UserOperation execution was deferred".into(),
+        }]);
+    }
+
+    /// The prepared transfer the relay kept re-sending on Arbitrum: signed
+    /// with 21 000 gas, refused by every node, known to none. It is cleared so
+    /// the next pass signs a fresh one at the same nonce, instead of holding
+    /// every operation on the chain behind it.
+    #[test]
+    fn a_funding_transfer_the_chain_refuses_is_discarded_not_resent_forever() {
+        let fixture = fixture(280);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata,
+            },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    relayer_balance: U256::from(100u64),
+                    ..context()
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireTreasuryLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        let funding_raw = [0x02u8, 0x09, 0x09];
+        let funding_hash = alloy::primitives::keccak256(funding_raw).to_string();
+        let stuck = crate::task::PreparedFundingIntent {
+            chain_id: CHAIN_ID,
+            relayer: policy().relayer.to_string(),
+            amount_wei: 900,
+            raw_transaction: "0x020909".into(),
+            transaction_hash: funding_hash.clone(),
+            nonce: 0,
+        };
+        driver.step(
+            ExecutionOperation::LoadPreparedFunding,
+            ExecutionOutcome::FundingIntent {
+                intent: Some(stuck),
+            },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        let refusal = "RPC code -32000: err: intrinsic gas too low (supplied gas 21000)";
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: funding_raw.to_vec(),
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Rejected {
+                    reason: refusal.into(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::ForgetBroadcast {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ProbeTransactionKnown {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Known { known: false },
+        );
+        driver.step(
+            ExecutionOperation::ClearFundingIntent {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ReleaseTreasuryLease,
+            ExecutionOutcome::Done,
+        );
+        // The operation is deferred with the chain's own words, so the next
+        // pass signs again — and whoever reads the record sees why.
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: format!(
+                    "the chain refused the treasury relayer top-up {funding_hash}; it will be signed again: {refusal}"
+                ),
+            },
+            ExecutionOutcome::Done,
+        );
+        // ...and the operator hears it: a refused top-up is theirs to see.
+        let reason = format!(
+            "the chain refused the treasury relayer top-up {funding_hash}; it will be signed again: {refusal}"
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: reason.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                    reason: reason.clone(),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        // Redelivered, not settled: the next pass signs the transfer again.
         driver.assert_settled(&[ItemResolution::Failed {
             reason: "UserOperation execution was deferred".into(),
         }]);
