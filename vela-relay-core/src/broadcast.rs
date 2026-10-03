@@ -56,6 +56,39 @@ pub fn is_broadcast_nonce_ambiguous(message: &str) -> bool {
 
 /// Rejections that prove the node did not admit the transaction; only when
 /// every endpoint answers in this class may the broadcast be judged rejected.
+/// Whether an `eth_getTransactionByHash` answer shows a node holding
+/// `expected_hash`: pending (a `null` block hash) or mined (a real block hash).
+///
+/// The hash alone is not enough. `arbitrum.meowrpc.com` answers with a
+/// fabricated object for a transaction it took and never forwarded — the
+/// matching hash, block number `0x0` and an all-zero block hash (2026-10-04).
+/// No transaction sits in the genesis block or in a block whose hash is zero,
+/// so that answer is "no node has it", which is what lets a stuck top-up or
+/// an ambiguous bundle be signed again.
+pub fn holds_transaction(answer: &serde_json::Value, expected_hash: &str) -> bool {
+    let Some(transaction) = answer.as_object() else {
+        return false;
+    };
+    let hash_matches = transaction
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|hash| hash.eq_ignore_ascii_case(expected_hash));
+    let zero = |value: &str| {
+        value
+            .strip_prefix("0x")
+            .is_some_and(|digits| digits.bytes().all(|byte| byte == b'0'))
+    };
+    let fabricated_block = transaction
+        .get("blockHash")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(zero)
+        || transaction
+            .get("blockNumber")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(zero);
+    hash_matches && !fabricated_block
+}
+
 pub fn is_definitive_broadcast_rejection(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("insufficient funds")
@@ -273,5 +306,38 @@ mod tests {
             resolve_unproven_broadcast("already known", false),
             UnprovenBroadcast::RetainOutbox
         );
+    }
+
+    #[test]
+    fn a_fabricated_lookup_is_not_a_node_holding_the_transaction() {
+        use super::holds_transaction;
+        use serde_json::json;
+        const HASH: &str = "0x3a0b198af40e512d95c5175c9d1bf04e0bd32a3f3e6f2e0271ee3e9b3a02f293";
+        // Pending on a real node: no block yet.
+        assert!(holds_transaction(
+            &json!({"hash": HASH, "blockHash": null, "blockNumber": null}),
+            HASH
+        ));
+        // Mined.
+        assert!(holds_transaction(
+            &json!({"hash": HASH.to_uppercase().replace("0X", "0x"), "blockHash": "0x9f2c4e5d6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f", "blockNumber": "0x1e7b1a2"}),
+            HASH
+        ));
+        // arbitrum.meowrpc.com, 2026-10-04: its own echo of a transfer it
+        // never forwarded.
+        assert!(!holds_transaction(
+            &json!({"hash": HASH, "blockHash": format!("0x{}", "0".repeat(64)), "blockNumber": "0x0", "gasPrice": "0x0"}),
+            HASH
+        ));
+        assert!(!holds_transaction(
+            &json!({"hash": HASH, "blockNumber": "0x0"}),
+            HASH
+        ));
+        // Nothing, or another transaction.
+        assert!(!holds_transaction(&json!(null), HASH));
+        assert!(!holds_transaction(
+            &json!({"hash": "0x01", "blockHash": null}),
+            HASH
+        ));
     }
 }

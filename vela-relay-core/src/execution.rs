@@ -405,6 +405,40 @@ pub enum RejectionCause {
     },
 }
 
+impl RejectionCause {
+    /// The executor stage and reason a rejection leaves on the record, so
+    /// what a client reads says why. A rejection used to write only its
+    /// status and leave the last in-progress note beside it: the Arbitrum swap
+    /// of 2026-10-04 read `rejected` next to "waiting for relayer funding
+    /// transaction confirmation" when its own deadline had expired in
+    /// simulation.
+    pub fn diagnostic(&self) -> (&'static str, String) {
+        match self {
+            Self::InvalidQueuedPayload { reason } => ("queue", (*reason).to_owned()),
+            Self::SimulationRejected { reason } => (
+                "simulation",
+                format!("the operation fails when simulated: {reason}"),
+            ),
+            Self::StaleNonce {
+                user_nonce,
+                onchain_nonce,
+            } => (
+                "nonce",
+                format!(
+                    "the account nonce {user_nonce} is already used on-chain (now {onchain_nonce})"
+                ),
+            ),
+            Self::UnsupportedTempoFeeToken { fee_token } => (
+                "tempo_fee_token",
+                format!(
+                    "Tempo fees are paid in pathUSD; the operation named {}",
+                    fee_token.map_or_else(|| "none".to_owned(), |token| token.to_string())
+                ),
+            ),
+        }
+    }
+}
+
 /// Why an item is entering the durable delayed inbox.
 #[derive(Debug, PartialEq)]
 pub enum DeferCause {
@@ -965,6 +999,18 @@ async fn record_candidates_deferred(
 }
 
 const DEFERRED_FINISH: &str = "UserOperation execution was deferred";
+
+/// The finish reason of an operation waiting on its relayer's top-up, or on a
+/// top-up about to be signed again. Seconds away, not minutes, so the shell
+/// redelivers it soon (`hold::redelivery_delay_ms`). On the age-based backoff
+/// alone, an Arbitrum swap signed at 07:03 waited 5 minutes for its re-signed
+/// top-up and 5 more for its bundle, and missed its own 07:33 deadline by
+/// 16 seconds (2026-10-04).
+pub const FUNDING_WAIT_FINISH: &str = "UserOperation is waiting for its relayer's top-up";
+
+/// How a discarded top-up's deferral ends; it marks the deferral as a
+/// funding wait for [`FUNDING_WAIT_FINISH`].
+const TOP_UP_SIGNED_AGAIN: &str = "it will be signed again";
 const NO_OUTCOME_FINISH: &str = "no durable executor outcome";
 
 /// The whole lane-batch program. Sequential: at most one operation is ever in
@@ -1185,8 +1231,17 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         Err(reason) => {
             record_routed_deferred(ctx, &start.operations, Some(&results), "execution", &reason)
                 .await;
+            // A top-up thrown away to be signed again is a funding wait: the
+            // next pass is the one that signs it.
+            let finish = if reason.ends_with(TOP_UP_SIGNED_AGAIN)
+                || reason.contains(&format!("{TOP_UP_SIGNED_AGAIN}:"))
+            {
+                FUNDING_WAIT_FINISH
+            } else {
+                DEFERRED_FINISH
+            };
             emit_diagnostic(ctx, ExecutionDiagnostic::ExecutionDeferred { reason }).await;
-            results.finish(DEFERRED_FINISH)
+            results.finish(finish)
         }
     }
 }
@@ -1701,6 +1756,9 @@ async fn execute_with_lane_lease(
             "waiting for relayer funding transaction confirmation",
         )
         .await;
+        for candidate in &survivors {
+            results.failed(candidate.result_index, FUNDING_WAIT_FINISH);
+        }
         return Ok(());
     }
     ensure_lane_lease(ctx).await?;
@@ -2769,7 +2827,7 @@ async fn await_or_discard_unseen_funding(
                 ctx,
                 intent,
                 format!(
-                    "no node has the treasury relayer top-up {}; it will be signed again",
+                    "no node has the treasury relayer top-up {}; {TOP_UP_SIGNED_AGAIN}",
                     intent.transaction_hash
                 ),
             )
@@ -2788,7 +2846,7 @@ async fn discard_refused_funding(
         ctx,
         intent,
         format!(
-            "the chain refused the treasury relayer top-up {}; it will be signed again: {reason}",
+            "the chain refused the treasury relayer top-up {}; {TOP_UP_SIGNED_AGAIN}: {reason}",
             intent.transaction_hash
         ),
     )
@@ -4663,8 +4721,9 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        // A funding wait: redelivered within seconds, not on the age ladder.
         driver.assert_settled(&[ItemResolution::Failed {
-            reason: "UserOperation execution was deferred".into(),
+            reason: super::FUNDING_WAIT_FINISH.into(),
         }]);
     }
 
@@ -4820,8 +4879,9 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        // A funding wait: redelivered within seconds, not on the age ladder.
         driver.assert_settled(&[ItemResolution::Failed {
-            reason: "UserOperation execution was deferred".into(),
+            reason: super::FUNDING_WAIT_FINISH.into(),
         }]);
     }
 
@@ -4850,8 +4910,9 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        // A funding wait: redelivered within seconds, not on the age ladder.
         driver.assert_settled(&[ItemResolution::Failed {
-            reason: "UserOperation execution was deferred".into(),
+            reason: super::FUNDING_WAIT_FINISH.into(),
         }]);
     }
 
@@ -5004,9 +5065,48 @@ mod tests {
             ExecutionOutcome::Done,
         );
         // Redelivered, not settled: the next pass signs the transfer again.
+        // A funding wait: redelivered within seconds, not on the age ladder.
         driver.assert_settled(&[ItemResolution::Failed {
-            reason: "UserOperation execution was deferred".into(),
+            reason: super::FUNDING_WAIT_FINISH.into(),
         }]);
+    }
+
+    /// A rejection says why on the record (2026-10-04: an Arbitrum swap
+    /// whose deadline expired read `rejected` next to "waiting for relayer
+    /// funding transaction confirmation").
+    #[test]
+    fn a_rejection_says_why() {
+        use super::RejectionCause;
+        assert_eq!(
+            RejectionCause::SimulationRejected {
+                reason: "handleOps reverted during simulation".into()
+            }
+            .diagnostic(),
+            (
+                "simulation",
+                "the operation fails when simulated: handleOps reverted during simulation".into()
+            )
+        );
+        let (stage, reason) = RejectionCause::StaleNonce {
+            user_nonce: U256::from(3u64),
+            onchain_nonce: U256::from(5u64),
+        }
+        .diagnostic();
+        assert_eq!(stage, "nonce");
+        assert!(reason.contains('3') && reason.contains('5'), "{reason}");
+        assert_eq!(
+            RejectionCause::InvalidQueuedPayload {
+                reason: "bad envelope"
+            }
+            .diagnostic(),
+            ("queue", "bad envelope".into())
+        );
+        assert_eq!(
+            RejectionCause::UnsupportedTempoFeeToken { fee_token: None }
+                .diagnostic()
+                .0,
+            "tempo_fee_token"
+        );
     }
 
     #[test]

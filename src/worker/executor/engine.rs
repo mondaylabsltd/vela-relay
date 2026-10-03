@@ -992,11 +992,7 @@ impl ExecutorEngine {
             .call(chain_id, "eth_getTransactionByHash", json!([expected_hash]))
             .await
         {
-            Ok(Value::Object(transaction)) => transaction
-                .get("hash")
-                .and_then(Value::as_str)
-                .is_some_and(|hash| hash.eq_ignore_ascii_case(expected_hash)),
-            Ok(_) => false,
+            Ok(answer) => vela_relay_core::broadcast::holds_transaction(&answer, expected_hash),
             Err(error) => {
                 tracing::warn!(
                     chain_id,
@@ -1482,62 +1478,72 @@ impl BatchShell<'_> {
                     message: error.to_string(),
                 },
             },
-            Op::MarkRejected { hash, cause } => match engine.store.mark_rejected(hash).await {
-                Ok(_) => {
-                    match cause {
-                        core_execution::RejectionCause::InvalidQueuedPayload { reason } => {
+            Op::MarkRejected { hash, cause } => {
+                // Why, in the core's words — never the last in-progress note.
+                let (stage, reason) = cause.diagnostic();
+                let written = engine
+                    .store
+                    .mark_rejected_with_executor_reason(hash, stage, &reason)
+                    .await;
+                match written {
+                    Ok(_) => {
+                        match cause {
+                            core_execution::RejectionCause::InvalidQueuedPayload { reason } => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %hash,
+                                    reason,
+                                    "rejected invalid queued UserOperation"
+                                );
+                            }
+                            core_execution::RejectionCause::SimulationRejected { reason } => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %hash,
+                                    reason,
+                                    "single-operation simulation rejected UserOperation"
+                                );
+                            }
+                            core_execution::RejectionCause::StaleNonce {
+                                user_nonce,
+                                onchain_nonce,
+                            } => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %hash,
+                                    user_nonce = %user_nonce,
+                                    onchain_nonce = %onchain_nonce,
+                                    "stale account nonce rejected UserOperation"
+                                );
+                            }
+                            core_execution::RejectionCause::UnsupportedTempoFeeToken {
+                                fee_token,
+                            } => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %hash,
+                                    fee_token = ?fee_token,
+                                    "Tempo UserOperation requested an unsupported fee token"
+                                );
+                            }
+                        }
+                        Out::Done
+                    }
+                    Err(error) => {
+                        if let core_execution::RejectionCause::StaleNonce { .. } = cause {
                             tracing::warn!(
                                 chain_id,
                                 user_operation_hash = %hash,
-                                reason,
-                                "rejected invalid queued UserOperation"
+                                %error,
+                                "could not persist stale nonce rejection"
                             );
                         }
-                        core_execution::RejectionCause::SimulationRejected { reason } => {
-                            tracing::warn!(
-                                chain_id,
-                                user_operation_hash = %hash,
-                                reason,
-                                "single-operation simulation rejected UserOperation"
-                            );
-                        }
-                        core_execution::RejectionCause::StaleNonce {
-                            user_nonce,
-                            onchain_nonce,
-                        } => {
-                            tracing::warn!(
-                                chain_id,
-                                user_operation_hash = %hash,
-                                user_nonce = %user_nonce,
-                                onchain_nonce = %onchain_nonce,
-                                "stale account nonce rejected UserOperation"
-                            );
-                        }
-                        core_execution::RejectionCause::UnsupportedTempoFeeToken { fee_token } => {
-                            tracing::warn!(
-                                chain_id,
-                                user_operation_hash = %hash,
-                                fee_token = ?fee_token,
-                                "Tempo UserOperation requested an unsupported fee token"
-                            );
+                        Out::Failed {
+                            message: error.to_string(),
                         }
                     }
-                    Out::Done
                 }
-                Err(error) => {
-                    if let core_execution::RejectionCause::StaleNonce { .. } = cause {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %hash,
-                            %error,
-                            "could not persist stale nonce rejection"
-                        );
-                    }
-                    Out::Failed {
-                        message: error.to_string(),
-                    }
-                }
-            },
+            }
             Op::MarkRejectedWithReason {
                 hash,
                 stage,

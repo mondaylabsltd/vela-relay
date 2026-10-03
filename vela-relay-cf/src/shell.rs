@@ -102,14 +102,17 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
                             worker::console_log!(
                                 "lane item will be redelivered: chain_id={chain_id} lane={lane} reason={reason}"
                             );
-                            retry_later(&messages[index]);
+                            retry_later(
+                                &messages[index],
+                                reason == vela_relay_core::execution::FUNDING_WAIT_FINISH,
+                            );
                         }
                     }
                 }
             }
             _ => {
                 for index in indexes {
-                    retry_later(&messages[index]);
+                    retry_later(&messages[index], false);
                 }
             }
         }
@@ -175,10 +178,11 @@ async fn give_up_dead_letters(
 /// 100 retries in under two minutes and was dead-lettered, left `queued`
 /// forever (Arbitrum, 2026-10-03). The docker consumer has no retry limit to
 /// spend; this queue does.
-fn retry_later(message: &worker::Message<Value>) {
+fn retry_later(message: &worker::Message<Value>, waiting_on_funding: bool) {
     let sent_ms = message.timestamp().as_millis();
     let age_ms = worker::Date::now().as_millis().saturating_sub(sent_ms);
-    let delay_s = vela_relay_core::hold::redelivery_delay_ms(age_ms).div_ceil(1_000);
+    let delay_s =
+        vela_relay_core::hold::redelivery_delay_ms(age_ms, waiting_on_funding).div_ceil(1_000);
     message.retry_with_options(
         &worker::QueueRetryOptionsBuilder::new()
             .with_delay_seconds(u32::try_from(delay_s).unwrap_or(u32::MAX))

@@ -322,7 +322,15 @@ impl LaneDo {
             }
             Op::MarkRejected { hash, cause } => {
                 self.log_rejection_cause(chain_id, hash, cause);
-                let patch = serde_json::json!({ "status": "rejected", "admitted": true });
+                // Why, in the core's words — never the last in-progress note.
+                let (stage, reason) = cause.diagnostic();
+                let patch = serde_json::json!({
+                    "status": "rejected",
+                    "admitted": true,
+                    "lastExecutorStage": truncate_diagnostic(stage, 64),
+                    "lastExecutorError": truncate_diagnostic(&reason, 512),
+                    "lastExecutorAttemptAtMs": Date::now().as_millis(),
+                });
                 match self
                     .record(chain_id, hash, &RecordCommand::Patch { patch })
                     .await
@@ -2513,11 +2521,7 @@ async fn transaction_is_known(
         .call(chain_id, "eth_getTransactionByHash", json!([expected_hash]))
         .await
     {
-        Ok(Value::Object(transaction)) => transaction
-            .get("hash")
-            .and_then(Value::as_str)
-            .is_some_and(|hash| hash.eq_ignore_ascii_case(expected_hash)),
-        Ok(_) => false,
+        Ok(answer) => vela_relay_core::broadcast::holds_transaction(&answer, expected_hash),
         Err(error) => {
             worker::console_warn!(
                 "could not confirm ambiguous transaction broadcast: chain_id={chain_id} transaction_hash={expected_hash} error={error}"

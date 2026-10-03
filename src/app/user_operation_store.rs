@@ -1096,17 +1096,6 @@ impl UserOperationStatusStore {
         Ok(reply.is_some())
     }
 
-    pub async fn mark_rejected(
-        &self,
-        user_operation_hash: &str,
-    ) -> Result<bool, UserOperationStatusStoreError> {
-        self.patch(
-            user_operation_hash,
-            json!({ "status": UserOperationStatusKind::Rejected, "admitted": true }),
-        )
-        .await
-    }
-
     /// Records a terminal local rejection with a bounded, client-safe explanation. On-chain
     /// rejections remain represented by their receipt event instead.
     pub async fn mark_rejected_with_executor_reason(
