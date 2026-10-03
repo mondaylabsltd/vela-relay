@@ -37,6 +37,12 @@ pub enum RecordCommand {
         bundle_chain_id: u64,
         transaction_hash: String,
     },
+    /// The platform dead-lettered this operation's queue message: the core's
+    /// `lifecycle::dead_letter_patch` decides whether the record gives up
+    /// (only one that never left the relay does). Replies `Patched`.
+    GiveUp {
+        now_ms: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

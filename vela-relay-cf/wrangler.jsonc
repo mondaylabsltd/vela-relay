@@ -42,6 +42,15 @@
         "max_batch_timeout": 2,
         "max_retries": 100,
         "dead_letter_queue": "vela-relay-dlq"
+      },
+      {
+        // What the platform dead-letters gives up its record (shell.rs
+        // `give_up_dead_letters`); this queue has no dead-letter queue of its
+        // own.
+        "queue": "vela-relay-dlq",
+        "max_batch_size": 20,
+        "max_batch_timeout": 5,
+        "max_retries": 5
       }
     ]
   },
