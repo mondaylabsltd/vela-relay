@@ -3,7 +3,7 @@
 use serde_json::Value;
 use worker::{Context, Env, MessageBatch, MessageExt, Request, Response, Result, event};
 
-use crate::proto::{ItemResolutionWire, LaneCommand, LaneReply};
+use crate::proto::{ItemResolutionWire, LaneCommand, LaneReply, RecordCommand, RecordReply};
 
 /// Permissive CORS, matching the docker shell's `CorsLayer::permissive()`.
 ///
@@ -58,6 +58,11 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
         return Ok(());
     }
 
+    if batch.queue() == DEAD_LETTER_QUEUE {
+        give_up_dead_letters(&batch, &env, config.relayer_count).await?;
+        return Ok(());
+    }
+
     let messages = batch.messages()?;
     // (chain, lane) → (message indexes, routed operations)
     let mut groups: std::collections::BTreeMap<(u64, u8), (Vec<usize>, Vec<_>)> =
@@ -107,6 +112,58 @@ pub async fn queue(batch: MessageBatch<Value>, env: Env, _ctx: Context) -> Resul
                     retry_later(&messages[index]);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The queue the platform moves a message to once its redeliveries are spent
+/// (`dead_letter_queue` in wrangler.jsonc), and where the shell and the lane
+/// dead-letter what they cannot process.
+const DEAD_LETTER_QUEUE: &str = "vela-relay-dlq";
+
+/// The dead-letter queue's consumer. Until it existed nothing read the queue:
+/// an operation whose redeliveries ran out stayed `queued` until its record
+/// expired, and the wallet waited on it ("taking longer than usual") for good.
+///
+/// A message the PLATFORM moved here is the original queue envelope; its
+/// record gives up if the core says so (`lifecycle::dead_letter_patch`: only
+/// an operation that never left the relay). What the shell or the lane
+/// dead-lettered on purpose — a malformed envelope, an envelope that does not
+/// match its record — is a different payload with no `schemaVersion`; it was
+/// reported when it was sent and its record is not this message's to judge.
+/// Every message is acknowledged: the dead-letter queue has nowhere further to
+/// go, and a record that could not be reached is retried by the platform.
+async fn give_up_dead_letters(
+    batch: &MessageBatch<Value>,
+    env: &Env,
+    relayer_count: usize,
+) -> Result<()> {
+    let now_ms = worker::Date::now().as_millis();
+    for message in batch.messages()? {
+        let Ok(routed) = parse_routed(message.body(), relayer_count) else {
+            message.ack();
+            continue;
+        };
+        match crate::admission::record_command(
+            env,
+            routed.chain_id,
+            &routed.user_operation_hash,
+            &RecordCommand::GiveUp { now_ms },
+        )
+        .await
+        {
+            Ok(RecordReply::Patched { patched }) => {
+                if patched {
+                    worker::console_warn!(
+                        "dead-lettered UserOperation rejected after its retries ran out: chain_id={} user_operation_hash={}",
+                        routed.chain_id,
+                        routed.user_operation_hash
+                    );
+                }
+                message.ack();
+            }
+            _ => message.retry(),
         }
     }
     Ok(())
