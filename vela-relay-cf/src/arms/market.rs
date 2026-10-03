@@ -4,6 +4,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use vela_relay_core::{chain_directory::Listing, rpc_host::RpcHostPolicy};
 use worker::{Delay, Env, Fetch, Headers, Method, Request, RequestInit};
 
 const METADATA_REQUEST_ATTEMPTS: usize = 3;
@@ -63,18 +64,44 @@ pub async fn settlement_assets(env: &Env, chain_id: u64) -> Result<SettlementAss
     })
 }
 
-pub async fn fallback_rpc_urls(env: &Env, chain_id: u64) -> Result<Vec<String>, String> {
+/// The directory's endpoints for the chain that `policy` lets the relay call
+/// (docker `fetch_fallback_rpc_urls`).
+pub async fn fallback_rpc_urls(
+    env: &Env,
+    chain_id: u64,
+    policy: RpcHostPolicy,
+) -> Result<Vec<String>, MetadataError> {
     let metadata = chain_metadata(env, chain_id).await?;
     Ok(metadata
         .rpc
         .into_iter()
-        .filter(|url| is_plain_http_url(url))
+        .filter(|url| super::rpc::usable_rpc_url(url, policy))
         .collect())
 }
 
 /// The quote path needs symbols and decimals too (docker: `payment_assets`).
 pub async fn payment_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, String> {
-    chain_metadata(env, chain_id).await
+    chain_metadata(env, chain_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Why the directory gave no metadata for a chain (docker `MetadataError`).
+#[derive(Debug, PartialEq)]
+pub enum MetadataError {
+    /// It does not list the chain ([`Listing::NotListed`]).
+    NotListed,
+    /// It did not answer, or answered with something unreadable.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotListed => formatter.write_str("the chain directory does not list the chain"),
+            Self::Unavailable(error) => formatter.write_str(error),
+        }
+    }
 }
 
 const BINANCE_TICKER_URLS: [&str; 3] = [
@@ -103,7 +130,7 @@ pub async fn binance_usdt_price(symbol: &str) -> Option<String> {
     None
 }
 
-async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, String> {
+async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, MetadataError> {
     let cache_key = format!("chainmeta:{chain_id}");
     if let Ok(kv) = env.kv(KV_BINDING)
         && let Ok(Some(cached)) = kv.get(&cache_key).text().await
@@ -112,21 +139,31 @@ async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, Strin
         return Ok(metadata);
     }
 
-    let url = crate::config::chain_directory(env)?.metadata_url(chain_id);
+    let url = crate::config::chain_directory(env)
+        .map_err(MetadataError::Unavailable)?
+        .metadata_url(chain_id);
     let mut last_error = None;
     for attempt in 1..=METADATA_REQUEST_ATTEMPTS {
-        match fetch_json(&url).await {
-            Ok(body) => {
-                if let Ok(metadata) = serde_json::from_str::<ChainMetadata>(&body) {
-                    if let Ok(kv) = env.kv(KV_BINDING)
-                        && let Ok(put) = kv.put(&cache_key, body)
-                    {
-                        let _ = put.expiration_ttl(METADATA_CACHE_TTL_SECS).execute().await;
+        match fetch_with_status(&url, METADATA_FETCH_TIMEOUT_MS).await {
+            Ok((status, body)) => match Listing::of(status, &body) {
+                Listing::Listed => {
+                    if let Ok(metadata) = serde_json::from_str::<ChainMetadata>(&body) {
+                        if let Ok(kv) = env.kv(KV_BINDING)
+                            && let Ok(put) = kv.put(&cache_key, body)
+                        {
+                            let _ = put.expiration_ttl(METADATA_CACHE_TTL_SECS).execute().await;
+                        }
+                        return Ok(metadata);
                     }
-                    return Ok(metadata);
+                    last_error = Some("metadata body is not valid chain metadata".to_owned());
                 }
-                last_error = Some("metadata body is not valid chain metadata".to_owned());
-            }
+                // Definitive — the directory's HTML page or a 404: asking
+                // again gets the same answer.
+                Listing::NotListed => return Err(MetadataError::NotListed),
+                Listing::Unavailable => {
+                    last_error = Some(format!("upstream request returned {status}"));
+                }
+            },
             Err(error) => last_error = Some(error),
         }
         if attempt < METADATA_REQUEST_ATTEMPTS {
@@ -134,10 +171,10 @@ async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, Strin
         }
     }
 
-    Err(format!(
+    Err(MetadataError::Unavailable(format!(
         "metadata request failed after {METADATA_REQUEST_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "unknown error".into())
-    ))
+    )))
 }
 
 /// Mirrors the docker HTTP clients' per-request deadlines (metadata 10 s,
@@ -146,11 +183,15 @@ async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, Strin
 const METADATA_FETCH_TIMEOUT_MS: u64 = 10_000;
 const MARKET_FETCH_TIMEOUT_MS: u64 = 2_000;
 
-async fn fetch_json(url: &str) -> Result<String, String> {
-    fetch_json_with_timeout(url, METADATA_FETCH_TIMEOUT_MS).await
+async fn fetch_json_with_timeout(url: &str, timeout_ms: u64) -> Result<String, String> {
+    match fetch_with_status(url, timeout_ms).await? {
+        (status, _) if status >= 400 => Err(format!("upstream request returned {status}")),
+        (_, body) => Ok(body),
+    }
 }
 
-async fn fetch_json_with_timeout(url: &str, timeout_ms: u64) -> Result<String, String> {
+/// A GET for JSON: the status, and the body of a success (empty otherwise).
+async fn fetch_with_status(url: &str, timeout_ms: u64) -> Result<(u16, String), String> {
     use futures_util::future::{Either, select};
 
     let request = async {
@@ -165,13 +206,12 @@ async fn fetch_json_with_timeout(url: &str, timeout_ms: u64) -> Result<String, S
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        if response.status_code() >= 400 {
-            return Err(format!(
-                "upstream request returned {}",
-                response.status_code()
-            ));
+        let status = response.status_code();
+        if status >= 400 {
+            return Ok((status, String::new()));
         }
-        response.text().await.map_err(|error| error.to_string())
+        let body = response.text().await.map_err(|error| error.to_string())?;
+        Ok((status, body))
     };
     let deadline = Delay::from(std::time::Duration::from_millis(timeout_ms));
     match select(std::pin::pin!(request), deadline).await {
@@ -184,10 +224,6 @@ pub fn is_hex_address(address: &str) -> bool {
     address.len() == 42
         && address.starts_with("0x")
         && address[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn is_plain_http_url(url: &str) -> bool {
-    (url.starts_with("https://") || url.starts_with("http://")) && !url.contains("${")
 }
 
 /// One simulation upstream's reply: a result, or the JSON-RPC error object

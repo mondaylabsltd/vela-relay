@@ -3,6 +3,11 @@
 //! shell-owned transport policy (Constitution, Shell-owned concerns).
 
 use serde_json::{Value, json};
+use vela_relay_core::{
+    chain_directory::Listing,
+    rpc_host::RpcHostPolicy,
+    treasury::{ClientRpc, ProbeFailure},
+};
 use worker::Env;
 
 use super::market;
@@ -26,7 +31,11 @@ pub async fn call(
     method: &str,
     params: Value,
 ) -> Result<CallResult, ()> {
-    if let Some(url) = user_rpc_url.map(str::trim).filter(|url| is_rpc_url(url)) {
+    let policy = config.rpc_host_policy;
+    if let Some(url) = user_rpc_url
+        .map(str::trim)
+        .filter(|url| usable_rpc_url(url, policy))
+    {
         if let Ok(Some(value)) = market::json_rpc(url, method, &params).await {
             return Ok(CallResult {
                 value,
@@ -47,7 +56,7 @@ pub async fn call(
         });
     }
 
-    let fallback_urls = match market::fallback_rpc_urls(env, chain_id).await {
+    let fallback_urls = match market::fallback_rpc_urls(env, chain_id, policy).await {
         Ok(urls) => urls,
         Err(error) => {
             worker::console_warn!("could not fetch fallback RPC URLs: {error}");
@@ -63,6 +72,66 @@ pub async fn call(
         }
     }
     Err(())
+}
+
+/// The treasury probe's read (docker `rpc::treasury_read`): the same sources
+/// in the same order as [`call`], but when there is no balance it says why —
+/// "this chain cannot be served" (`404`) or "not now" (`503`), decided by the
+/// core ([`vela_relay_core::treasury::unreadable`]). The directory is asked
+/// first: a chain it does not list cannot be quoted or executed, however well
+/// the wallet's own RPC answers.
+pub async fn treasury_read(
+    config: &CfConfig,
+    env: &Env,
+    chain_id: u64,
+    user_rpc_url: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<CallResult, ProbeFailure> {
+    let policy = config.rpc_host_policy;
+    let (listing, directory_urls) = match market::fallback_rpc_urls(env, chain_id, policy).await {
+        Ok(urls) => (Listing::Listed, urls),
+        Err(market::MetadataError::NotListed) => return Err(ProbeFailure::NotListed),
+        Err(error) => {
+            worker::console_warn!(
+                "could not fetch the chain directory for the treasury probe: chain_id={chain_id} error={error}"
+            );
+            (Listing::Unavailable, Vec::new())
+        }
+    };
+
+    let header_url = user_rpc_url
+        .map(str::trim)
+        .filter(|url| usable_rpc_url(url, policy));
+    let client_rpc = match (user_rpc_url, header_url) {
+        (None, _) => ClientRpc::Absent,
+        (Some(_), Some(_)) => ClientRpc::Used,
+        (Some(_), None) => {
+            worker::console_warn!("ignored invalid user RPC URL header");
+            ClientRpc::Refused
+        }
+    };
+
+    let mut sources: Vec<String> = header_url.into_iter().map(str::to_owned).collect();
+    if let Some(api_key) = &config.alchemy_api_key
+        && let Some(url) = vela_relay_core::alchemy::rpc_url(chain_id, api_key)
+    {
+        sources.push(url);
+    }
+    sources.extend(directory_urls);
+
+    let tried = !sources.is_empty();
+    for url in sources {
+        if let Ok(Some(value)) = market::json_rpc(&url, method, &params).await {
+            return Ok(CallResult {
+                domain: rpc_domain(&url),
+                value,
+            });
+        }
+    }
+    Err(vela_relay_core::treasury::unreadable(
+        listing, client_rpc, tried,
+    ))
 }
 
 fn rpc_domain(value: &str) -> String {
@@ -85,8 +154,12 @@ pub async fn call_simulation(
 ) -> Result<CallResult, vela_relay_core::estimate::SimulationCallError> {
     use vela_relay_core::estimate::{SimulationCallError, is_execution_revert};
 
+    let policy = config.rpc_host_policy;
     let mut sources: Vec<String> = Vec::new();
-    if let Some(url) = user_rpc_url.map(str::trim).filter(|url| is_rpc_url(url)) {
+    if let Some(url) = user_rpc_url
+        .map(str::trim)
+        .filter(|url| usable_rpc_url(url, policy))
+    {
         sources.push(url.to_owned());
     } else if user_rpc_url.is_some() {
         worker::console_warn!("ignored invalid user RPC URL header");
@@ -96,7 +169,7 @@ pub async fn call_simulation(
     {
         sources.push(url);
     }
-    if let Ok(fallback_urls) = market::fallback_rpc_urls(env, chain_id).await {
+    if let Ok(fallback_urls) = market::fallback_rpc_urls(env, chain_id, policy).await {
         sources.extend(fallback_urls);
     }
 
@@ -147,6 +220,22 @@ pub async fn erc20_decimals(
     (decimals <= 38).then_some(decimals).ok_or(())
 }
 
-fn is_rpc_url(url: &str) -> bool {
-    (url.starts_with("https://") || url.starts_with("http://")) && !url.contains("${")
+/// Every URL the relay did not choose itself — the wallet's header and the
+/// directory's list — passes here (docker `parse_rpc_url`): public `https`
+/// only unless the operator opted in ([`vela_relay_core::rpc_host`]), and never
+/// a directory template still holding a `${API_KEY}` placeholder.
+///
+/// Before this, the header accepted any `http` or `https` URL here while the
+/// docker shell refused plain `http` and private hosts — two deployments of
+/// one relay answering the same request differently.
+pub fn usable_rpc_url(url: &str, policy: RpcHostPolicy) -> bool {
+    if url.contains("${") {
+        return false;
+    }
+    let Ok(parsed) = worker::Url::parse(url) else {
+        return false;
+    };
+    parsed
+        .host_str()
+        .is_some_and(|host| policy.allows(parsed.scheme(), host))
 }

@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use vela_relay_core::chain_directory::ChainDirectory;
+use vela_relay_core::{
+    chain_directory::ChainDirectory,
+    rpc_host::{ALLOW_PRIVATE_RPC_SETTING, RpcHostPolicy},
+};
 
 /// Default in-band reimbursement multiplier: 1.4x the simulated outer transaction cost.
 pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
@@ -47,6 +50,9 @@ pub struct Config {
     pub settlement_recipient: Option<String>,
     /// Where chain metadata (RPC endpoints, native asset, stablecoins) is read from.
     pub chain_directory: ChainDirectory,
+    /// Which RPC hosts the relay calls: public `https` only, unless a relay
+    /// run beside a private chain opts in (`VELA_RELAY_ALLOW_PRIVATE_RPC`).
+    pub rpc_host_policy: RpcHostPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +279,7 @@ impl Config {
             executor: executor_config()?,
             settlement_recipient: settlement_recipient()?,
             chain_directory: chain_directory()?,
+            rpc_host_policy: rpc_host_policy()?,
         })
     }
 }
@@ -281,6 +288,14 @@ fn chain_directory() -> Result<ChainDirectory, ConfigError> {
     let value = optional_value("VELA_RELAY_CHAIN_DIRECTORY_URL")?;
     ChainDirectory::from_setting(value.as_deref())
         .map_err(|error| ConfigError(format!("invalid VELA_RELAY_CHAIN_DIRECTORY_URL: {error}")))
+}
+
+fn rpc_host_policy() -> Result<RpcHostPolicy, ConfigError> {
+    let allow_private = match optional_value(ALLOW_PRIVATE_RPC_SETTING)? {
+        Some(value) => parse_bool(ALLOW_PRIVATE_RPC_SETTING, &value)?,
+        None => false,
+    };
+    Ok(RpcHostPolicy::from_setting(allow_private))
 }
 
 fn executor_config() -> Result<ExecutorConfig, ConfigError> {

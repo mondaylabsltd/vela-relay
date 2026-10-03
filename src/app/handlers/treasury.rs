@@ -34,9 +34,10 @@ pub async fn address(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /v1/treasury/{chain_id}`. The core decides which balance to read (the
-/// native coin, or pathUSD on Tempo) and what it means; this handler performs
-/// the one read and renders the core's answer — the same bytes the Cloudflare
-/// shell renders.
+/// native coin, or pathUSD on Tempo), what it means, and — when there is none —
+/// whether the relay cannot serve the chain (`404`) or cannot read it right now
+/// (`503`); this handler performs the one read and renders the core's answer —
+/// the same bytes the Cloudflare shell renders.
 pub async fn status(
     State(state): State<AppState>,
     Path(chain_id): Path<u64>,
@@ -53,7 +54,7 @@ pub async fn status(
         Err(failure) => return probe_failure(failure),
     };
 
-    let result = rpc::call(
+    let result = rpc::treasury_read(
         chain_id,
         headers.get(rpc::USER_RPC_URL_HEADER),
         read.method,
@@ -66,11 +67,10 @@ pub async fn status(
 }
 
 /// The RPC result → HTTP hop. A balance we could not read is NOT a balance of
-/// zero: both an unreachable RPC and an unreadable answer are a 503.
-fn respond(chain_id: u64, address: &str, result: Result<Value, ()>) -> Response {
-    let status = result
-        .map_err(|()| ProbeFailure::RpcUnavailable)
-        .and_then(|value| treasury::treasury_status(chain_id, address, &value));
+/// zero: an unreachable RPC and an unreadable answer are a 503, and a chain
+/// the relay cannot serve is a 404 that says why.
+fn respond(chain_id: u64, address: &str, result: Result<Value, ProbeFailure>) -> Response {
+    let status = result.and_then(|value| treasury::treasury_status(chain_id, address, &value));
 
     match status {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
@@ -79,7 +79,9 @@ fn respond(chain_id: u64, address: &str, result: Result<Value, ()>) -> Response 
 }
 
 fn probe_failure(failure: ProbeFailure) -> Response {
-    error(StatusCode::SERVICE_UNAVAILABLE, failure.message())
+    let status =
+        StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    (status, Json(failure.body())).into_response()
 }
 
 fn error(status: StatusCode, message: &'static str) -> Response {
@@ -93,7 +95,9 @@ mod tests {
 
     use super::respond;
     use crate::utils::config::DEFAULT_TREASURY_FLOOR_WEI;
-    use vela_relay_core::treasury::{NATIVE_TREASURY_FLOOR, balance_read, quantity_is_below};
+    use vela_relay_core::treasury::{
+        NATIVE_TREASURY_FLOOR, ProbeFailure, balance_read, quantity_is_below,
+    };
 
     const TREASURY: &str = "0x3e59292e18417f814112f731e7163534c6d2fe3c";
 
@@ -173,8 +177,16 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_balance_is_a_503_never_a_zero() {
         for (chain_id, result, message) in [
-            (4_217, Err(()), "treasury RPC is unavailable"),
-            (196, Err(()), "treasury RPC is unavailable"),
+            (
+                4_217,
+                Err(ProbeFailure::RpcUnavailable),
+                "treasury RPC is unavailable",
+            ),
+            (
+                196,
+                Err(ProbeFailure::RpcUnavailable),
+                "treasury RPC is unavailable",
+            ),
             (
                 4_217,
                 Ok(json!("0x")),
@@ -198,6 +210,23 @@ mod tests {
 
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(body, json!({ "error": message }));
+        }
+    }
+
+    /// The two answers the wallet stops on before anyone signs (spec 098).
+    #[tokio::test]
+    async fn a_chain_the_relay_cannot_serve_is_a_404_that_says_why() {
+        for (failure, reason) in [
+            (ProbeFailure::NotListed, "not_listed"),
+            (ProbeFailure::NoRpc, "no_rpc"),
+        ] {
+            let (status, body) = body(respond(1_337, TREASURY, Err(failure))).await;
+
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(
+                body,
+                json!({ "error": failure.message(), "reason": reason })
+            );
         }
     }
 }

@@ -98,7 +98,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
                 Err(failure) => return json_error(503, failure.message()),
             };
             let user_rpc_url = req.headers().get(USER_RPC_URL_HEADER).ok().flatten();
-            let balance = crate::arms::rpc::call(
+            let balance = crate::arms::rpc::treasury_read(
                 &config,
                 &env,
                 chain_id,
@@ -108,14 +108,16 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             )
             .await;
             // A balance we could not read is NOT a balance of zero: the wallet
-            // routes 5xx as transient and 404 as "not served", and neither may
-            // be invented out of an unreachable RPC.
+            // routes 5xx as transient and 404 as "this relay can't reach the
+            // network". The core says which — 404 only for a chain the relay
+            // cannot serve at all, never for an RPC that merely did not answer.
             let status = balance
-                .map_err(|_| treasury::ProbeFailure::RpcUnavailable)
                 .and_then(|result| treasury::treasury_status(chain_id, &address, &result.value));
             match status {
                 Ok(status) => Response::from_json(&status),
-                Err(failure) => json_error(503, failure.message()),
+                Err(failure) => {
+                    Ok(Response::from_json(&failure.body())?.with_status(failure.http_status()))
+                }
             }
         }
         // `/v1/account/{chain_id}/{safe}` — the docker shell's account view.
