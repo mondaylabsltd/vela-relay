@@ -5,6 +5,7 @@
 use serde_json::{Value, json};
 use vela_relay_core::account;
 use vela_relay_core::admission::SUPPORTED_ENTRY_POINTS;
+use vela_relay_core::treasury;
 use vela_relay_core::wire::{
     self, GetUserOperationByHashParams, GetUserOperationReceiptParams,
     GetUserOperationStatusParams, RpcError, RpcMethod, RpcResponse, UserOperationByHash,
@@ -88,38 +89,34 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             let Some(address) = config.settlement_recipient.clone() else {
                 return json_error(503, "settlement recipient is not configured");
             };
+            // The core decides WHICH balance is the treasury's — the native
+            // coin, or pathUSD on Tempo, whose `eth_getBalance` is a
+            // placeholder — and what it means. This shell performs the one
+            // read and renders the core's answer, the same bytes as docker.
+            let read = match treasury::balance_read(chain_id, &address) {
+                Ok(read) => read,
+                Err(failure) => return json_error(503, failure.message()),
+            };
             let user_rpc_url = req.headers().get(USER_RPC_URL_HEADER).ok().flatten();
             let balance = crate::arms::rpc::call(
                 &config,
                 &env,
                 chain_id,
                 user_rpc_url.as_deref(),
-                "eth_getBalance",
-                json!([address, "latest"]),
+                read.method,
+                read.params,
             )
             .await;
             // A balance we could not read is NOT a balance of zero: the wallet
             // routes 5xx as transient and 404 as "not served", and neither may
             // be invented out of an unreachable RPC.
-            let Ok(result) = balance else {
-                return json_error(503, "treasury RPC is unavailable");
-            };
-            let Some(balance) = result
-                .value
-                .as_str()
-                .and_then(|value| vela_relay_core::treasury::parse_quantity(value).ok())
-            else {
-                return json_error(503, "treasury RPC returned an invalid balance");
-            };
-            let floor = vela_relay_core::treasury::NATIVE_TREASURY_FLOOR;
-            Response::from_json(&json!({
-                "chainId": chain_id,
-                "address": address,
-                "asset": "native",
-                "balance": balance,
-                "floor": floor,
-                "bootstrapNeeded": vela_relay_core::treasury::quantity_is_below(&balance, floor),
-            }))
+            let status = balance
+                .map_err(|_| treasury::ProbeFailure::RpcUnavailable)
+                .and_then(|result| treasury::treasury_status(chain_id, &address, &result.value));
+            match status {
+                Ok(status) => Response::from_json(&status),
+                Err(failure) => json_error(503, failure.message()),
+            }
         }
         // `/v1/account/{chain_id}/{safe}` — the docker shell's account view.
         // Informational for the wallet (it reads this under a `.catch`), which
