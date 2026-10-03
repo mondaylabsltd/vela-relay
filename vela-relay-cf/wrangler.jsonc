@@ -59,6 +59,11 @@
     // Optional; absent = https://ethereum-data.getvela.app. Base URL of the
     // chain directory (RPCs, native asset, accepted stablecoins per chain).
     // "VELA_RELAY_CHAIN_DIRECTORY_URL": "https://chains.example.org"
+    // Optional; absent = false. Allows http and private hosts in the wallet's
+    // x-vela-rpc-url and the directory's endpoints — for a relay beside a
+    // private chain only, and of little use on Workers (docs/rpc.md). Vela's
+    // own deployment never sets it.
+    // "VELA_RELAY_ALLOW_PRIVATE_RPC": "false"
   }
   // Secrets (never in this file): OPERATOR_SECRET, ALCHEMY_API_KEY,
   // TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — set via `wrangler secret put`.

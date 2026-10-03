@@ -104,6 +104,21 @@ When it is unset, Relay uses `https://ethereum-data.getvela.app`. The directory 
 endpoints and payment tokens Relay trusts, so use one you control. Fetched entries are cached for
 an hour, so restart (Docker) or wait out the cache (Workers KV) after switching.
 
+### A network on your own machine
+
+Relay uses only public `https` endpoints from a wallet's `x-vela-rpc-url` header and from the
+directory, so nobody can make it call into its own network. A Relay you run beside a private
+chain — Anvil, Hardhat, a LAN node — can allow private hosts and plain `http`:
+
+```dotenv
+VELA_RELAY_ALLOW_PRIVATE_RPC=true
+VELA_RELAY_EXECUTOR_RPC_URLS={"31337":"http://127.0.0.1:8545"}
+```
+
+Never set it on a Relay that strangers can reach. [docs/rpc.md](docs/rpc.md) has the whole RPC
+rule: the order endpoints are tried in, why the executor never uses the wallet's, and what the
+treasury probe answers for a chain Relay cannot serve.
+
 For native-gas chains, a low relayer balance triggers a durable treasury top-up. The target is
 the greater of the next bundle prefund multiplied by `5` and the configured float target. If
 Binance supplies the native USD price, a single top-up is capped at USD 20; without a price the
