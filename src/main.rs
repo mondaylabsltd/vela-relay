@@ -13,8 +13,10 @@ fn main() -> Result<(), AppError> {
     let config = Config::from_env()?;
     utils::logging::init(&config.logging)?;
     utils::rpc::set_chain_directory(config.chain_directory.clone());
+    utils::rpc::set_rpc_host_policy(config.rpc_host_policy);
     tracing::info!(
         chain_directory = config.chain_directory.base_url(),
+        rpc_host_policy = ?config.rpc_host_policy,
         "chain directory configured"
     );
     if let Some(address) = config.settlement_recipient.as_deref() {

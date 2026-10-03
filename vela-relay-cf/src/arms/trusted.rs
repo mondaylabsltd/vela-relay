@@ -17,7 +17,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use vela_relay_core::broadcast as core_broadcast;
+use vela_relay_core::{broadcast as core_broadcast, rpc_host::RpcHostPolicy};
 use worker::{Delay, Env, Fetch, Headers, Method, Request, RequestInit};
 
 use super::market;
@@ -27,6 +27,7 @@ pub struct TrustedRpcClient<'env> {
     env: &'env Env,
     explicit_urls: BTreeMap<u64, Vec<String>>,
     alchemy_api_key: Option<String>,
+    rpc_host_policy: RpcHostPolicy,
     rpc_timeout_ms: u64,
 }
 
@@ -96,6 +97,7 @@ impl<'env> TrustedRpcClient<'env> {
             env,
             explicit_urls: config.trusted_rpc_urls.clone(),
             alchemy_api_key: config.alchemy_api_key.clone(),
+            rpc_host_policy: config.rpc_host_policy,
             rpc_timeout_ms: config.rpc_timeout_ms,
         }
     }
@@ -398,12 +400,10 @@ impl<'env> TrustedRpcClient<'env> {
             // Do not cache an outage: a subsequent batch should be able to
             // retry the controlled directory (docker parity; the KV metadata
             // cache underneath is success-only too).
-            match market::fallback_rpc_urls(self.env, chain_id).await {
+            // Filtered by the same rule as every read (docker parity: one
+            // `parse_rpc_url` for both).
+            match market::fallback_rpc_urls(self.env, chain_id, self.rpc_host_policy).await {
                 Ok(urls) => {
-                    let urls = urls
-                        .into_iter()
-                        .filter(|url| is_directory_executor_url(url))
-                        .collect::<Vec<_>>();
                     DIRECTORY_URLS.with(|directory| {
                         directory.borrow_mut().insert(chain_id, urls.clone());
                     });
@@ -420,29 +420,6 @@ impl<'env> TrustedRpcClient<'env> {
         append_unique_urls(&mut urls, directory_urls);
         urls
     }
-}
-
-/// The docker directory filter (`parse_rpc_url`): https only, no local hosts.
-fn is_directory_executor_url(url: &str) -> bool {
-    let Ok(url) = worker::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    url.scheme() == "https" && !is_local_host(host)
-}
-
-fn is_local_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || match ip {
-                    std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-                    std::net::IpAddr::V6(_) => false,
-                }
-        })
 }
 
 fn append_unique_urls(urls: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {

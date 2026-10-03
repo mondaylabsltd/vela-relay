@@ -32,8 +32,10 @@
 //!   affordability.
 //! - [`tempo`] — Tempo chain constants and pathUSD calldata builders.
 //! - [`alchemy`] — the static Alchemy network registry.
-//! - [`chain_directory`] — the chain-metadata directory address and the
-//!   per-chain metadata URL.
+//! - [`chain_directory`] — the chain-metadata directory address, the
+//!   per-chain metadata URL, and what an answer from it means.
+//! - [`rpc_host`] — which RPC endpoints the relay will call (the SSRF rule
+//!   and its self-host opt-in).
 //!
 //! Nondeterministic inputs (wall-clock time, generated identifiers, chain
 //! context, market prices, policy values) always enter through an event or an
@@ -56,6 +58,7 @@ pub mod hold;
 pub mod lifecycle;
 pub mod quote;
 pub mod receipt;
+pub mod rpc_host;
 pub mod settlement;
 pub mod signing;
 pub mod simulation;

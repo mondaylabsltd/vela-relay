@@ -2,7 +2,11 @@
 //! (Constitution II). Bounds mirror the docker parser where they apply; the
 //! Iggy fixed-routing width pin deliberately does NOT (research.md R11).
 
-use vela_relay_core::{chain_directory::ChainDirectory, vault};
+use vela_relay_core::{
+    chain_directory::ChainDirectory,
+    rpc_host::{ALLOW_PRIVATE_RPC_SETTING, RpcHostPolicy},
+    vault,
+};
 use worker::Env;
 
 #[derive(Clone)]
@@ -17,6 +21,9 @@ pub struct CfConfig {
     /// Explicit per-chain executor RPC endpoints (docker
     /// `VELA_RELAY_EXECUTOR_RPC_URLS`), tried before Alchemy and the directory.
     pub trusted_rpc_urls: std::collections::BTreeMap<u64, Vec<String>>,
+    /// Which RPC hosts the relay calls for a URL it did not choose (docker
+    /// `rpc_host_policy`, `VELA_RELAY_ALLOW_PRIVATE_RPC`).
+    pub rpc_host_policy: RpcHostPolicy,
     /// Per-request executor RPC deadline (docker `rpc_timeout`, default 5 s).
     pub rpc_timeout_ms: u64,
     /// Treasury lease TTL (docker `lease_ttl`, default 30 s).
@@ -208,6 +215,7 @@ impl CfConfig {
                 Some(value) => parse_trusted_rpc_urls(&value)?,
                 None => std::collections::BTreeMap::new(),
             },
+            rpc_host_policy: rpc_host_policy(env)?,
             rpc_timeout_ms: u64_var(env, "VELA_RELAY_EXECUTOR_RPC_TIMEOUT_SECS", 5)?
                 .saturating_mul(1_000),
             lease_ttl_ms: u64_var(env, "VELA_RELAY_EXECUTOR_LEASE_TTL_SECS", 30)?
@@ -338,6 +346,15 @@ fn usize_var(env: &Env, name: &str, default: usize) -> Result<usize, String> {
             .parse::<usize>()
             .map_err(|error| format!("invalid {name}: {error}")),
     }
+}
+
+/// Same setting and rule as the docker shell; absent = public `https` only.
+pub fn rpc_host_policy(env: &Env) -> Result<RpcHostPolicy, String> {
+    let allow_private = match var(env, ALLOW_PRIVATE_RPC_SETTING) {
+        Some(value) => parse_bool(ALLOW_PRIVATE_RPC_SETTING, &value)?,
+        None => false,
+    };
+    Ok(RpcHostPolicy::from_setting(allow_private))
 }
 
 /// Same setting and rule as the docker shell; absent = Vela's directory.

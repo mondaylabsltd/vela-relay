@@ -22,7 +22,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::tempo;
+use crate::{chain_directory::Listing, tempo};
 
 /// 0.0001 native coin — the operator float below which the relay cannot fund a
 /// relayer and needs a direct, NON-REFUNDABLE bootstrap deposit. Mirrors
@@ -109,8 +109,17 @@ impl TreasuryAsset {
     }
 }
 
-/// Why the probe has no answer. Every one is a 503: a balance we cannot read is
-/// not a balance of zero, and the wallet routes 5xx as transient.
+/// Why the probe has no answer.
+///
+/// Two of them mean the relay CANNOT serve the chain — a `404`, which the
+/// wallet treats as "this relay can't reach this network" and stops the send
+/// before anyone signs. The rest mean "not now" — a `503`, which the wallet
+/// treats as transient: a balance we cannot read is not a balance of zero.
+///
+/// Before the two `404`s existed, a chain the relay could never reach answered
+/// `503` like a hiccup, so the wallet carried on to the passkey and the send
+/// failed after it was signed (spec 098 in vela-wallet, 2026-10-03: chains
+/// 1337 and 123456789).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeFailure {
     /// No RPC answered the read.
@@ -121,16 +130,82 @@ pub enum ProbeFailure {
     /// (The native read passes the address through to the node, as it always
     /// has.)
     InvalidAddress,
+    /// The chain directory does not hold the chain ([`Listing::NotListed`]).
+    NotListed,
+    /// The relay has no RPC it may use for the chain — see [`unreadable`].
+    NoRpc,
 }
 
 impl ProbeFailure {
-    /// The `error` text both shells return with the 503.
+    /// The `error` text both shells return.
     pub const fn message(self) -> &'static str {
         match self {
             Self::RpcUnavailable => "treasury RPC is unavailable",
             Self::InvalidBalance => "treasury RPC returned an invalid balance",
             Self::InvalidAddress => "settlement recipient is not a valid address",
+            Self::NotListed => "this relay's chain directory does not list the chain",
+            Self::NoRpc => "this relay has no RPC it can use for the chain",
         }
+    }
+
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::NotListed | Self::NoRpc => 404,
+            Self::RpcUnavailable | Self::InvalidBalance | Self::InvalidAddress => 503,
+        }
+    }
+
+    /// The machine-readable `reason` beside a `404`'s `error`; a `503` has none.
+    pub const fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::NotListed => Some("not_listed"),
+            Self::NoRpc => Some("no_rpc"),
+            Self::RpcUnavailable | Self::InvalidBalance | Self::InvalidAddress => None,
+        }
+    }
+
+    /// The response body, the same bytes from both shells.
+    pub fn body(self) -> Value {
+        match self.reason() {
+            Some(reason) => json!({ "error": self.message(), "reason": reason }),
+            None => json!({ "error": self.message() }),
+        }
+    }
+}
+
+/// What became of the RPC the wallet sent in `x-vela-rpc-url`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientRpc {
+    /// None was sent.
+    Absent,
+    /// It was sent and the relay may use it ([`crate::rpc_host`]).
+    Used,
+    /// It was sent and the relay may not use it: plain `http`, or a private
+    /// host, under the default [`crate::rpc_host::RpcHostPolicy`].
+    Refused,
+}
+
+/// Why the balance read came back empty, from what the shell found while
+/// trying: the directory's [`Listing`], what became of the wallet's RPC, and
+/// whether there was any RPC to try at all. (A chain that is not listed never
+/// gets this far: the shell answers [`ProbeFailure::NotListed`] first.)
+///
+/// - Nothing to try, with the directory answering: no RPC the relay may use
+///   exists — [`ProbeFailure::NoRpc`]. Chain 1337 is listed with only
+///   `http://127.0.0.1:8545`.
+/// - Nothing to try, with the directory down: unknown — a `503`.
+/// - Something tried and nothing answered, when the wallet's own RPC was
+///   refused: the network the person uses is one this relay cannot reach, and
+///   the directory's endpoints do not answer either —
+///   [`ProbeFailure::NoRpc`]. This is a local Anvil or Hardhat chain (31337),
+///   whose id the directory gives to a public testnet that no longer answers.
+/// - Something tried and nothing answered otherwise: a `503`, transient.
+pub const fn unreadable(listing: Listing, client_rpc: ClientRpc, tried: bool) -> ProbeFailure {
+    match (tried, listing, client_rpc) {
+        (false, Listing::Unavailable, _) => ProbeFailure::RpcUnavailable,
+        (false, _, _) => ProbeFailure::NoRpc,
+        (true, _, ClientRpc::Refused) => ProbeFailure::NoRpc,
+        (true, _, _) => ProbeFailure::RpcUnavailable,
     }
 }
 
@@ -240,11 +315,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        BalanceRead, NATIVE_TREASURY_FLOOR, PATH_USD_TOP_UP_GAS_HEADROOM, PATH_USD_TREASURY_FLOOR,
-        PATH_USD_TREASURY_FLOOR_MICRO, ProbeFailure, TreasuryAsset, balance_read, parse_quantity,
-        quantity_is_below, treasury_status,
+        BalanceRead, ClientRpc, NATIVE_TREASURY_FLOOR, PATH_USD_TOP_UP_GAS_HEADROOM,
+        PATH_USD_TREASURY_FLOOR, PATH_USD_TREASURY_FLOOR_MICRO, ProbeFailure, TreasuryAsset,
+        balance_read, parse_quantity, quantity_is_below, treasury_status, unreadable,
     };
-    use crate::tempo;
+    use crate::{chain_directory::Listing, tempo};
 
     const TREASURY: &str = "0x3e59292e18417f814112f731e7163534c6d2fe3c";
     const TEMPO: u64 = 4_217;
@@ -452,5 +527,79 @@ mod tests {
             .unwrap();
         let required = top_up + gas_cost + U256::from(tempo::TEMPO_TREASURY_FLOOR);
         assert!(required <= U256::from(PATH_USD_TREASURY_FLOOR_MICRO));
+    }
+
+    /// A relay that cannot serve the chain says 404 with a reason; one that
+    /// could, but did not get an answer, says 503 without one.
+    #[test]
+    fn cannot_is_a_404_with_a_reason_and_not_now_is_a_503() {
+        assert_eq!(ProbeFailure::NotListed.http_status(), 404);
+        assert_eq!(ProbeFailure::NoRpc.http_status(), 404);
+        assert_eq!(
+            ProbeFailure::NoRpc.body(),
+            json!({
+                "error": "this relay has no RPC it can use for the chain",
+                "reason": "no_rpc",
+            })
+        );
+        assert_eq!(
+            ProbeFailure::NotListed.body(),
+            json!({
+                "error": "this relay's chain directory does not list the chain",
+                "reason": "not_listed",
+            })
+        );
+        for failure in [
+            ProbeFailure::RpcUnavailable,
+            ProbeFailure::InvalidBalance,
+            ProbeFailure::InvalidAddress,
+        ] {
+            assert_eq!(failure.http_status(), 503);
+            assert_eq!(failure.body(), json!({ "error": failure.message() }));
+        }
+    }
+
+    /// The live answers of 2026-10-03, each of which was a 503 the wallet
+    /// carried on through.
+    #[test]
+    fn a_chain_the_relay_can_never_reach_is_not_a_hiccup() {
+        // 1337: listed, but its only RPC is http://127.0.0.1:8545 — nothing to
+        // try, whether or not the wallet sent its own (refused) localhost RPC.
+        assert_eq!(
+            unreadable(Listing::Listed, ClientRpc::Absent, false),
+            ProbeFailure::NoRpc
+        );
+        assert_eq!(
+            unreadable(Listing::Listed, ClientRpc::Refused, false),
+            ProbeFailure::NoRpc
+        );
+        // 31337: the wallet's Anvil RPC is refused, and the public testnet the
+        // directory lists under that id does not answer.
+        assert_eq!(
+            unreadable(Listing::Listed, ClientRpc::Refused, true),
+            ProbeFailure::NoRpc
+        );
+    }
+
+    #[test]
+    fn a_usable_rpc_that_did_not_answer_is_still_transient() {
+        for client_rpc in [ClientRpc::Absent, ClientRpc::Used] {
+            assert_eq!(
+                unreadable(Listing::Listed, client_rpc, true),
+                ProbeFailure::RpcUnavailable
+            );
+            assert_eq!(
+                unreadable(Listing::Unavailable, client_rpc, true),
+                ProbeFailure::RpcUnavailable
+            );
+        }
+        // The directory is down and nothing else was there to try: unknown,
+        // not "cannot".
+        for client_rpc in [ClientRpc::Absent, ClientRpc::Refused] {
+            assert_eq!(
+                unreadable(Listing::Unavailable, client_rpc, false),
+                ProbeFailure::RpcUnavailable
+            );
+        }
     }
 }

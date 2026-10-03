@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    fmt,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -9,7 +9,11 @@ use axum::http::HeaderValue;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use vela_relay_core::chain_directory::ChainDirectory;
+use vela_relay_core::{
+    chain_directory::{ChainDirectory, Listing},
+    rpc_host::RpcHostPolicy,
+    treasury::{ClientRpc, ProbeFailure},
+};
 
 pub const USER_RPC_URL_HEADER: &str = "x-vela-rpc-url";
 
@@ -28,6 +32,7 @@ static METADATA_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static FAILED_RPCS: OnceLock<FailedRpcCache> = OnceLock::new();
 static CHAIN_METADATA_CACHE: OnceLock<Mutex<HashMap<u64, CachedChainMetadata>>> = OnceLock::new();
 static CHAIN_DIRECTORY: OnceLock<ChainDirectory> = OnceLock::new();
+static RPC_HOST_POLICY: OnceLock<RpcHostPolicy> = OnceLock::new();
 
 #[derive(Debug, PartialEq)]
 pub struct RpcCallResult {
@@ -134,6 +139,90 @@ pub async fn directory_rpc_urls(chain_id: u64) -> Result<Vec<String>, ()> {
     fetch_fallback_rpc_urls(chain_id).await.map_err(|error| {
         tracing::warn!(%error, chain_id, "could not fetch controlled directory RPC URLs");
     })
+}
+
+/// The treasury probe's read (`GET /v1/treasury/{chain_id}`): the same sources
+/// in the same order as [`call`], but when there is no balance it says why, so
+/// the relay can tell "this chain cannot be served" (`404`) from "not now"
+/// (`503`) — the core decides which ([`vela_relay_core::treasury::unreadable`]).
+///
+/// It asks the directory first, even when the wallet's RPC would answer: a
+/// chain the directory does not list cannot be quoted or executed, so a balance
+/// read for it would only send the wallet on to a send that fails after it is
+/// signed.
+pub async fn treasury_read(
+    chain_id: u64,
+    user_rpc_url: Option<&HeaderValue>,
+    method: &str,
+    params: Value,
+) -> Result<RpcCallResult, ProbeFailure> {
+    let directory = fetch_fallback_rpc_urls(chain_id).await;
+    let sources = TreasurySources {
+        directory,
+        user_rpc_url,
+        alchemy: alchemy_rpc_url(chain_id),
+        policy: rpc_host_policy(),
+    };
+    sources.read(http_client(), chain_id, method, &params).await
+}
+
+/// What [`treasury_read`] reads from, gathered before any read is made.
+struct TreasurySources<'a> {
+    /// The directory's usable endpoints, or why there are none.
+    directory: Result<Vec<String>, MetadataError>,
+    user_rpc_url: Option<&'a HeaderValue>,
+    alchemy: Option<String>,
+    policy: RpcHostPolicy,
+}
+
+impl TreasurySources<'_> {
+    async fn read(
+        self,
+        client: &Client,
+        chain_id: u64,
+        method: &str,
+        params: &Value,
+    ) -> Result<RpcCallResult, ProbeFailure> {
+        let (listing, directory_urls) = match self.directory {
+            Ok(urls) => (Listing::Listed, urls),
+            Err(MetadataError::NotListed) => return Err(ProbeFailure::NotListed),
+            Err(error) => {
+                tracing::warn!(%error, chain_id, "could not fetch the chain directory for the treasury probe");
+                (Listing::Unavailable, Vec::new())
+            }
+        };
+
+        let header_url = self
+            .user_rpc_url
+            .and_then(|value| parse_rpc_url_under(value.to_str().ok()?.trim(), self.policy));
+        let client_rpc = match (self.user_rpc_url, &header_url) {
+            (None, _) => ClientRpc::Absent,
+            (Some(_), Some(_)) => ClientRpc::Used,
+            (Some(_), None) => {
+                tracing::warn!("ignored invalid user RPC URL header");
+                ClientRpc::Refused
+            }
+        };
+
+        let sources = [
+            ("request_header", header_url.into_iter().collect::<Vec<_>>()),
+            ("alchemy", self.alchemy.into_iter().collect()),
+            ("chain-directory", directory_urls),
+        ];
+        let tried = sources.iter().any(|(_, urls)| !urls.is_empty());
+        for (source, urls) in &sources {
+            if !urls.is_empty()
+                && let Some(result) =
+                    first_result(client, chain_id, source, urls, method, params).await
+            {
+                return Ok(result);
+            }
+        }
+
+        Err(vela_relay_core::treasury::unreadable(
+            listing, client_rpc, tried,
+        ))
+    }
 }
 
 /// Call an EVM simulation method while preserving a definitive contract revert.
@@ -288,6 +377,16 @@ pub fn set_chain_directory(directory: ChainDirectory) {
     let _ = CHAIN_DIRECTORY.set(directory);
 }
 
+/// Set once at startup from `VELA_RELAY_ALLOW_PRIVATE_RPC`; later calls are
+/// ignored. Absent means public `https` only.
+pub fn set_rpc_host_policy(policy: RpcHostPolicy) {
+    let _ = RPC_HOST_POLICY.set(policy);
+}
+
+fn rpc_host_policy() -> RpcHostPolicy {
+    RPC_HOST_POLICY.get().copied().unwrap_or_default()
+}
+
 fn chain_directory() -> &'static ChainDirectory {
     CHAIN_DIRECTORY.get_or_init(ChainDirectory::default)
 }
@@ -318,7 +417,7 @@ fn parse_user_rpc_url(value: &HeaderValue) -> Option<String> {
     parse_rpc_url(value)
 }
 
-async fn fetch_fallback_rpc_urls(chain_id: u64) -> Result<Vec<String>, String> {
+async fn fetch_fallback_rpc_urls(chain_id: u64) -> Result<Vec<String>, MetadataError> {
     let response = fetch_chain_metadata(metadata_http_client(), chain_id).await?;
 
     Ok(response
@@ -328,7 +427,10 @@ async fn fetch_fallback_rpc_urls(chain_id: u64) -> Result<Vec<String>, String> {
         .collect())
 }
 
-async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMetadata, String> {
+async fn fetch_chain_metadata(
+    client: &Client,
+    chain_id: u64,
+) -> Result<ChainMetadata, MetadataError> {
     let now = Instant::now();
     if let Some(metadata) = cached_chain_metadata(chain_id, now) {
         return Ok(metadata);
@@ -342,7 +444,9 @@ async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMet
                 store_chain_metadata(chain_id, metadata.clone(), now);
                 return Ok(metadata);
             }
-            Err(error) => {
+            // Definitive: asking again gets the same page.
+            Err(MetadataError::NotListed) => return Err(MetadataError::NotListed),
+            Err(MetadataError::Unavailable(error)) => {
                 last_error = Some(error);
                 if attempt < METADATA_REQUEST_ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
@@ -351,25 +455,55 @@ async fn fetch_chain_metadata(client: &Client, chain_id: u64) -> Result<ChainMet
         }
     }
 
-    Err(format!(
+    Err(MetadataError::Unavailable(format!(
         "metadata request failed after {METADATA_REQUEST_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "unknown error".into())
-    ))
+    )))
 }
 
-async fn fetch_chain_metadata_once(client: &Client, url: &str) -> Result<ChainMetadata, String> {
-    let body = client
+/// Why the directory gave no metadata for a chain.
+#[derive(Debug, PartialEq)]
+enum MetadataError {
+    /// It does not list the chain ([`Listing::NotListed`]).
+    NotListed,
+    /// It did not answer, or answered with something unreadable.
+    Unavailable(String),
+}
+
+impl fmt::Display for MetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotListed => formatter.write_str("the chain directory does not list the chain"),
+            Self::Unavailable(error) => formatter.write_str(error),
+        }
+    }
+}
+
+async fn fetch_chain_metadata_once(
+    client: &Client,
+    url: &str,
+) -> Result<ChainMetadata, MetadataError> {
+    let unavailable = |error: reqwest::Error| MetadataError::Unavailable(error.to_string());
+    let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .text()
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::from_str(&body).map_err(|error| error.to_string())
+        .map_err(unavailable)?;
+    let status = response.status().as_u16();
+    let body = if response.status().is_success() {
+        response.text().await.map_err(unavailable)?
+    } else {
+        String::new()
+    };
+    match Listing::of(status, &body) {
+        Listing::Listed => serde_json::from_str(&body)
+            .map_err(|error| MetadataError::Unavailable(error.to_string())),
+        Listing::NotListed => Err(MetadataError::NotListed),
+        Listing::Unavailable => Err(MetadataError::Unavailable(format!(
+            "chain directory returned HTTP status {status}"
+        ))),
+    }
 }
 
 fn cached_chain_metadata(chain_id: u64, now: Instant) -> Option<ChainMetadata> {
@@ -406,24 +540,18 @@ fn chain_metadata_cache() -> &'static Mutex<HashMap<u64, CachedChainMetadata>> {
     CHAIN_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Every URL the relay did not choose itself — the wallet's header and the
+/// directory's list — passes here: public `https` only, unless the operator
+/// opted in ([`vela_relay_core::rpc_host`]).
 fn parse_rpc_url(value: &str) -> Option<String> {
+    parse_rpc_url_under(value, rpc_host_policy())
+}
+
+fn parse_rpc_url_under(value: &str, policy: RpcHostPolicy) -> Option<String> {
     let url = reqwest::Url::parse(value).ok()?;
     let host = url.host_str()?;
 
-    (url.scheme() == "https" && !is_local_host(host)).then(|| url.into())
-}
-
-fn is_local_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    host.parse::<IpAddr>().is_ok_and(|address| match address {
-        IpAddr::V4(address) => {
-            address.is_loopback() || address.is_private() || address.is_link_local()
-        }
-        IpAddr::V6(address) => address.is_loopback() || address.is_unspecified(),
-    })
+    policy.allows(url.scheme(), host).then(|| url.into())
 }
 
 async fn first_result(
@@ -839,10 +967,13 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        ChainMetadata, FailedRpcCache, SimulationUpstreamError, fetch_result,
-        fetch_simulation_result, first_result, first_simulation_result, parse_rpc_url,
-        redacted_rpc_url, response_rpc_url, rpc_domain,
+        ChainMetadata, FailedRpcCache, MetadataError, SimulationUpstreamError, TreasurySources,
+        fetch_chain_metadata_once, fetch_result, fetch_simulation_result, first_result,
+        first_simulation_result, parse_rpc_url, parse_rpc_url_under, redacted_rpc_url,
+        response_rpc_url, rpc_domain,
     };
+    use axum::{http::HeaderValue, routing::get};
+    use vela_relay_core::{rpc_host::RpcHostPolicy, treasury::ProbeFailure};
 
     static TEST_CHAIN_IDS: AtomicU64 = AtomicU64::new(9_000_000_000);
 
@@ -889,6 +1020,229 @@ mod tests {
         );
         assert!(parse_rpc_url("http://eth.example.com").is_none());
         assert!(parse_rpc_url("https://127.0.0.1").is_none());
+        assert!(parse_rpc_url("https://[::1]:8545").is_none());
+        assert!(parse_rpc_url("https://169.254.169.254/latest").is_none());
+    }
+
+    #[test]
+    fn a_relay_beside_a_private_chain_may_opt_in_to_its_node() {
+        let private = RpcHostPolicy::AllowPrivate;
+        assert_eq!(
+            parse_rpc_url_under("http://127.0.0.1:8545", private),
+            Some("http://127.0.0.1:8545/".into())
+        );
+        assert_eq!(
+            parse_rpc_url_under("http://anvil:8545", private),
+            Some("http://anvil:8545/".into())
+        );
+        assert!(parse_rpc_url_under("ws://127.0.0.1:8545", private).is_none());
+        assert!(parse_rpc_url_under("http://127.0.0.1:8545", RpcHostPolicy::default()).is_none());
+    }
+
+    /// A local JSON-RPC node and chain directory: `POST /ok` answers a balance,
+    /// `POST /down` a 503, and each counts its calls; `GET` serves directory
+    /// pages.
+    async fn local_node() -> (
+        std::net::SocketAddr,
+        Arc<Mutex<usize>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(0_usize));
+        let ok_calls = Arc::clone(&calls);
+        let down_calls = Arc::clone(&calls);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/ok",
+                        post(move || {
+                            let calls = Arc::clone(&ok_calls);
+                            async move {
+                                *calls.lock().unwrap() += 1;
+                                Json(json!({ "jsonrpc": "2.0", "id": 1, "result": "0x0" }))
+                            }
+                        }),
+                    )
+                    .route(
+                        "/down",
+                        post(move || {
+                            let calls = Arc::clone(&down_calls);
+                            async move {
+                                *calls.lock().unwrap() += 1;
+                                (StatusCode::SERVICE_UNAVAILABLE, "down")
+                            }
+                        }),
+                    )
+                    .route(
+                        "/chains/listed.json",
+                        get(|| async {
+                            Json(json!({ "chainId": 1337, "rpc": ["http://127.0.0.1:8545"] }))
+                        }),
+                    )
+                    .route(
+                        "/chains/spa.json",
+                        get(|| async {
+                            (
+                                [("content-type", "text/html")],
+                                "<!doctype html><html><body>ethereum-data</body></html>",
+                            )
+                        }),
+                    )
+                    .route(
+                        "/chains/broken.json",
+                        get(|| async { (StatusCode::BAD_GATEWAY, "bad gateway") }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        (address, calls, server)
+    }
+
+    #[tokio::test]
+    async fn the_directorys_html_page_is_not_a_listing_and_its_outage_is_not_either() {
+        let (address, _, server) = local_node().await;
+        let client = reqwest::Client::new();
+        let fetch = |page: &str| {
+            let url = format!("http://{address}/chains/{page}");
+            let client = client.clone();
+            async move { fetch_chain_metadata_once(&client, &url).await }
+        };
+
+        assert_eq!(fetch("listed.json").await.unwrap().rpc.len(), 1);
+        assert_eq!(
+            fetch("spa.json").await.err(),
+            Some(MetadataError::NotListed)
+        );
+        assert_eq!(
+            fetch("missing.json").await.err(),
+            Some(MetadataError::NotListed)
+        );
+        assert!(matches!(
+            fetch("broken.json").await,
+            Err(MetadataError::Unavailable(_))
+        ));
+        server.abort();
+    }
+
+    fn header(value: &str) -> HeaderValue {
+        HeaderValue::from_str(value).unwrap()
+    }
+
+    async fn probe(
+        directory: Result<Vec<String>, MetadataError>,
+        user_rpc_url: Option<&HeaderValue>,
+        policy: RpcHostPolicy,
+    ) -> Result<serde_json::Value, ProbeFailure> {
+        let chain_id = TEST_CHAIN_IDS.fetch_add(1, Ordering::Relaxed);
+        TreasurySources {
+            directory,
+            user_rpc_url,
+            alchemy: None,
+            policy,
+        }
+        .read(
+            &reqwest::Client::new(),
+            chain_id,
+            "eth_getBalance",
+            &json!([]),
+        )
+        .await
+        .map(|result| result.value)
+    }
+
+    /// Chain 123456789 (2026-10-03): the directory answered its HTML page, so
+    /// the relay cannot quote or execute it — even if the wallet's RPC answers.
+    #[tokio::test]
+    async fn a_chain_the_directory_does_not_list_is_not_read_at_all() {
+        let (address, calls, server) = local_node().await;
+        let rpc = header(&format!("http://{address}/ok"));
+
+        let result = probe(
+            Err(MetadataError::NotListed),
+            Some(&rpc),
+            RpcHostPolicy::AllowPrivate,
+        )
+        .await;
+
+        assert_eq!(result, Err(ProbeFailure::NotListed));
+        assert_eq!(*calls.lock().unwrap(), 0);
+        server.abort();
+    }
+
+    /// Chain 1337 (2026-10-03): listed with only a loopback RPC, and the
+    /// wallet's own localhost RPC refused — there is nothing the relay may
+    /// call, and the node is never contacted.
+    #[tokio::test]
+    async fn no_rpc_the_relay_may_use_is_no_rpc_not_a_hiccup() {
+        let (address, calls, server) = local_node().await;
+        let rpc = header(&format!("http://{address}/ok"));
+
+        let result = probe(Ok(Vec::new()), Some(&rpc), RpcHostPolicy::default()).await;
+
+        assert_eq!(result, Err(ProbeFailure::NoRpc));
+        assert_eq!(*calls.lock().unwrap(), 0);
+        server.abort();
+    }
+
+    /// Chain 31337: the wallet's Anvil RPC is refused and the directory's
+    /// public endpoint for that id does not answer.
+    #[tokio::test]
+    async fn a_refused_wallet_rpc_and_a_silent_directory_is_no_rpc() {
+        let (address, calls, server) = local_node().await;
+        let directory = vec![format!("http://{address}/down")];
+        let rpc = header("http://127.0.0.1:8545");
+
+        let result = probe(Ok(directory), Some(&rpc), RpcHostPolicy::default()).await;
+
+        assert_eq!(result, Err(ProbeFailure::NoRpc));
+        assert_eq!(*calls.lock().unwrap(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_usable_rpc_that_does_not_answer_is_still_a_503() {
+        let (address, _, server) = local_node().await;
+        let down = format!("http://{address}/down");
+
+        let result = probe(Ok(vec![down.clone()]), None, RpcHostPolicy::AllowPrivate).await;
+        assert_eq!(result, Err(ProbeFailure::RpcUnavailable));
+
+        let rpc = header(&down);
+        let result = probe(
+            Err(MetadataError::Unavailable("directory down".into())),
+            Some(&rpc),
+            RpcHostPolicy::AllowPrivate,
+        )
+        .await;
+        assert_eq!(result, Err(ProbeFailure::RpcUnavailable));
+
+        let result = probe(
+            Err(MetadataError::Unavailable("directory down".into())),
+            None,
+            RpcHostPolicy::default(),
+        )
+        .await;
+        assert_eq!(result, Err(ProbeFailure::RpcUnavailable));
+        server.abort();
+    }
+
+    /// The wallet's RPC is read first, and the directory's after it.
+    #[tokio::test]
+    async fn the_wallets_rpc_answers_for_a_listed_chain() {
+        let (address, calls, server) = local_node().await;
+        let rpc = header(&format!("http://{address}/ok"));
+        let directory = vec![format!("http://{address}/down")];
+
+        let result = probe(Ok(directory), Some(&rpc), RpcHostPolicy::AllowPrivate).await;
+
+        assert_eq!(result, Ok(json!("0x0")));
+        assert_eq!(*calls.lock().unwrap(), 1);
+        server.abort();
     }
 
     #[test]
