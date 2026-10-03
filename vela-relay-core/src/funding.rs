@@ -10,8 +10,21 @@ use alloy::primitives::U256;
 
 use crate::settlement::USD_PRICE_SCALE;
 
-/// Gas limit of a plain native treasury → relayer transfer.
+/// The least gas a plain native treasury → relayer transfer is signed with:
+/// the intrinsic cost of a value transfer on Ethereum and on OP-stack chains,
+/// which charge their L1 data separately.
+///
+/// It is a floor, not the limit. Arbitrum folds the L1 data cost into the gas
+/// limit, so a 21 000 transfer there is refused — "intrinsic gas too low
+/// (supplied gas 21000)"; the same transfer estimated 21 397 on 2026-10-03.
+/// Every top-up the relay signed for Arbitrum was refused, the relayer was
+/// never funded, and every operation on the chain waited in "funding" until
+/// the queue gave up on it. See [`native_top_up_gas_limit`].
 pub const TOP_UP_GAS_LIMIT: u64 = 21_000;
+/// Headroom on the chain's own estimate of the top-up — the same 1.2× the
+/// Tempo top-up carries. Arbitrum's L1 component moves with the L1 price
+/// between the estimate and inclusion.
+pub const TOP_UP_GAS_BUFFER_BPS: u64 = 12_000;
 /// Preferred per-transfer relayer top-up cap in whole USD, when a market
 /// price is available; otherwise the shell falls back to its static wei cap.
 pub const NATIVE_TOP_UP_USD_CAP: u64 = 20;
@@ -92,13 +105,25 @@ pub fn plan_native_top_up(
     })
 }
 
+/// The gas limit a native top-up is signed with: the chain's estimate of the
+/// exact transfer with [`TOP_UP_GAS_BUFFER_BPS`] on top, never below
+/// [`TOP_UP_GAS_LIMIT`]. Without an estimate it is the floor — and a chain
+/// that refuses that is caught by the broadcast, which discards the transfer
+/// and signs it again (`execution::broadcast_funding`).
+pub fn native_top_up_gas_limit(raw_estimate: Option<u64>) -> u64 {
+    raw_estimate.map_or(TOP_UP_GAS_LIMIT, |gas| {
+        (gas.saturating_mul(TOP_UP_GAS_BUFFER_BPS) / 10_000).max(TOP_UP_GAS_LIMIT)
+    })
+}
+
 /// The treasury balance that must survive a top-up: the transfer's own gas at
 /// the current fee plus the configured floor.
 pub fn native_top_up_reserve(
+    gas_limit: u64,
     max_fee_per_gas: u128,
     treasury_floor_wei: u128,
 ) -> Result<U256, FundingPlanError> {
-    U256::from(TOP_UP_GAS_LIMIT)
+    U256::from(gas_limit)
         .checked_mul(U256::from(max_fee_per_gas))
         .ok_or(FundingPlanError::GasCostOverflow)?
         .checked_add(U256::from(treasury_floor_wei))
@@ -275,6 +300,24 @@ mod tests {
         assert_eq!(
             plan_tempo_top_up(U256::from(100u64), U256::from(500_000u64)).unwrap(),
             Some(U256::from(499_900u64))
+        );
+    }
+
+    #[test]
+    fn a_top_up_is_signed_with_the_chains_estimate_never_below_a_plain_transfer() {
+        use super::{TOP_UP_GAS_LIMIT, native_top_up_gas_limit, native_top_up_reserve};
+        // Arbitrum, 2026-10-03: 21 397 estimated, 21 000 refused.
+        assert_eq!(native_top_up_gas_limit(Some(21_397)), 25_676);
+        // OP-stack chains estimate the plain 21 000: the 1.2x stays on top.
+        assert_eq!(native_top_up_gas_limit(Some(21_000)), 25_200);
+        // No estimate, or one below a value transfer's cost: the floor.
+        assert_eq!(native_top_up_gas_limit(None), TOP_UP_GAS_LIMIT);
+        assert_eq!(native_top_up_gas_limit(Some(1)), TOP_UP_GAS_LIMIT);
+        assert!(native_top_up_gas_limit(Some(u64::MAX)) > TOP_UP_GAS_LIMIT);
+        // The reserve counts the gas the transfer is signed with.
+        assert_eq!(
+            native_top_up_reserve(25_676, 2, 7).unwrap(),
+            alloy::primitives::U256::from(51_359u64)
         );
     }
 }

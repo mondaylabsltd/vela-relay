@@ -2232,6 +2232,7 @@ impl BatchShell<'_> {
                 }
             }
             Op::FetchTreasuryContext => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
                 let calls = [
                     RpcBatchCall {
                         method: "eth_getTransactionCount",
@@ -2240,6 +2241,16 @@ impl BatchShell<'_> {
                     RpcBatchCall {
                         method: "eth_getBalance",
                         params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                    // The chain's own price of the transfer (Arbitrum charges
+                    // more than 21 000); the core buffers it and floors it.
+                    RpcBatchCall {
+                        method: "eth_estimateGas",
+                        params: json!([{
+                            "from": engine.treasury_address.to_string(),
+                            "to": relayer.to_string(),
+                            "value": "0x1",
+                        }]),
                     },
                 ];
                 match engine.rpc.batch(chain_id, &calls).await {
@@ -2258,7 +2269,12 @@ impl BatchShell<'_> {
                                     Ok((nonce, balance))
                                 });
                         match context {
-                            Ok((nonce, balance)) => Out::TreasuryContext { nonce, balance },
+                            Ok((nonce, balance)) => Out::TreasuryContext {
+                                nonce,
+                                balance,
+                                raw_gas_estimate: response_quantity_optional(&responses, 2)
+                                    .and_then(|gas| u64::try_from(gas).ok()),
+                            },
                             Err(error) => Out::Failed {
                                 message: error.to_string(),
                             },
@@ -2341,7 +2357,7 @@ impl BatchShell<'_> {
                     TransactionPlan {
                         chain_id,
                         nonce: request.nonce,
-                        gas_limit: TOP_UP_GAS_LIMIT,
+                        gas_limit: request.gas_limit,
                         max_fee_per_gas: request.max_fee_per_gas,
                         max_priority_fee_per_gas: request.max_priority_fee_per_gas,
                         to: engine.relayer_addresses[self.lane as usize],
@@ -2877,7 +2893,6 @@ fn parse_quantity(value: &str) -> Option<U256> {
 use vela_relay_core::broadcast::{nonce_too_low, parse_hex_bytes};
 use vela_relay_core::execution as core_execution;
 use vela_relay_core::execution::BundleReplayAudit;
-use vela_relay_core::funding::TOP_UP_GAS_LIMIT;
 use vela_relay_core::settlement::parse_market_usd_price;
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {
