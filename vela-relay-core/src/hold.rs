@@ -39,9 +39,23 @@ pub fn retry_delay_ms(attempt: u32) -> u64 {
 /// dead-lettered, left `queued` forever (Arbitrum, 2026-10-03, while its
 /// relayer waited on funding). With it the same 100 retries span about eight
 /// hours.
-pub fn redelivery_delay_ms(age_ms: u64) -> u64 {
-    (age_ms / 2).clamp(DELAYED_RETRY_BASE_MS, DELAYED_RETRY_MAX_MS)
+///
+/// An operation waiting on its relayer's top-up (`waiting_on_funding`,
+/// [`crate::execution::FUNDING_WAIT_FINISH`]) is seconds from going out, so
+/// its wait never grows past [`FUNDING_WAIT_RETRY_MAX_MS`].
+pub fn redelivery_delay_ms(age_ms: u64, waiting_on_funding: bool) -> u64 {
+    let ceiling = if waiting_on_funding {
+        FUNDING_WAIT_RETRY_MAX_MS
+    } else {
+        DELAYED_RETRY_MAX_MS
+    };
+    (age_ms / 2).clamp(DELAYED_RETRY_BASE_MS, ceiling)
 }
+
+/// The longest redelivery wait of an operation whose relayer is being topped
+/// up: a top-up lands in seconds, and the operation's own deadline may not
+/// wait for the general ladder.
+pub const FUNDING_WAIT_RETRY_MAX_MS: u64 = 10_000;
 
 /// The full schedule as a lookup table: entry `i` (0-based) is the delay for
 /// attempt `i + 1`; every attempt past the end uses the last entry. This is
@@ -151,15 +165,25 @@ mod tests {
     #[test]
     fn a_redelivery_waits_half_its_age_inside_the_ladders_band() {
         use super::{DELAYED_RETRY_BASE_MS, DELAYED_RETRY_MAX_MS, redelivery_delay_ms};
-        assert_eq!(redelivery_delay_ms(0), DELAYED_RETRY_BASE_MS);
-        assert_eq!(redelivery_delay_ms(30_000), 15_000);
-        assert_eq!(redelivery_delay_ms(60 * 60 * 1_000), DELAYED_RETRY_MAX_MS);
+        assert_eq!(redelivery_delay_ms(0, false), DELAYED_RETRY_BASE_MS);
+        assert_eq!(redelivery_delay_ms(30_000, false), 15_000);
+        assert_eq!(
+            redelivery_delay_ms(60 * 60 * 1_000, false),
+            DELAYED_RETRY_MAX_MS
+        );
+        // Waiting on a top-up: never the five-minute wait that cost the
+        // Arbitrum swap of 2026-10-04 its deadline.
+        assert_eq!(redelivery_delay_ms(0, true), DELAYED_RETRY_BASE_MS);
+        assert_eq!(
+            redelivery_delay_ms(30 * 60 * 1_000, true),
+            super::FUNDING_WAIT_RETRY_MAX_MS
+        );
 
         // 100 redeliveries — the Cloudflare queue's max_retries — last hours,
         // not the two minutes they lasted at one a second.
         let mut age = 0_u64;
         for _ in 0..100 {
-            age += redelivery_delay_ms(age);
+            age += redelivery_delay_ms(age, false);
         }
         assert!(age > 7 * 60 * 60 * 1_000, "{age} ms");
     }
