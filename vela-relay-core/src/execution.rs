@@ -1470,8 +1470,22 @@ async fn execute_with_lane_lease(
         ExecutionOutcome::Failed { message } => return Err(message),
         _ => return Err("unexpected shell response".to_owned()),
     };
-    let allocations = allocate_bundle_gas(
+    // The simulation's figure, believed only up to what the bundle could
+    // really use (`credible_simulated_gas`): Avalanche reports half the
+    // node's 50M default for any trace that names no gas (vela-wallet #440).
+    let declared = crate::cost::declared_bundle_gas(
+        &survivors
+            .iter()
+            .map(|candidate| &candidate.packed)
+            .collect::<Vec<_>>(),
+    );
+    let simulated_gas = crate::cost::credible_simulated_gas(
         bundle_simulation.gas_used,
+        context.estimated_gas,
+        declared,
+    );
+    let allocations = allocate_bundle_gas(
+        simulated_gas,
         context.estimated_gas,
         &bundle_simulation.operation_gas_used,
         policy.gas_buffer_bps,
@@ -3532,6 +3546,170 @@ mod tests {
             ExecutionOperation::MarkBundleSubmitted {
                 intent,
                 gas_limit: 100,
+            },
+            ExecutionOutcome::Indexed { indexed: 1 },
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_simulation_that_reports_half_the_nodes_default_gas_is_allocated_at_the_declared_bound() {
+        // vela-wallet #440: since Avalanche's 2026-09-22 upgrade a trace that
+        // names no gas reports half the node's 50M default — 25,000,000 for
+        // one send. Believed, it allocated 25M and held the op unfundable.
+        // The declared bound for the fixture's limits (100 + 100 + 0, through
+        // 64/63, + 50,000 + 60,000) is 110,203: at the quoted fee 2 and
+        // markup 1.4 that needs 308,569, and the op pays 310,000.
+        let fixture = fixture(310_000);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
+
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(BundleSimulationData {
+                    gas_used: U256::from(25_000_000u64),
+                    ..sim_data()
+                }),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata: calldata.clone(),
+            },
+            ExecutionOutcome::Context {
+                // Enough to front 110,203 gas at 2 without a top-up.
+                context: TransactionContext {
+                    relayer_balance: U256::from(1_000_000u64),
+                    ..context()
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let signed_raw = [0x02u8, 0x01, 0x02, 0x03];
+        let signed_hash = alloy::primitives::keccak256(signed_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 110_203,
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 0,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x02010203".into(),
+                    transaction_hash: signed_hash.clone(),
+                    nonce: 7,
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: CHAIN_ID,
+            lane: fixture.routed.lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: "0x02010203".into(),
+            transaction_hash: signed_hash.clone(),
+            nonce: 7,
+            user_operation_hashes: vec![fixture.hash_string.clone()],
+        };
+        driver.step(
+            ExecutionOperation::SavePreparedBundle {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: signed_raw.to_vec(),
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: signed_hash.to_ascii_uppercase(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::MarkBundleSubmitted {
+                intent,
+                gas_limit: 110_203,
             },
             ExecutionOutcome::Indexed { indexed: 1 },
         );
