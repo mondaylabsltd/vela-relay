@@ -220,9 +220,15 @@ fn parse_validation_pre_op_gas(value: &Value) -> Result<u128, RpcError> {
         .as_str()
         .ok_or_else(RpcError::estimation_unavailable)?;
     let encoded = decode_hex_str(encoded).map_err(|()| RpcError::estimation_unavailable())?;
-    let return_info_offset =
-        read_usize_word(&encoded, 0).ok_or_else(RpcError::estimation_unavailable)?;
-    read_u128_word(&encoded, return_info_offset).ok_or_else(RpcError::estimation_unavailable)
+    // `abi.encode(ValidationResult)`: word 0 is the offset of the tuple, and
+    // the tuple's FIRST head word is not `preOpGas` but the offset (relative
+    // to the tuple) of `ReturnInfo`, which is itself dynamic because it ends
+    // in `bytes paymasterContext`. `preOpGas` is ReturnInfo's first word.
+    let tuple = read_usize_word(&encoded, 0).ok_or_else(RpcError::estimation_unavailable)?;
+    let return_info = read_usize_word(&encoded, tuple)
+        .and_then(|relative| tuple.checked_add(relative))
+        .ok_or_else(RpcError::estimation_unavailable)?;
+    read_u128_word(&encoded, return_info).ok_or_else(RpcError::estimation_unavailable)
 }
 
 /// Extract revert bytes from the error shapes used by common EVM RPC providers.
@@ -796,14 +802,61 @@ mod tests {
         assert!(SimulationUserOperation::try_from((1, operation)).is_ok());
     }
 
+    /// Real `simulateValidation` answers from Ethereum mainnet (block
+    /// ~26,149,240, 2026-10-08 UTC) for a Vela Safe's ETH send: a deployed
+    /// Safe, and a counterfactual one whose operation carries the factory.
+    const MAINNET_VALIDATION_DEPLOYED: &str = "0x00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f1d200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000";
+    const MAINNET_VALIDATION_UNDEPLOYED: &str = "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000001400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000064a2300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000";
+
     #[test]
     fn decodes_pre_op_gas_from_validation_return_data() {
-        let mut data = vec![0; 32 * 15];
-        data[31] = 0x40;
-        data[64 + 31] = 0x7b;
-        let result = json!(format!("0x{}", hex::encode(&data)));
+        // The old reader returned 320 — the offset of ReturnInfo inside the
+        // tuple — for both, and the 100,000 floor hid it.
+        assert_eq!(
+            parse_validation_pre_op_gas(&json!(MAINNET_VALIDATION_DEPLOYED)).unwrap(),
+            61_906
+        );
+        assert_eq!(
+            parse_validation_pre_op_gas(&json!(MAINNET_VALIDATION_UNDEPLOYED)).unwrap(),
+            412_195
+        );
+    }
 
-        assert_eq!(parse_validation_pre_op_gas(&result).unwrap(), 123);
+    #[test]
+    fn a_validation_answer_that_ends_early_is_no_estimate() {
+        // The tuple offset is read, but the ReturnInfo it points at is past
+        // the end of the data: refuse rather than read a neighbouring word.
+        let truncated = &MAINNET_VALIDATION_DEPLOYED[..2 + 2 * 64 * 2];
+        assert_eq!(
+            parse_validation_pre_op_gas(&json!(truncated))
+                .unwrap_err()
+                .code,
+            super::RpcError::estimation_unavailable().code
+        );
+    }
+
+    #[test]
+    fn the_verification_limit_is_the_measured_validation_gas_with_its_buffer() {
+        let plan = super::plan(
+            1,
+            operation_with_fees(None, None, None),
+            "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+            None,
+        )
+        .unwrap();
+        let limit = |validation: &str| {
+            super::finish(&plan, &json!(validation), super::CallGasSource::NotNeeded)
+                .unwrap()
+                .estimate
+                .verification_gas_limit
+        };
+        // 1.5 × 61,906 = 92,859 is under the 100,000 floor.
+        assert_eq!(limit(MAINNET_VALIDATION_DEPLOYED), "0x186a0");
+        // 1.5 × 412,195 = 618,293 (rounded up). It was the 100,000 floor.
+        assert_eq!(
+            limit(MAINNET_VALIDATION_UNDEPLOYED),
+            format!("0x{:x}", 618_293)
+        );
     }
 
     #[test]
