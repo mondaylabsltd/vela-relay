@@ -39,6 +39,32 @@ Never `x-vela-rpc-url`. A caller-supplied endpoint could lie about a nonce, a
 receipt or a balance and make the relay send again, spending the float that every
 person on that chain depends on.
 
+### A method the chain's nodes do not have
+
+The executor simulates every operation before it signs, in three tiers:
+`eth_simulateV1`, then the Pimlico simulation contracts through `eth_call`, then
+`debug_traceCall`. Each tier walks the endpoint list above, one endpoint at a
+time, until one answers.
+
+Avalanche's C-Chain client does not implement `eth_simulateV1`. On 2026-10-08
+every one of the 28 endpoints the directory lists for 43114 answered `-32601`
+("method does not exist") or not at all, so each simulation walked the whole list
+before falling back, twice a pass, and an AVAX send took about a minute
+(vela-wallet #464). So:
+
+- **Avalanche (43114) and Fuji (43113)** ask for `eth_simulateV1` last.
+- **Any chain** where a whole walk got only "no such method" answers (JSON-RPC
+  `-32601`, or an error that says the method is missing) and no `result` is
+  treated the same way for 10 minutes. Endpoints that timed out or answered with
+  an HTTP error are no evidence either way. One endpoint that serves the method
+  ends it at once.
+
+"Last" means after the other two tiers, and only for the operations they could
+not decide. The method is never skipped, so a wrong belief costs one slow walk,
+never a verdict. The rule is `vela-relay-core`'s `simulation::simulate_v1_turn`
+and `rpc_walk`. Each process (docker) or isolate (Workers) keeps its own memory,
+which starts empty.
+
 **Considered and not built** (2026-10-03): broadcasting through the wallet's RPC
 for a chain whose directory entry has no usable endpoint. Measured on a snapshot of
 the chain list the directory serves (ethereum-lists, 2026-05-06): of 2,602 chains,

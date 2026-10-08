@@ -36,6 +36,9 @@
 //!   per-chain metadata URL, and what an answer from it means.
 //! - [`rpc_host`] — which RPC endpoints the relay will call (the SSRF rule
 //!   and its self-host opt-in).
+//! - [`rpc_walk`] — how the executor walks a chain's endpoint list: what an
+//!   endpoint's error says about a method, and when a whole walk proves the
+//!   chain's endpoints lack it.
 //!
 //! Nondeterministic inputs (wall-clock time, generated identifiers, chain
 //! context, market prices, policy values) always enter through an event or an
@@ -59,6 +62,7 @@ pub mod lifecycle;
 pub mod quote;
 pub mod receipt;
 pub mod rpc_host;
+pub mod rpc_walk;
 pub mod settlement;
 pub mod signing;
 pub mod simulation;

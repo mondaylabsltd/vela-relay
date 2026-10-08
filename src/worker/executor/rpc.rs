@@ -13,6 +13,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use vela_relay_core::rpc_walk::{self, MethodAnswer, MissingMethods};
+
 use crate::utils::{alchemy, config::ExecutorConfig, rpc as chain_directory};
 
 #[derive(Clone)]
@@ -22,7 +24,18 @@ pub(super) struct TrustedRpcClient {
     alchemy_api_key: Option<Arc<str>>,
     directory_urls: Arc<Mutex<HashMap<u64, Vec<String>>>>,
     validated_urls: Arc<Mutex<HashSet<(u64, String)>>>,
+    /// The methods a walk proved a chain's endpoints lack (core `rpc_walk`).
+    missing_methods: Arc<std::sync::Mutex<MissingMethods>>,
     request_id: Arc<AtomicU64>,
+}
+
+/// Wall-clock milliseconds for the core's walk memories.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +100,7 @@ impl TrustedRpcClient {
                 .map(|key| Arc::from(key.expose())),
             directory_urls: Arc::new(Mutex::new(HashMap::new())),
             validated_urls: Arc::new(Mutex::new(HashSet::new())),
+            missing_methods: Arc::new(std::sync::Mutex::new(MissingMethods::default())),
             request_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -101,20 +115,51 @@ impl TrustedRpcClient {
         method: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        let urls = self.urls_or_error(chain_id).await?;
+        self.call_walk(chain_id, method, params).await.0
+    }
+
+    /// [`Self::call`], also reporting what each endpoint that answered said
+    /// about `method` (core `rpc_walk`).
+    pub(super) async fn call_walk(
+        &self,
+        chain_id: u64,
+        method: &str,
+        params: Value,
+    ) -> (Result<Value, RpcError>, Vec<MethodAnswer>) {
+        let mut answers = Vec::new();
+        let urls = match self.urls_or_error(chain_id).await {
+            Ok(urls) => urls,
+            Err(error) => return (Err(error), answers),
+        };
         for url in urls {
             if self.validate_chain(chain_id, &url).await.is_err() {
                 continue;
             }
-            match self.request(&url, method, params.clone()).await {
-                Ok(response) => match response.into_result_and_error() {
-                    (Some(result), None) => return Ok(result),
-                    _ => continue,
-                },
-                Err(_) => continue,
+            let Ok(response) = self.request(&url, method, params.clone()).await else {
+                continue;
+            };
+            answers.extend(response.method_answer());
+            if let (Some(result), None) = response.into_result_and_error() {
+                return (Ok(result), answers);
             }
         }
-        Err(RpcError::Unavailable)
+        (Err(RpcError::Unavailable), answers)
+    }
+
+    /// Whether a recent walk proved this chain's endpoints lack `method`.
+    pub(super) fn lacks_method(&self, chain_id: u64, method: &str) -> bool {
+        self.missing_methods
+            .lock()
+            .expect("missing-method memory mutex")
+            .lacks(chain_id, method, now_ms())
+    }
+
+    /// Folds a finished walk for `method` into the chain's memory.
+    pub(super) fn note_method_walk(&self, chain_id: u64, method: &str, answers: &[MethodAnswer]) {
+        self.missing_methods
+            .lock()
+            .expect("missing-method memory mutex")
+            .note_walk(chain_id, method, answers, now_ms());
     }
 
     pub(super) async fn simulate(
@@ -149,6 +194,30 @@ impl TrustedRpcClient {
         &self,
         chain_id: u64,
         calls: &[RpcBatchCall<'_>],
+    ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+        self.batch_walk(chain_id, calls).await.0
+    }
+
+    /// [`Self::batch`], also reporting what each endpoint said about each
+    /// call it answered (core `rpc_walk`).
+    pub(super) async fn batch_walk(
+        &self,
+        chain_id: u64,
+        calls: &[RpcBatchCall<'_>],
+    ) -> (
+        Result<Vec<Result<Value, RpcError>>, RpcError>,
+        Vec<MethodAnswer>,
+    ) {
+        let mut answers = Vec::new();
+        let result = self.batch_inner(chain_id, calls, &mut answers).await;
+        (result, answers)
+    }
+
+    async fn batch_inner(
+        &self,
+        chain_id: u64,
+        calls: &[RpcBatchCall<'_>],
+        answers: &mut Vec<MethodAnswer>,
     ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
         if calls.is_empty() {
             return Ok(Vec::new());
@@ -213,10 +282,9 @@ impl TrustedRpcClient {
                     retry.push(index);
                     continue;
                 }
-                match response_by_index
-                    .remove(&index)
-                    .and_then(definitive_batch_result)
-                {
+                let response = response_by_index.remove(&index);
+                answers.extend(response.as_ref().and_then(UpstreamResponse::method_answer));
+                match response.and_then(definitive_batch_result) {
                     Some(result) => results[index] = Some(result),
                     None => retry.push(index),
                 }
@@ -438,6 +506,26 @@ impl UpstreamError {
 use vela_relay_core::broadcast::{self as core_broadcast, join_broadcast_diagnostics};
 
 impl UpstreamResponse {
+    /// What this reply says about the method it answers: an error object is
+    /// classified (a revert means the node ran the method), a bare `result`
+    /// is served, and a reply with neither is no answer.
+    fn method_answer(&self) -> Option<MethodAnswer> {
+        if let Some(error) = self
+            .fields
+            .get("error")
+            .and_then(|value| serde_json::from_value::<UpstreamError>(value.clone()).ok())
+        {
+            return Some(if error.is_execution_revert() {
+                MethodAnswer::Refused
+            } else {
+                rpc_walk::method_error_answer(error.code, error.message.as_deref().unwrap_or(""))
+            });
+        }
+        self.fields
+            .contains_key("result")
+            .then_some(MethodAnswer::Served)
+    }
+
     fn into_result_and_error(mut self) -> (Option<Value>, Option<UpstreamError>) {
         let result = self.fields.remove("result");
         let error = self
@@ -458,7 +546,135 @@ fn definitive_batch_result(response: UpstreamResponse) -> Option<Result<Value, R
 
 #[cfg(test)]
 mod tests {
-    use super::append_unique_urls;
+    use std::{
+        collections::{BTreeMap, HashMap, HashSet},
+        sync::{Arc, atomic::AtomicU64},
+        time::Duration,
+    };
+
+    use axum::{Json, Router, routing::post};
+    use reqwest::Client;
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, sync::Mutex};
+    use vela_relay_core::rpc_walk::{MethodAnswer, MissingMethods};
+
+    use super::{TrustedRpcClient, append_unique_urls};
+
+    const AVALANCHE: u64 = 43_114;
+
+    /// How a fake node answers: every node reports `AVALANCHE` for
+    /// `eth_chainId` and `0x1` for any other method, except as named.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Node {
+        /// `-32601` for `eth_simulateV1`, as every Avalanche node answered it
+        /// on 2026-10-08.
+        LacksSimulateV1,
+        /// A `result` for `eth_simulateV1`.
+        ServesSimulateV1,
+    }
+
+    /// A fake JSON-RPC node on a loopback port; returns its URL and the
+    /// methods it was asked, in order.
+    async fn fake_node(node: Node) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let answer = move |call: &Value| -> Value {
+            let id = call["id"].clone();
+            let method = call["method"].as_str().unwrap_or_default().to_owned();
+            seen.lock().unwrap().push(method.clone());
+            match method.as_str() {
+                "eth_chainId" => {
+                    json!({ "jsonrpc": "2.0", "id": id, "result": format!("0x{AVALANCHE:x}") })
+                }
+                "eth_simulateV1" if node == Node::LacksSimulateV1 => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": "the method eth_simulateV1 does not exist/is not available",
+                    },
+                }),
+                _ => json!({ "jsonrpc": "2.0", "id": id, "result": "0x1" }),
+            }
+        };
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move |Json(body): Json<Value>| {
+                        let answer = answer.clone();
+                        async move {
+                            Json(match body {
+                                Value::Array(calls) => {
+                                    Value::Array(calls.iter().map(&answer).collect())
+                                }
+                                call => answer(&call),
+                            })
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        (url, asked)
+    }
+
+    /// A transport over `urls` alone: no Alchemy, and an empty directory entry
+    /// so nothing is fetched from the network.
+    fn client(urls: Vec<String>) -> TrustedRpcClient {
+        TrustedRpcClient {
+            http: Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap(),
+            explicit_urls: Arc::new(BTreeMap::from([(AVALANCHE, urls)])),
+            alchemy_api_key: None,
+            directory_urls: Arc::new(Mutex::new(HashMap::from([(AVALANCHE, Vec::new())]))),
+            validated_urls: Arc::new(Mutex::new(HashSet::new())),
+            missing_methods: Arc::new(std::sync::Mutex::new(MissingMethods::default())),
+            request_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_walk_every_node_answers_with_no_such_method_is_remembered() {
+        let (first, _) = fake_node(Node::LacksSimulateV1).await;
+        let (second, _) = fake_node(Node::LacksSimulateV1).await;
+        let rpc = client(vec![first, second]);
+
+        let (result, answers) = rpc.call_walk(AVALANCHE, "eth_simulateV1", json!([])).await;
+        assert!(result.is_err());
+        assert_eq!(
+            answers,
+            vec![MethodAnswer::Unsupported, MethodAnswer::Unsupported]
+        );
+        rpc.note_method_walk(AVALANCHE, "eth_simulateV1", &answers);
+        assert!(rpc.lacks_method(AVALANCHE, "eth_simulateV1"));
+    }
+
+    #[tokio::test]
+    async fn one_node_that_serves_the_method_keeps_it_first() {
+        let (first, _) = fake_node(Node::LacksSimulateV1).await;
+        let (second, _) = fake_node(Node::ServesSimulateV1).await;
+        let rpc = client(vec![first, second]);
+
+        let calls = [super::RpcBatchCall {
+            method: "eth_simulateV1",
+            params: json!([]),
+        }];
+        let (result, answers) = rpc.batch_walk(AVALANCHE, &calls).await;
+        assert!(matches!(result.as_deref(), Ok([Ok(_)])));
+        assert_eq!(
+            answers,
+            vec![MethodAnswer::Unsupported, MethodAnswer::Served]
+        );
+        rpc.note_method_walk(AVALANCHE, "eth_simulateV1", &answers);
+        assert!(!rpc.lacks_method(AVALANCHE, "eth_simulateV1"));
+    }
 
     #[test]
     fn appends_each_executor_rpc_url_once() {

@@ -10,6 +10,44 @@ use std::str::FromStr;
 use alloy::primitives::{Address, B256, Bytes, U256, address, b256, keccak256};
 use serde_json::{Value, json};
 
+/// The first simulation tier's method.
+pub const SIMULATE_V1: &str = "eth_simulateV1";
+
+/// Chains whose node software has no `eth_simulateV1`, known before any walk:
+/// Avalanche C-Chain and its Fuji testnet run AvalancheGo's C-Chain client,
+/// which does not implement the method. On 2026-10-08 every one of the 28
+/// endpoints the directory lists for 43114 answered -32601 or not at all, and
+/// asking each of them in turn, twice a pass, was most of the minute an AVAX
+/// send took (vela-wallet #464).
+///
+/// Listing a chain here only moves the method to the end of the walk: if the
+/// chain gains it, a simulation that the other tiers could not run still asks.
+pub fn chain_lacks_simulate_v1(chain_id: u64) -> bool {
+    matches!(chain_id, 43_114 | 43_113)
+}
+
+/// When a simulation asks for `eth_simulateV1` relative to the other tiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimulateV1Turn {
+    /// Before the Pimlico `eth_call` and `debug_traceCall` tiers, as always.
+    First,
+    /// After them, and only for what they could not decide. A chain known or
+    /// recently proven to lack the method skips the walk that would find no
+    /// one serving it, and never loses a verdict to a stale belief.
+    Last,
+}
+
+/// `remembered_missing`: whether a walk within
+/// [`crate::rpc_walk::MISSING_METHOD_MEMORY_MS`] proved the chain's endpoints
+/// lack the method (the shell's [`crate::rpc_walk::MissingMethods`]).
+pub fn simulate_v1_turn(chain_id: u64, remembered_missing: bool) -> SimulateV1Turn {
+    if remembered_missing || chain_lacks_simulate_v1(chain_id) {
+        SimulateV1Turn::Last
+    } else {
+        SimulateV1Turn::First
+    }
+}
+
 pub const DETERMINISTIC_DEPLOYER: Address = address!("4e59b44847b379578588920ca78fbf26c0b4956c");
 pub const PIMLICO_SIMULATIONS_INIT_CODE_HASH: B256 =
     b256!("6d2eb1ee903947960a7faf13c49dc4b9deb468b3c7a6d19863c4d9b2bffd78d1");
@@ -487,6 +525,18 @@ mod tests {
             parse_trace_simulation(trace, entry_point, &[hash]),
             SimulationVerdict::Success(_)
         ));
+    }
+
+    #[test]
+    fn avalanche_asks_for_simulate_v1_last_and_so_does_a_chain_proven_to_lack_it() {
+        use super::{SimulateV1Turn, simulate_v1_turn};
+        assert_eq!(simulate_v1_turn(43_114, false), SimulateV1Turn::Last);
+        assert_eq!(simulate_v1_turn(43_113, false), SimulateV1Turn::Last);
+        // Polygon, Base, Arbitrum: publicnode serves it (measured 2026-10-08).
+        for chain_id in [137, 8_453, 42_161] {
+            assert_eq!(simulate_v1_turn(chain_id, false), SimulateV1Turn::First);
+            assert_eq!(simulate_v1_turn(chain_id, true), SimulateV1Turn::Last);
+        }
     }
 
     #[test]
