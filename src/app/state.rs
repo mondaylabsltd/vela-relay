@@ -3,6 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use vela_relay_core::cost::BillingTerms;
+
 use crate::gas_price::GasPriceManager;
 
 use super::{queue::UserOperationQueue, user_operation_store::UserOperationStatusStore};
@@ -10,6 +12,7 @@ use super::{queue::UserOperationQueue, user_operation_store::UserOperationStatus
 #[derive(Clone)]
 pub struct AppState {
     gas_price: GasPriceManager,
+    billing_terms: BillingTerms,
     readiness: Readiness,
     settlement_recipient: Option<String>,
     user_operation_queue: Option<UserOperationQueue>,
@@ -29,6 +32,7 @@ impl AppState {
     ) -> Self {
         Self {
             gas_price: GasPriceManager::default(),
+            billing_terms: BillingTerms::default(),
             readiness: Readiness {
                 expected_jobs: Arc::from(expected_jobs),
                 ready_jobs: Arc::new(Mutex::new(HashSet::new())),
@@ -37,6 +41,13 @@ impl AppState {
             user_operation_queue: None,
             user_operation_status_store: None,
         }
+    }
+
+    /// The executor's billing terms, published by the RPC exactly as the
+    /// executor applies them (`settlementGas`, `inBandFeePerGas`).
+    pub fn with_billing_terms(mut self, billing_terms: BillingTerms) -> Self {
+        self.billing_terms = billing_terms;
+        self
     }
 
     pub fn with_user_operation_queue(mut self, user_operation_queue: UserOperationQueue) -> Self {
@@ -54,6 +65,10 @@ impl AppState {
 
     pub fn readiness(&self) -> Readiness {
         self.readiness.clone()
+    }
+
+    pub fn billing_terms(&self) -> BillingTerms {
+        self.billing_terms
     }
 
     pub fn gas_price(&self) -> GasPriceManager {

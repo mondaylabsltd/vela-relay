@@ -47,6 +47,16 @@ const MULTISEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 const TRUSTED_MULTISEND: Address = address!("38869bf66a61cf6bdb996a6ae40d5853fd43b526");
 
+/// The executor's default settlement markup
+/// (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`): the reimbursement must cover
+/// this multiple of the gas cost at the cap the outer transaction is signed
+/// with. `docs/fees.md` §1.
+pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
+/// The executor's default inclusion floor
+/// (`VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS`): the lowest cap,
+/// as a multiple of the base fee plus the signed tip, a repricing may sign.
+pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 15_000;
+
 pub const MIN_NATIVE_FRACTION_DECIMALS: u32 = 5;
 pub const MIN_STABLE_FRACTION_DECIMALS: u32 = 2;
 pub const USD_PRICE_DECIMALS: u32 = 8;

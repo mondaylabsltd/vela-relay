@@ -193,7 +193,7 @@ The relay supports the unpacked EntryPoint v0.7 UserOperation format for the con
 }
 ```
 
-The relay does not forward this bundler-specific method to a normal EVM RPC. It injects the EntryPoint v0.7 simulation code through the standard `eth_call` state-override parameter, then estimates the account execution phase with `eth_estimateGas` using the EntryPoint as `from`.
+The relay does not forward this bundler-specific method to a normal EVM RPC. It injects the EntryPoint v0.7 simulation code through the standard `eth_call` state-override parameter, then estimates the account execution phase with `eth_estimateGas` using the EntryPoint as `from`. For a sender that is not deployed yet (`factory` present) the execution is instead measured with `eth_simulateV1` — the factory called by the EntryPoint's `SenderCreator`, then the `callData` from the EntryPoint, in one block — and `eth_estimateGas` is the fallback when no source performs it.
 
 All supported chains use in-band settlement. `maxFeePerGas` and `maxPriorityFeePerGas` must therefore both be `0x0`; the simulation encodes the same zero values and never substitutes a native EntryPoint fee. The submitted operation is never modified.
 
@@ -203,18 +203,19 @@ by `eth_sendUserOperation`.
 
 An RPC that rejects state overrides, times out, or is rate limited is cooled down and the next configured source is tried. A genuine EVM revert is returned as a UserOperation simulation error without cooling down that RPC. `FailedOp`, `FailedOpWithRevert`, Solidity panic, and nested gateway revert data are decoded into the JSON-RPC error `data` field. Successful responses include the selected simulation source in `x-vela-rpc-domain`.
 
-The response contains the v0.7 gas fields, including zero-valued paymaster limits when no paymaster is present:
+The response contains the v0.7 gas fields, including zero-valued paymaster limits when no paymaster is present, and — on a chain whose executor bills the gas a bundle uses, when the execution was measured — the Vela extension `settlementGas`: the gas the in-band reimbursement is billed against (the predicted gas used plus the executor's buffer, never more than `verificationGasLimit + callGasLimit + preVerificationGas`). `docs/fees.md` §1a has the rule and its calibration.
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "preVerificationGas": "0x0",
-    "verificationGasLimit": "0x0",
-    "callGasLimit": "0x0",
+    "preVerificationGas": "0x18d3c",
+    "verificationGasLimit": "0x186a0",
+    "callGasLimit": "0x1c13c",
     "paymasterVerificationGasLimit": "0x0",
-    "paymasterPostOpGasLimit": "0x0"
+    "paymasterPostOpGasLimit": "0x0",
+    "settlementGas": "0x32cc6"
   }
 }
 ```

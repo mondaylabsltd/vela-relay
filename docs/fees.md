@@ -24,7 +24,8 @@ required = max( markup × gas_native_cost ,  floor )
 
 - **`markup`** — default **14000 bps = 1.4×** (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`,
   hard lower bound 1.0×). The relay recovers 1.4× the gas it spends.
-- **`gas_native_cost`** = the operation's allocated gas × the **submit cap**,
+- **`gas_native_cost`** = the operation's **settlement gas** (§1a) × the
+  **submit cap**,
   which by default is `max_fee_per_gas = 2 × base_fee + tip`
   (`gas_math::quoted_outer_fee`). The `2×` is **inclusion headroom, not cost** —
   the chain only ever charges `base_fee + effective tip`; the extra base-fee
@@ -38,10 +39,96 @@ required = max( markup × gas_native_cost ,  floor )
   compute it through the same `minimum_amount(decimals, fraction)` with the same
   constants, so they can never disagree.
 
-Gas is split across a bundle by `cost::allocate_bundle_gas`: each op pays its own
-simulated gas plus an even share of the outer overhead + buffer; the per-op
-allocations sum to the bundle total exactly (no wei lost or double-charged), and
-every op is guaranteed ≥ its own direct gas (no free-riding).
+## 1a. The gas an operation pays for — used, not reserved
+
+Two gas figures exist for every bundle, and they used to be one:
+
+- **The outer gas LIMIT** the relay signs: `cost::allocate_bundle_gas` over
+  `max(simulated gas, eth_estimateGas of the bundle, the ops' own gas)` plus
+  the buffer (`VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS` 15%, `…_FIXED_GAS_BUFFER`
+  30,000). `eth_estimateGas` of `handleOps` answers the gas the EntryPoint
+  RESERVES for every declared limit, not the gas the bundle burns, so this is
+  the figure that keeps a bundle from running out of gas. It is unchanged.
+- **The settlement gas** each operation is billed for
+  (`cost::settlement_gas_allocations`): on a chain that charges `gasUsed ×
+  price` and whose bundle simulation ran in full (`eth_simulateV1` or
+  `debug_traceCall`), the **measured** gas plus the same buffer,
+  `cost::buffered_gas(used) = used + ⌈15% × used⌉ + 30,000`, never more than
+  the limit allocation. It is split across a bundle's operations in proportion
+  to the gas the EntryPoint accounts to each (`UserOperationEvent.actualGasUsed`),
+  summing to the total exactly; a bundle of one operation bills the whole.
+
+The 2026-10-02 Ethereum send that exposed the gap (tx `0x7132ee31…`): the
+bundle used **146,824** gas, its `eth_estimateGas` was 322,126, and the relay
+signed — and billed — a **400,445** limit. It now still signs 400,445 and bills
+**198,848**. Pinned by
+`ethereum_measures_the_payment_against_the_gas_used_and_signs_the_estimated_limit`.
+
+Which chains settle on measured gas is a list, never an assumption
+(`cost::settlement_gas_rule`):
+
+| rule | chains | billed gas |
+|---|---|---|
+| `Measured` | Ethereum, Sepolia, Holesky, Hoodi; Gnosis, Chiado; Polygon, Amoy; BNB Smart Chain and its testnet | `buffered_gas(measured)` |
+| `MeasuredAtLeastHalfTheLimit` | Avalanche C-Chain, Fuji | the same, but never under half the signed outer limit — Avalanche charges `max(gasUsed, gasLimit / 2)` since 2026-09-22, and its only simulation (`debug_traceCall`) is believed only up to `max(estimate, declared limits)` (`cost::credible_simulated_gas`) |
+| `OuterLimit` | every other chain: Arbitrum (its L1 data cost rides inside gas units its simulation need not show), the OP stack (its L1 fee is charged beside gas), anything unlisted | the limit allocation, as before |
+
+A simulation that measured nothing — the Pimlico `eth_call` stand-in, whose
+bundle figure is an `eth_estimateGas` — bills the limit allocation on every
+chain.
+
+**`settlementGas` — the same figure, promised before signing.**
+`eth_estimateUserOperationGas` returns an optional `settlementGas` (hex) on a
+`Measured` chain: the executor's own rule, `buffered_gas`, over the gas a
+one-operation `handleOps` carrying this operation is predicted to use
+(`estimate::settlement_gas`):
+
+```
+used = 21,000 + calldata gas of handleOps([op], 0xff…ff)     (the returned limits, the request's signature)
+     + preOpGas                                              (simulateValidation: validation, and any deployment)
+     + execution                                             (the call's measured gas less its own 21,000 + calldata)
+     + 10,000                                                (ENTRY_POINT_OVERHEAD_GAS)
+settlementGas = min( buffered_gas(used) , verificationGasLimit + callGasLimit + preVerificationGas )
+```
+
+The execution of a **deployed** account is `eth_estimateGas` of its
+`callData` from the EntryPoint. An **undeployed** account has no code to
+estimate against — that call measured a plain transfer (a first send was
+estimated at the 50,000 call-gas floor and used 52,804; a first backup at
+~30,000 and used 4,315,038) — so its execution is measured with
+`eth_simulateV1` of `[factory call from the SenderCreator, callData from the
+EntryPoint]` in one block, which also sets its `callGasLimit` (1.5 × the
+measurement, as for a deployed one). Where no endpoint performs that, the old
+`eth_estimateGas` answers and `settlementGas` is omitted. It is omitted on
+every chain that is not `Measured`, too: there the executor bills the limit
+and nothing smaller can be promised.
+
+The 10,000 overhead is measured, not derived. The relay's two estimate calls,
+replayed at the parent block of four mined Vela operations (archive state),
+left this much of the receipt unexplained, and the predicted `settlementGas`
+against what the executor bills for the same bundle:
+
+| operation | receipt gas | unexplained | `settlementGas` | executor bills | ratio |
+|---|---|---|---|---|---|
+| ETH send `0x7132ee31…` | 146,824 | 1,249 | 208,070 | 198,848 | 1.046 |
+| USDT send `0xe42fb6b9…` | 183,941 | 2,368 | 249,371 | 241,533 | 1.032 |
+| USDT send `0x22cbfbd6…` | 169,192 | 3,511 | 228,988 | 224,571 | 1.020 |
+| first op + backup `0x86795d08…` | 5,034,866 | −930 | 5,831,838 | 5,820,096 | 1.002 |
+
+(`settlementGas` here with vela-wallet's dummy signature, which costs 3,060
+gas of calldata against a real one's 3,792.) Signed with the limits the same
+estimate returns, every one of the four executes in full at its parent block
+(`simulateHandleOp`, `UserOperationEvent.success`), and with a third of the
+call limit none does. Pinned by
+`the_settlement_gas_of_a_mined_ethereum_send_covers_what_the_executor_billed` and
+`an_undeployed_safe_is_measured_with_its_code_in_place`.
+
+**The limits are still what the operation must carry.** `verificationGasLimit`
+is 1.5 × the measured `preOpGas` (at least 100,000) — the measured value since
+the `ValidationResult` decode was fixed: 61,906 for a deployed Safe's send on
+Ethereum (so 100,000), 412,195 for a counterfactual one's first (so 618,293;
+it was answered 100,000 before). `callGasLimit` is 1.5 × the measured
+execution (at least 50,000).
 
 Every rounding step in the chain (`mul_div_ceil` markup, `native_to_usd_stable_ceil`
 USD conversion, Binance price parse, Tempo cost) rounds **toward the relay**, and

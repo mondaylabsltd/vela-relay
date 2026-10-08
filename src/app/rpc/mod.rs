@@ -99,6 +99,7 @@ pub async fn handle(
                 request.id,
                 chain_id,
                 headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
+                state.billing_terms(),
                 params,
             )
             .await;

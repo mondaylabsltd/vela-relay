@@ -55,6 +55,16 @@ pub struct CfConfig {
 }
 
 impl CfConfig {
+    /// The executor's billing terms, which the RPC publishes exactly as the
+    /// executor applies them (`settlementGas`, `inBandFeePerGas`).
+    pub fn billing_terms(&self) -> vela_relay_core::cost::BillingTerms {
+        vela_relay_core::cost::BillingTerms {
+            settlement_markup_bps: self.settlement_markup_bps,
+            gas_buffer_bps: self.gas_buffer_bps,
+            fixed_gas_buffer: self.fixed_gas_buffer,
+        }
+    }
+
     /// The core's per-batch policy, with the treasury and per-lane relayer
     /// addresses derived from `OPERATOR_SECRET` (core vault, chain-agnostic).
     pub fn execution_policy(
@@ -172,15 +182,18 @@ impl CfConfig {
         }
 
         // Same defaults and bounds as the docker parser.
-        let settlement_markup_bps =
-            u64_var(env, "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS", 14_000)?;
+        let settlement_markup_bps = u64_var(
+            env,
+            "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS",
+            vela_relay_core::settlement::DEFAULT_SETTLEMENT_MARKUP_BPS,
+        )?;
         if settlement_markup_bps < 10_000 {
             return Err("VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS cannot be below 10000".into());
         }
         let settlement_inclusion_floor_bps = u64_var(
             env,
             "VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS",
-            15_000,
+            vela_relay_core::settlement::DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS,
         )?;
         if settlement_inclusion_floor_bps <= 10_000 {
             return Err(
@@ -229,8 +242,16 @@ impl CfConfig {
             telegram_cooldown_ms: u64_var(env, "VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS", 30 * 60)?
                 .saturating_mul(1_000),
             max_bundle_operations: usize_var(env, "VELA_RELAY_MAX_BUNDLE_OPERATIONS", 10)?,
-            gas_buffer_bps: u64_var(env, "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,
-            fixed_gas_buffer: u64_var(env, "VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER", 30_000)?,
+            gas_buffer_bps: u64_var(
+                env,
+                "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS",
+                vela_relay_core::cost::DEFAULT_GAS_BUFFER_BPS,
+            )?,
+            fixed_gas_buffer: u64_var(
+                env,
+                "VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER",
+                vela_relay_core::cost::DEFAULT_FIXED_GAS_BUFFER,
+            )?,
             settlement_markup_bps,
             settlement_inclusion_floor_bps,
             settlement_hold_max_attempts: u32_var(

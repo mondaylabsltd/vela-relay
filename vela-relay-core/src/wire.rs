@@ -466,6 +466,14 @@ pub struct UserOperationGasEstimate {
     pub call_gas_limit: Quantity,
     pub paymaster_verification_gas_limit: Quantity,
     pub paymaster_post_op_gas_limit: Quantity,
+    /// The Vela extension (`docs/fees.md` §1, §3): the gas the executor will
+    /// bill this operation's in-band reimbursement against — the gas a bundle
+    /// carrying it is predicted to use, plus the executor's buffer — never the
+    /// limits above, and never more than their sum. Absent on a chain whose
+    /// executor bills the outer limit, and whenever the execution could not be
+    /// measured; a client then prices the limits as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_gas: Option<Quantity>,
 }
 
 #[derive(Debug, Serialize)]

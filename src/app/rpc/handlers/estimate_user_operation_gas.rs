@@ -1,10 +1,13 @@
 //! Shell driver for `eth_estimateUserOperationGas`. Planning, decoding, and
 //! every gas rule live in `vela_relay_core::estimate` (spec 002); this
-//! handler performs the two simulation RPC calls and logs.
+//! handler performs the simulation RPC calls and logs.
 
 use axum::http::HeaderValue;
 use serde_json::Value;
-use vela_relay_core::estimate::{self, CallGasSource, SimulationCallError, SimulationRevert};
+use vela_relay_core::{
+    cost::BillingTerms,
+    estimate::{self, CallGasSource, SimulationCallError, SimulationRevert},
+};
 
 use crate::{
     app::rpc::types::{EstimateUserOperationGasParams, RpcError, RpcResponse},
@@ -15,12 +18,14 @@ pub async fn handle(
     id: Value,
     chain_id: u64,
     user_rpc_url: Option<&HeaderValue>,
+    terms: BillingTerms,
     params: EstimateUserOperationGasParams,
 ) -> (RpcResponse<Value>, Option<String>) {
     let EstimateUserOperationGasParams(user_operation, entry_point, state_overrides) = params;
     let result = estimate(
         chain_id,
         user_rpc_url,
+        terms,
         user_operation,
         entry_point,
         state_overrides,
@@ -42,6 +47,7 @@ pub async fn handle(
 async fn estimate(
     chain_id: u64,
     user_rpc_url: Option<&HeaderValue>,
+    terms: BillingTerms,
     user_operation: vela_relay_core::wire::EstimatableUserOperation,
     entry_point: String,
     state_overrides: Option<vela_relay_core::wire::StateOverrideSet>,
@@ -62,9 +68,22 @@ async fn estimate(
     .await
     .map_err(|error| estimate::simulation_error(call_error(error)))?;
 
-    let call_gas = match plan.execution_params() {
-        None => CallGasSource::NotNeeded,
+    // An undeployed sender's execution is measured with its code in place
+    // (`eth_simulateV1` of [deploy, execute]); the plain `eth_estimateGas` is
+    // the fallback when no endpoint performs the simulation.
+    let simulated = match plan.deployed_execution_params() {
         Some(params) => {
+            rpc::call_simulation(chain_id, user_rpc_url, "eth_simulateV1", params.clone())
+                .await
+                .ok()
+                .map(|result| CallGasSource::Simulated(result.value))
+        }
+        None => None,
+    };
+    let call_gas = match (simulated, plan.execution_params()) {
+        (Some(simulated), _) => simulated,
+        (None, None) => CallGasSource::NotNeeded,
+        (None, Some(params)) => {
             match rpc::call_simulation(chain_id, user_rpc_url, "eth_estimateGas", params.clone())
                 .await
             {
@@ -75,7 +94,7 @@ async fn estimate(
         }
     };
 
-    let outcome = estimate::finish(&plan, &validation.value, call_gas)?;
+    let outcome = estimate::finish(&plan, &validation.value, call_gas, &terms)?;
     if let Some(fallback) = outcome.fallback_call_gas {
         tracing::warn!(
             chain_id,

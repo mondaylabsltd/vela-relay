@@ -450,7 +450,7 @@ async fn rpc_dispatch(
     }
 }
 
-/// The same thin driver as the docker handler: plan → two simulation calls →
+/// The same thin driver as the docker handler: plan → the simulation calls →
 /// finish; every rule lives in `vela_relay_core::estimate`.
 async fn estimate_gas(
     config: &CfConfig,
@@ -484,9 +484,27 @@ async fn estimate_gas(
     .await
     .map_err(estimate::simulation_error)?;
 
-    let call_gas = match plan.execution_params() {
-        None => CallGasSource::NotNeeded,
-        Some(params) => {
+    // An undeployed sender's execution is measured with its code in place
+    // (`eth_simulateV1` of [deploy, execute]); the plain `eth_estimateGas` is
+    // the fallback when no endpoint performs the simulation.
+    let simulated = match plan.deployed_execution_params() {
+        Some(params) => crate::arms::rpc::call_simulation(
+            config,
+            env,
+            chain_id,
+            user_rpc_url,
+            "eth_simulateV1",
+            params.clone(),
+        )
+        .await
+        .ok()
+        .map(|result| CallGasSource::Simulated(result.value)),
+        None => None,
+    };
+    let call_gas = match (simulated, plan.execution_params()) {
+        (Some(simulated), _) => simulated,
+        (None, None) => CallGasSource::NotNeeded,
+        (None, Some(params)) => {
             match crate::arms::rpc::call_simulation(
                 config,
                 env,
@@ -504,7 +522,7 @@ async fn estimate_gas(
         }
     };
 
-    let outcome = estimate::finish(&plan, &validation.value, call_gas)?;
+    let outcome = estimate::finish(&plan, &validation.value, call_gas, &config.billing_terms())?;
     if let Some(fallback) = outcome.fallback_call_gas {
         worker::console_warn!(
             "could not estimate UserOperation call gas; returning the conservative fallback: chain_id={chain_id} fallback_call_gas_limit={fallback}"
