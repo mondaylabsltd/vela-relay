@@ -303,6 +303,11 @@ pub enum ExecutionOperation {
     FetchTransactionReceipt {
         transaction_hash: String,
     },
+    /// Sleep for `ms` before the next operation: one step of a wait the core
+    /// paces and bounds (`pace::top_up_receipt_wait`). Answered `Done`.
+    Pause {
+        ms: u64,
+    },
     RecordTreasuryShortfall {
         treasury_balance: U256,
         required_treasury: U256,
@@ -2323,8 +2328,9 @@ async fn resolve_nonce_mismatches(
 }
 
 /// Native relayer funding under the treasury lease: prepared-intent resume,
-/// the float plan, affordability, sign/persist, and the funding broadcast.
-/// Returns whether the relayer is ready (`false` = a top-up is pending).
+/// the float plan, affordability, sign/persist, the funding broadcast, and a
+/// short wait for it. Returns whether the relayer is ready: `true` once a
+/// top-up this pass sent is mined, `false` while one is pending.
 #[allow(clippy::too_many_arguments)]
 async fn ensure_native_funding(
     ctx: &Ctx,
@@ -2513,7 +2519,7 @@ async fn native_funding_locked(
         },
     )
     .await?;
-    Ok(false)
+    await_fresh_top_up(ctx, chain_id, &intent).await
 }
 
 /// Tempo pathUSD variant: flat float target, all-or-nothing affordability.
@@ -2680,7 +2686,7 @@ async fn tempo_funding_locked(
         },
     )
     .await?;
-    Ok(false)
+    await_fresh_top_up(ctx, chain_id, &intent).await
 }
 
 async fn ensure_treasury_lease(ctx: &Ctx) -> Result<(), String> {
@@ -2820,9 +2826,10 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
 /// fund twice, and that sees the relayer already funded if the old one did
 /// land after all.
 ///
-/// Only an intent from an earlier pass gets here (a fresh one is broadcast and
-/// left until the next delivery, seconds later), so a node that is merely
-/// slow to see a real transfer costs at most one re-sign.
+/// Only an intent from an earlier pass gets here (a fresh one is waited on
+/// for about two blocks, then left until the next delivery, seconds later),
+/// so a node that is merely slow to see a real transfer costs at most one
+/// re-sign.
 async fn await_or_discard_unseen_funding(
     ctx: &Ctx,
     intent: &PreparedFundingIntent,
@@ -2929,7 +2936,60 @@ async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(),
     let Some(receipt) = receipt else {
         return await_or_discard_unseen_funding(ctx, intent).await;
     };
-    let Some(success) = receipt_succeeded(&receipt) else {
+    settle_funding_receipt(ctx, intent, &receipt).await
+}
+
+/// A top-up this pass just sent, waited on here for about two blocks
+/// (`pace::top_up_receipt_wait`) rather than ending the pass. Returns whether
+/// it was mined: then the relayer holds this bundle's prefund — the top-up
+/// was planned to cover it — and the pass signs on.
+///
+/// Until 2026-10-08 the pass ended at the broadcast, the operation came back
+/// 5–10 s later, and the next pass simulated it all over again: 36–43 s
+/// between an Avalanche top-up and its bundle, for a top-up mined in about a
+/// second (vela-wallet #464).
+///
+/// Nothing else about the top-up changes. A receipt is settled as
+/// [`resume_funding`] settles one: cleared, noted, an error if it reverted.
+/// With no receipt in time, or a read that failed, the prepared intent stays
+/// for the next pass exactly as before: resumed at its nonce, never signed a
+/// second time while a node has it.
+async fn await_fresh_top_up(
+    ctx: &Ctx,
+    chain_id: u64,
+    intent: &PreparedFundingIntent,
+) -> Result<bool, String> {
+    let wait = crate::pace::top_up_receipt_wait(chain_id);
+    for _ in 0..wait.polls {
+        request(ctx, ExecutionOperation::Pause { ms: wait.pause_ms }).await?;
+        match request(
+            ctx,
+            ExecutionOperation::FetchTransactionReceipt {
+                transaction_hash: intent.transaction_hash.clone(),
+            },
+        )
+        .await?
+        {
+            ExecutionOutcome::Receipt {
+                receipt: Some(receipt),
+            } => {
+                settle_funding_receipt(ctx, intent, &receipt).await?;
+                return Ok(true);
+            }
+            ExecutionOutcome::Receipt { receipt: None } | ExecutionOutcome::Failed { .. } => {}
+            _ => return Err("unexpected shell response".to_owned()),
+        }
+    }
+    Ok(false)
+}
+
+/// A mined top-up: clear its intent and note it; `Err` when it reverted.
+async fn settle_funding_receipt(
+    ctx: &Ctx,
+    intent: &PreparedFundingIntent,
+    receipt: &Value,
+) -> Result<(), String> {
+    let Some(success) = receipt_succeeded(receipt) else {
         return Err("funding transaction receipt has invalid status".to_owned());
     };
     if let ExecutionOutcome::Failed { message } = request(
@@ -4739,14 +4799,15 @@ mod tests {
         driver.assert_settled(&[ItemResolution::Durable]);
     }
 
-    #[test]
-    fn an_underfunded_relayer_walks_the_treasury_top_up_and_defers() {
+    /// An underfunded relayer's batch walked through a fresh treasury top-up
+    /// to the moment it is broadcast and recorded — where the pass starts
+    /// waiting for it. Returns the top-up's hash.
+    fn walk_to_top_up_submitted(fixture: &Fixture) -> (Driver, String) {
         // prefund = 100 gas x fee 2 = 200 > balance 100. Float plan: target
         // 200 x 5 = 1000, desired 900, deficit 100; treasury 100_000 covers
         // the full request after the 42_000 reserve.
-        let fixture = fixture(280);
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
-        let mut driver = walk_to_bundle_simulation(&fixture);
+        let mut driver = walk_to_bundle_simulation(fixture);
         driver.step(
             ExecutionOperation::SimulateIndividually {
                 entry_point,
@@ -4841,17 +4902,9 @@ mod tests {
             ExecutionOperation::EnsureTreasuryLease,
             ExecutionOutcome::LeaseHeld { held: true },
         );
-        let funding_intent = crate::task::PreparedFundingIntent {
-            chain_id: CHAIN_ID,
-            relayer: policy().relayer.to_string(),
-            amount_wei: 900,
-            raw_transaction: "0x020909".into(),
-            transaction_hash: funding_hash.clone(),
-            nonce: 3,
-        };
         driver.step(
             ExecutionOperation::SaveFundingIntent {
-                intent: funding_intent,
+                intent: fresh_top_up(&funding_hash),
             },
             ExecutionOutcome::Saved { saved: true },
         );
@@ -4881,11 +4934,63 @@ mod tests {
         driver.step(
             ExecutionOperation::RecordFundingSubmitted {
                 amount: U256::from(900u64),
-                transaction_hash: funding_hash,
+                transaction_hash: funding_hash.clone(),
                 tempo: false,
             },
             ExecutionOutcome::Done,
         );
+        (driver, funding_hash)
+    }
+
+    /// The top-up `walk_to_top_up_submitted` signs.
+    fn fresh_top_up(transaction_hash: &str) -> crate::task::PreparedFundingIntent {
+        crate::task::PreparedFundingIntent {
+            chain_id: CHAIN_ID,
+            relayer: policy().relayer.to_string(),
+            amount_wei: 900,
+            raw_transaction: "0x020909".into(),
+            transaction_hash: transaction_hash.to_owned(),
+            nonce: 3,
+        }
+    }
+
+    /// One step of the in-pass wait for a fresh top-up: Arbitrum (the
+    /// fixture's chain) is waited on in four half-second steps.
+    fn top_up_poll(driver: &mut Driver, transaction_hash: &str, receipt: Option<Value>) {
+        driver.step(
+            ExecutionOperation::Pause { ms: 500 },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::FetchTransactionReceipt {
+                transaction_hash: transaction_hash.to_owned(),
+            },
+            ExecutionOutcome::Receipt { receipt },
+        );
+    }
+
+    #[test]
+    fn an_underfunded_relayer_walks_the_treasury_top_up_and_defers() {
+        let fixture = fixture(280);
+        let (mut driver, funding_hash) = walk_to_top_up_submitted(&fixture);
+        // Waited on for about two blocks, never mined in that time — and a
+        // read that failed is no answer either.
+        top_up_poll(&mut driver, &funding_hash, None);
+        driver.step(
+            ExecutionOperation::Pause { ms: 500 },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::FetchTransactionReceipt {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Failed {
+                message: "trusted RPC is temporarily unavailable".into(),
+            },
+        );
+        top_up_poll(&mut driver, &funding_hash, None);
+        top_up_poll(&mut driver, &funding_hash, None);
+        // The intent stays for the next pass, untouched.
         driver.step(
             ExecutionOperation::ReleaseTreasuryLease,
             ExecutionOutcome::Done,
@@ -4902,6 +5007,188 @@ mod tests {
         // A funding wait: redelivered within seconds, not on the age ladder.
         driver.assert_settled(&[ItemResolution::Failed {
             reason: super::FUNDING_WAIT_FINISH.into(),
+        }]);
+    }
+
+    /// Avalanche, 2026-10-08 (vela-wallet #464): a top-up mined in about a
+    /// second, and its bundle sent 36–43 s later, because the pass ended at
+    /// the top-up and the next one simulated everything again. A top-up mined
+    /// while the pass waits is settled, and the same pass signs the bundle.
+    #[test]
+    fn a_top_up_mined_while_the_pass_waits_is_followed_by_the_bundle_in_that_pass() {
+        let fixture = fixture(280);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let (mut driver, funding_hash) = walk_to_top_up_submitted(&fixture);
+        top_up_poll(&mut driver, &funding_hash, None);
+        top_up_poll(
+            &mut driver,
+            &funding_hash,
+            Some(serde_json::json!({ "status": "0x1" })),
+        );
+        driver.step(
+            ExecutionOperation::ClearFundingIntent {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ForgetBroadcast {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NoteFundingReceipt {
+                intent: fresh_top_up(&funding_hash),
+                success: true,
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ReleaseTreasuryLease,
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        // The relayer's own nonce: the top-up came from the treasury.
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        let bundle_raw = [0x02u8, 0x01, 0x02];
+        let bundle_hash = alloy::primitives::keccak256(bundle_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 100,
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 0,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x020102".into(),
+                    transaction_hash: bundle_hash.clone(),
+                    nonce: 7,
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: CHAIN_ID,
+            lane: fixture.routed.lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: "0x020102".into(),
+            transaction_hash: bundle_hash.clone(),
+            nonce: 7,
+            user_operation_hashes: vec![fixture.hash_string.clone()],
+        };
+        driver.step(
+            ExecutionOperation::SavePreparedBundle {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: bundle_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: bundle_raw.to_vec(),
+                transaction_hash: bundle_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: bundle_hash.clone(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: bundle_hash,
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::MarkBundleSubmitted {
+                intent,
+                gas_limit: 100,
+            },
+            ExecutionOutcome::Indexed { indexed: 1 },
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    /// A top-up that reverts while the pass waits is settled as a resumed one
+    /// is — cleared and noted — and the batch defers with the reason, so the
+    /// next pass plans a fresh one from the treasury's state.
+    #[test]
+    fn a_top_up_that_reverts_while_the_pass_waits_defers_with_the_reason() {
+        let fixture = fixture(280);
+        let (mut driver, funding_hash) = walk_to_top_up_submitted(&fixture);
+        top_up_poll(
+            &mut driver,
+            &funding_hash,
+            Some(serde_json::json!({ "status": "0x0" })),
+        );
+        driver.step(
+            ExecutionOperation::ClearFundingIntent {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ForgetBroadcast {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NoteFundingReceipt {
+                intent: fresh_top_up(&funding_hash),
+                success: false,
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ReleaseTreasuryLease,
+            ExecutionOutcome::Done,
+        );
+        let reason = format!("treasury relayer top-up transaction reverted: {funding_hash}");
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: reason.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: reason.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred { reason },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: super::DEFERRED_FINISH.into(),
         }]);
     }
 

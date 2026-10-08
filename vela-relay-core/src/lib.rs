@@ -30,6 +30,8 @@
 //!   ambiguous/rejected broadcasts.
 //! - [`funding`] — relayer float targets, top-up caps, and treasury
 //!   affordability.
+//! - [`pace`] — how fast a chain makes blocks, and the waits measured in
+//!   blocks (a lane's own top-up).
 //! - [`tempo`] — Tempo chain constants and pathUSD calldata builders.
 //! - [`alchemy`] — the static Alchemy network registry.
 //! - [`chain_directory`] — the chain-metadata directory address, the
@@ -59,6 +61,7 @@ pub mod funding;
 pub mod gas_math;
 pub mod hold;
 pub mod lifecycle;
+pub mod pace;
 pub mod quote;
 pub mod receipt;
 pub mod rpc_host;

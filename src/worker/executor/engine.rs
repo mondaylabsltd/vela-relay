@@ -2432,6 +2432,10 @@ impl BatchShell<'_> {
                     },
                 }
             }
+            Op::Pause { ms } => {
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+                Out::Done
+            }
             Op::FetchTransactionReceipt { transaction_hash } => {
                 match engine
                     .rpc

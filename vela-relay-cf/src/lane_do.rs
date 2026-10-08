@@ -800,6 +800,10 @@ impl LaneDo {
                     _ => treasury_unavailable(),
                 }
             }
+            Op::Pause { ms } => {
+                worker::Delay::from(std::time::Duration::from_millis(*ms)).await;
+                Out::Done
+            }
             Op::FetchTransactionReceipt { transaction_hash } => {
                 match context
                     .trusted

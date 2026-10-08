@@ -42,6 +42,7 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 | `SignTreasuryTransfer` / `SignTreasuryPathUsd` / `SignBundle` / `SignTempoBundle` | core signing fns + secret bindings | keys never enter core; same signing math |
 | `AcquireReceiptProbe` | TDO expiring throttle slot (`probe:{txhash}` deadline; never released, exactly the docker per-interval receipt lease; the slot is deleted as housekeeping when its funding intent clears) | DO serial |
 | `FetchTransactionReceipt` | chain RPC fetch | same policy |
+| `Pause` | `worker::Delay` (docker: `tokio::time::sleep`, fenced like any leased op) | the core paces and bounds every pause (`pace::top_up_receipt_wait`, ≤ 5 s a top-up); the TDO lease (30 s, renewed on touch) outlives it |
 | `RecordTreasuryShortfall` / `RecordPartialTopUp` / `RecordFundingSubmitted` / `RecordUnprovenFunding` / `NoteFundingReceipt` | TDO/RDO writes + logs | same texts |
 | `CheckBroadcastSeen` / `RememberBroadcast` / `ForgetBroadcast` | LDO cache | cache (30 s), loss harmless |
 | `BroadcastRaw` / `ProbeTransactionKnown` / `ProbeStaleNonce` | chain RPC fetches | same classification rules (core `broadcast`) |
@@ -56,7 +57,7 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 | Receipt confirmation checks | shell reconciler loop (per prepared intent) | LDO reconcile alarm while an intent exists (as-built: receipts are bundle-scoped exactly as docker; RecordDO alarms remain TTL-only) | same interval values (`VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS`, 3 s); same tolerance class | submitted → `included` in 2–3 s after mining |
 | Prepared-bundle reconcile | shell timer | same LDO alarm (resume → receipt → per-member `receipt_patch` → clear); armed on save (covers the save-to-broadcast crash window) and on submit | same interval values | intent cleared with the receipt write; lane accepted follow-up work immediately |
 | Record TTL expiry | Redis TTL | RDO alarm cleanup | ± one alarm granule; never early | unchanged (T00x behavior) |
-| Funding retry cadence | in-batch + redelivery | queue retry delay + TDO state | core-owned values | Gate 3: four full cycles |
+| Funding retry cadence | in-batch + redelivery | queue retry delay + TDO state | core-owned values; a fresh top-up is first waited on in-batch for about two blocks (`pace::top_up_receipt_wait`) | Gate 3: four full cycles |
 
 Delayed-payload retention: `max(VELA_RELAY_EXECUTOR_ATTEMPT_TTL_SECS, 14 d)`
 sliding from the last park/retry write — the docker
