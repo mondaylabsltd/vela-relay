@@ -69,6 +69,11 @@ pub(crate) struct ExecutorEngine {
     market_http: Client,
     market_prices: Arc<Mutex<HashMap<String, CachedMarketPrice>>>,
     broadcast_seen: Arc<Mutex<HashMap<String, Instant>>>,
+    /// When the reconciler next checks each prepared bundle (by transaction
+    /// hash): armed on save and, a block after the broadcast, on submit (core
+    /// `pace::receipt_pace_ms`) — the per-intent deadline the Worker keeps in
+    /// its lane alarm. A bundle not in the map is checked on the next tick.
+    receipt_due: Arc<Mutex<HashMap<String, Instant>>>,
     telegram_notifier: Option<TelegramAlertNotifier>,
 }
 
@@ -190,6 +195,7 @@ impl ExecutorEngine {
             market_http,
             market_prices: Arc::new(Mutex::new(HashMap::new())),
             broadcast_seen: Arc::new(Mutex::new(HashMap::new())),
+            receipt_due: Arc::new(Mutex::new(HashMap::new())),
             telegram_notifier,
         })
     }
@@ -198,32 +204,63 @@ impl ExecutorEngine {
         self.treasury_address
     }
 
+    /// Prepared bundles are looked at every `RECEIPT_PACE_FLOOR_MS` (or the
+    /// configured interval, if shorter), each one only when its own deadline
+    /// is due (`receipt_due`); the delayed inbox keeps the configured
+    /// interval.
     pub(crate) async fn run_reconciler(&self, shutdown: CancellationToken) {
-        let mut interval = tokio::time::interval(self.config.receipt_poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let bundle_tick = self.config.receipt_poll_interval.min(Duration::from_millis(
+            vela_relay_core::pace::RECEIPT_PACE_FLOOR_MS,
+        ));
+        let mut bundles = tokio::time::interval(bundle_tick);
+        bundles.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut delayed = tokio::time::interval(self.config.receipt_poll_interval);
+        delayed.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
+            let failed = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
-                _ = interval.tick() => {
-                    let mut failed = false;
-                    if let Err(error) = self.reconcile_prepared_bundles().await {
-                        failed = true;
+                _ = bundles.tick() => match self.reconcile_prepared_bundles().await {
+                    Ok(()) => false,
+                    Err(error) => {
                         tracing::warn!(%error, "prepared bundle reconciliation failed");
+                        true
                     }
-                    if let Err(error) = self.reconcile_delayed_user_operations().await {
-                        failed = true;
+                },
+                _ = delayed.tick() => match self.reconcile_delayed_user_operations().await {
+                    Ok(()) => false,
+                    Err(error) => {
                         tracing::warn!(%error, "delayed UserOperation reconciliation failed");
+                        true
                     }
-                    if failed {
-                        tokio::select! {
-                            _ = shutdown.cancelled() => return,
-                            _ = tokio::time::sleep(RECEIPT_RECONCILE_FAILURE_DELAY) => {}
-                        }
-                    }
+                },
+            };
+            if failed {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(RECEIPT_RECONCILE_FAILURE_DELAY) => {}
                 }
             }
         }
+    }
+
+    /// A chain's receipt pace (core `pace::receipt_pace_ms`).
+    fn receipt_pace(&self, chain_id: u64) -> Duration {
+        let configured =
+            u64::try_from(self.config.receipt_poll_interval.as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(vela_relay_core::pace::receipt_pace_ms(chain_id, configured))
+    }
+
+    /// Arms (or advances) a prepared bundle's next reconcile to at most
+    /// `within` from now.
+    async fn arm_receipt_check(&self, transaction_hash: &str, within: Duration) {
+        let due = Instant::now() + within;
+        self.receipt_due
+            .lock()
+            .await
+            .entry(transaction_hash.to_owned())
+            .and_modify(|existing| *existing = (*existing).min(due))
+            .or_insert(due);
     }
 
     async fn reconcile_delayed_user_operations(&self) -> Result<(), ExecutorItemError> {
@@ -1082,6 +1119,30 @@ impl ExecutorEngine {
             .list_prepared_bundle_intents()
             .await
             .map_err(store_item_error)?;
+        let now = Instant::now();
+        let intents = {
+            let mut receipt_due = self.receipt_due.lock().await;
+            receipt_due.retain(|transaction_hash, _| {
+                intents
+                    .iter()
+                    .any(|intent| intent.transaction_hash == *transaction_hash)
+            });
+            let mut due_now = Vec::new();
+            for intent in intents {
+                if receipt_due
+                    .get(&intent.transaction_hash)
+                    .is_some_and(|due| now < *due)
+                {
+                    continue;
+                }
+                receipt_due.insert(
+                    intent.transaction_hash.clone(),
+                    now + self.receipt_pace(intent.chain_id),
+                );
+                due_now.push(intent);
+            }
+            due_now
+        };
         let mut claimed_by_chain = BTreeMap::<u64, Vec<PreparedBundleIntent>>::new();
         for intent in intents {
             let disposition = match self.resume_bundle_intent(&intent).await {
@@ -1125,7 +1186,7 @@ impl ExecutorEngine {
                 .acquire_lease(
                     &format!("receipt:{}:{}", intent.chain_id, intent.transaction_hash),
                     &unique_token("receipt"),
-                    self.config.receipt_poll_interval,
+                    self.receipt_pace(intent.chain_id),
                 )
                 .await
             {
@@ -2107,7 +2168,21 @@ impl BatchShell<'_> {
             }
             Op::SavePreparedBundle { intent } => {
                 match engine.store.save_prepared_bundle_intent(intent).await {
-                    Ok(saved) => Out::Saved { saved },
+                    Ok(saved) => {
+                        if saved {
+                            // Covers the crash window between save and
+                            // broadcast, and leaves the outbox to this pass
+                            // until then (the Worker's lane alarm, armed on
+                            // save).
+                            engine
+                                .arm_receipt_check(
+                                    &intent.transaction_hash,
+                                    engine.config.receipt_poll_interval,
+                                )
+                                .await;
+                        }
+                        Out::Saved { saved }
+                    }
                     Err(error) => Out::Failed {
                         message: error.to_string(),
                     },
@@ -2634,6 +2709,15 @@ impl BatchShell<'_> {
                                 );
                             }
                         }
+                        // A submitted bundle now has a receipt to reconcile:
+                        // the first check comes a block after the broadcast,
+                        // not the poll interval after the save.
+                        engine
+                            .arm_receipt_check(
+                                &intent.transaction_hash,
+                                engine.receipt_pace(chain_id),
+                            )
+                            .await;
                         Out::Indexed { indexed }
                     }
                     Err(error) => Out::Failed {

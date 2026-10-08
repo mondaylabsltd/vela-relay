@@ -2,7 +2,8 @@
 //!
 //! A wait for something to be mined is wrong at both ends when it is a flat
 //! number of seconds: three seconds is three Avalanche blocks and a quarter of
-//! an Ethereum one. The core decides how long; the shell sleeps.
+//! an Ethereum one. The core decides how long; the shell sleeps, or arms its
+//! timer.
 
 /// The typical interval between blocks, for the chains where it is known.
 pub fn block_interval_ms(chain_id: u64) -> Option<u64> {
@@ -67,9 +68,46 @@ pub fn top_up_receipt_wait(chain_id: u64) -> ReceiptWait {
     }
 }
 
+/// The most often a submitted bundle's receipt is asked for, on any chain.
+pub const RECEIPT_PACE_FLOOR_MS: u64 = 1_000;
+
+/// How often the lane reconciler asks for a submitted bundle's receipt — and
+/// how soon after the broadcast it first asks: a block, but not more often
+/// than once a second, and never less often than the operator's
+/// `VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS` (`configured_ms`). A chain not
+/// listed in [`block_interval_ms`] keeps the configured interval.
+///
+/// The record says `included` only once the reconciler has seen the receipt,
+/// and the wallet asks the relay for it. A flat 3 s, counted from when the
+/// bundle was saved rather than sent, was up to three Avalanche blocks of
+/// waiting after the bundle was already mined (vela-wallet #464).
+pub fn receipt_pace_ms(chain_id: u64, configured_ms: u64) -> u64 {
+    match block_interval_ms(chain_id) {
+        Some(block) => block.max(RECEIPT_PACE_FLOOR_MS).min(configured_ms),
+        None => configured_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ReceiptWait, TOP_UP_WAIT_MAX_MS, top_up_receipt_wait};
+    use super::{ReceiptWait, TOP_UP_WAIT_MAX_MS, receipt_pace_ms, top_up_receipt_wait};
+
+    #[test]
+    fn a_receipt_is_asked_for_once_a_block_within_a_second_and_the_configured_interval() {
+        // Avalanche: every block.
+        assert_eq!(receipt_pace_ms(43_114, 3_000), 1_000);
+        // Base, Polygon: every 2 s block.
+        assert_eq!(receipt_pace_ms(8_453, 3_000), 2_000);
+        assert_eq!(receipt_pace_ms(137, 3_000), 2_000);
+        // Arbitrum's quarter-second blocks: once a second at most.
+        assert_eq!(receipt_pace_ms(42_161, 3_000), 1_000);
+        // Ethereum and Gnosis: never slower than the operator asked.
+        assert_eq!(receipt_pace_ms(1, 3_000), 3_000);
+        assert_eq!(receipt_pace_ms(100, 3_000), 3_000);
+        // A chain nobody listed, and an operator who asked for faster.
+        assert_eq!(receipt_pace_ms(999_999, 3_000), 3_000);
+        assert_eq!(receipt_pace_ms(8_453, 1_500), 1_500);
+    }
 
     #[test]
     fn a_top_up_is_waited_on_for_about_two_blocks_and_never_more_than_five_seconds() {

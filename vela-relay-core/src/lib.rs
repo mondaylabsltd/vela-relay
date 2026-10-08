@@ -31,7 +31,7 @@
 //! - [`funding`] — relayer float targets, top-up caps, and treasury
 //!   affordability.
 //! - [`pace`] — how fast a chain makes blocks, and the waits measured in
-//!   blocks (a lane's own top-up).
+//!   blocks (a lane's own top-up, a submitted bundle's receipt).
 //! - [`tempo`] — Tempo chain constants and pathUSD calldata builders.
 //! - [`alchemy`] — the static Alchemy network registry.
 //! - [`chain_directory`] — the chain-metadata directory address, the
