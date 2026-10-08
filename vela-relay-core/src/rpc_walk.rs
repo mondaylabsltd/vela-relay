@@ -13,6 +13,74 @@
 
 use std::collections::HashMap;
 
+use serde_json::Value;
+
+/// How long an endpoint that failed its chain check or timed out is left out
+/// of walks. On Avalanche about a dozen listed endpoints answer 403, 429, 521
+/// or 530 to everything, and avalancheapi.terminet.io never answers at all;
+/// each was asked again on every walk, the last one for the whole 5 s RPC
+/// timeout (2026-10-08).
+pub const ENDPOINT_COOLDOWN_MS: u64 = 3 * 60 * 1_000;
+
+/// The endpoints a walk leaves out for now, per chain.
+///
+/// The operator's own endpoints (`VELA_RELAY_EXECUTOR_RPC_URLS`) are never
+/// cooled: they are a deliberate choice, often the one node that serves
+/// `debug_traceCall`, and the shells do not report them.
+#[derive(Debug, Default)]
+pub struct EndpointCooldowns {
+    until_ms: HashMap<(u64, String), u64>,
+}
+
+impl EndpointCooldowns {
+    /// Leave `url` out of the chain's walks for [`ENDPOINT_COOLDOWN_MS`].
+    pub fn cool(&mut self, chain_id: u64, url: &str, now_ms: u64) {
+        self.until_ms.retain(|_, until| *until > now_ms);
+        self.until_ms.insert(
+            (chain_id, url.to_owned()),
+            now_ms.saturating_add(ENDPOINT_COOLDOWN_MS),
+        );
+    }
+
+    /// `url` answered its chain check: walk it again.
+    pub fn clear(&mut self, chain_id: u64, url: &str) {
+        self.until_ms.remove(&(chain_id, url.to_owned()));
+    }
+
+    pub fn is_cooling(&self, chain_id: u64, url: &str, now_ms: u64) -> bool {
+        self.until_ms
+            .get(&(chain_id, url.to_owned()))
+            .is_some_and(|until| now_ms < *until)
+    }
+
+    /// The endpoints a walk asks, in their order: those not cooling down — or
+    /// every one of them when all are, so a cooldown never leaves a chain with
+    /// nothing to ask.
+    pub fn walkable(&self, chain_id: u64, urls: Vec<String>, now_ms: u64) -> Vec<String> {
+        let warm = urls
+            .iter()
+            .filter(|url| !self.is_cooling(chain_id, url, now_ms))
+            .cloned()
+            .collect::<Vec<_>>();
+        if warm.is_empty() { urls } else { warm }
+    }
+}
+
+/// The replies in an answer to `calls_sent` JSON-RPC calls: the array a batch
+/// gets, or the one object a single call gets. A transport sends a lone call
+/// on its own rather than as a batch of one — pocket.network answers a
+/// one-call batch with a bare object, which read as no answer and walked on
+/// past it (Avalanche `debug_traceCall`, 2026-10-08) — and accepts the bare
+/// object from an endpoint that does the same to a batch. `None` is no
+/// answer: try the next endpoint.
+pub fn batch_replies(body: Value, calls_sent: usize) -> Option<Vec<Value>> {
+    match body {
+        Value::Array(replies) => Some(replies),
+        reply @ Value::Object(_) if calls_sent == 1 => Some(vec![reply]),
+        _ => None,
+    }
+}
+
 /// How long a walk that proved a chain's endpoints lack a method is believed.
 /// It only reorders the next walks (the method is asked last instead of
 /// first), so a stale memory costs a slower walk, never a verdict.
@@ -118,10 +186,70 @@ impl MissingMethods {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
-        MISSING_METHOD_MEMORY_MS, MethodAnswer, MissingMethods, method_error_answer,
-        walk_proves_method_missing,
+        ENDPOINT_COOLDOWN_MS, EndpointCooldowns, MISSING_METHOD_MEMORY_MS, MethodAnswer,
+        MissingMethods, batch_replies, method_error_answer, walk_proves_method_missing,
     };
+
+    #[test]
+    fn a_cooled_endpoint_is_left_out_of_walks_until_its_cooldown_ends() {
+        let urls = || {
+            vec![
+                "https://terminet.example/".to_owned(),
+                "https://publicnode.example/".to_owned(),
+                "https://pocket.example/".to_owned(),
+            ]
+        };
+        let mut cooldowns = EndpointCooldowns::default();
+        let now = 5_000_000;
+        cooldowns.cool(43_114, "https://terminet.example/", now);
+
+        assert_eq!(
+            cooldowns.walkable(43_114, urls(), now + 1),
+            vec![
+                "https://publicnode.example/".to_owned(),
+                "https://pocket.example/".to_owned(),
+            ]
+        );
+        // Per chain: the same host for another chain is still asked.
+        assert_eq!(cooldowns.walkable(137, urls(), now + 1), urls());
+        // Back in the walk once the cooldown is over, in its old place.
+        assert_eq!(
+            cooldowns.walkable(43_114, urls(), now + ENDPOINT_COOLDOWN_MS),
+            urls()
+        );
+        // ...or as soon as it passes its chain check again.
+        cooldowns.clear(43_114, "https://terminet.example/");
+        assert_eq!(cooldowns.walkable(43_114, urls(), now + 1), urls());
+    }
+
+    #[test]
+    fn a_chain_whose_every_endpoint_is_cooling_still_has_them_all_to_ask() {
+        let urls = vec![
+            "https://first.example/".to_owned(),
+            "https://second.example/".to_owned(),
+        ];
+        let mut cooldowns = EndpointCooldowns::default();
+        for url in &urls {
+            cooldowns.cool(43_114, url, 0);
+        }
+        assert_eq!(cooldowns.walkable(43_114, urls.clone(), 1), urls);
+    }
+
+    #[test]
+    fn a_lone_call_may_be_answered_with_a_bare_object_and_a_batch_may_not() {
+        let reply = json!({ "jsonrpc": "2.0", "id": 7, "result": "0x1" });
+        assert_eq!(batch_replies(reply.clone(), 1), Some(vec![reply.clone()]));
+        assert_eq!(
+            batch_replies(json!([reply.clone(), reply.clone()]), 2),
+            Some(vec![reply.clone(), reply.clone()])
+        );
+        // An object for a batch of two is a whole-batch refusal, not replies.
+        assert_eq!(batch_replies(reply, 2), None);
+        assert_eq!(batch_replies(json!("rate limited"), 1), None);
+    }
 
     #[test]
     fn every_way_an_avalanche_endpoint_said_it_has_no_simulate_v1_is_unsupported() {

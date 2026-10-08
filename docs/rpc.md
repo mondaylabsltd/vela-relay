@@ -39,6 +39,29 @@ Never `x-vela-rpc-url`. A caller-supplied endpoint could lie about a nonce, a
 receipt or a balance and make the relay send again, spending the float that every
 person on that chain depends on.
 
+### Endpoints that do not answer
+
+Before it uses an endpoint, the executor checks that the endpoint reports the
+chain's id. An endpoint that fails that check (the wrong chain, an error, an
+HTTP error, no answer) or that runs out the RPC timeout on any request is left
+out of the executor's walks for 3 minutes. On Avalanche about a dozen listed
+endpoints answer 403, 429, 521 or 530 to everything, and one never answers, so
+each walk used to ask them all again and wait the full 5 s timeout for that one.
+
+Two exceptions keep this from making things worse:
+
+- The operator's own endpoints (`VELA_RELAY_EXECUTOR_RPC_URLS`) are never left
+  out.
+- When every endpoint for a chain is cooling down, the walk asks all of them.
+
+A single call is sent on its own, not as a batch of one. Some endpoints
+(pocket.network on Avalanche) answer a one-call batch with a bare object, which
+the executor used to read as no answer. It now also accepts that bare object.
+
+The rules are in `vela-relay-core`'s `rpc_walk` (`EndpointCooldowns`,
+`batch_replies`). The cooldowns are kept per process or per isolate, like the
+rest of the walk's memory.
+
 ### A method the chain's nodes do not have
 
 The executor simulates every operation before it signs, in three tiers:
