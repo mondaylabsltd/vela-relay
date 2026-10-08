@@ -79,6 +79,11 @@ pub struct SimulationResult {
     pub gas_used: U256,
     pub events: Vec<SimulatedUserOperation>,
     pub logs: Vec<SimulatedLog>,
+    /// Whether this is a full execution of the `handleOps` call — its status,
+    /// its gas and every log (`eth_simulateV1`, `debug_traceCall`) — rather
+    /// than a stand-in that proves less: the Pimlico `eth_call` (gas 0, no
+    /// logs) or the bundle's `eth_estimateGas` (no logs).
+    pub full_execution: bool,
 }
 
 #[derive(Debug)]
@@ -322,6 +327,7 @@ fn simulation_from_logs(
         gas_used,
         events,
         logs,
+        full_execution: true,
     })
 }
 

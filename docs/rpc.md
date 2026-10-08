@@ -88,6 +88,13 @@ never a verdict. The rule is `vela-relay-core`'s `simulation::simulate_v1_turn`
 and `rpc_walk`. Each process (docker) or isolate (Workers) keeps its own memory,
 which starts empty.
 
+Each operation is first simulated alone, and then the bundle is simulated
+before it is signed. When the bundle is a single operation and its own
+simulation ran in full (`eth_simulateV1` or `debug_traceCall`, with its gas and
+every log), that run is the bundle's simulation: the call is identical. An
+operation that only the Pimlico `eth_call` could check (no gas, no logs) is
+still simulated as a bundle.
+
 **Considered and not built** (2026-10-03): broadcasting through the wallet's RPC
 for a chain whose directory entry has no usable endpoint. Measured on a snapshot of
 the chain list the directory serves (ethereum-lists, 2026-05-06): of 2,602 chains,

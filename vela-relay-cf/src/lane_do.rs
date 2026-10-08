@@ -18,7 +18,6 @@ use vela_relay_core::broadcast::{nonce_too_low, validate_raw_transaction};
 use vela_relay_core::execution::{
     self as core_execution, ExecutionOperation as Op, ExecutionOutcome as Out,
 };
-use vela_relay_core::simulation::{SimulationResult, SimulationVerdict};
 use vela_relay_core::task::{PreparedBundleIntent, RoutedUserOperation, truncate_diagnostic};
 use vela_relay_core::vault;
 use worker::{
@@ -497,7 +496,10 @@ impl LaneDo {
                 )
                 .await;
                 Out::OperationVerdicts {
-                    verdicts: verdicts.into_iter().map(operation_sim_verdict).collect(),
+                    verdicts: verdicts
+                        .into_iter()
+                        .map(core_execution::OperationSimVerdict::from)
+                        .collect(),
                 }
             }
             Op::FetchAccountNonces {
@@ -564,7 +566,7 @@ impl LaneDo {
                 )
                 .await;
                 Out::BundleVerdict {
-                    verdict: bundle_sim_verdict(verdict),
+                    verdict: core_execution::BundleSimVerdict::from(verdict),
                 }
             }
             Op::FetchTransactionContext {
@@ -2047,61 +2049,8 @@ impl LaneDo {
     }
 }
 
-// --- verdict/reply conversions (docker engine arm mappings, verbatim) ---
-
-fn operation_sim_verdict(
-    verdict: SimulationVerdict<SimulationResult>,
-) -> core_execution::OperationSimVerdict {
-    match verdict {
-        SimulationVerdict::Success(_) => core_execution::OperationSimVerdict::Success,
-        SimulationVerdict::NonceMismatch => core_execution::OperationSimVerdict::NonceMismatch,
-        SimulationVerdict::Rejected(reason) => core_execution::OperationSimVerdict::Rejected {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Pending(reason) => core_execution::OperationSimVerdict::Pending {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Transient(reason) => core_execution::OperationSimVerdict::Transient {
-            reason: reason.to_string(),
-        },
-    }
-}
-
-fn bundle_sim_verdict(
-    verdict: SimulationVerdict<SimulationResult>,
-) -> core_execution::BundleSimVerdict {
-    match verdict {
-        SimulationVerdict::Success(simulation) => {
-            core_execution::BundleSimVerdict::Success(core_execution::BundleSimulationData {
-                gas_used: simulation.gas_used,
-                operation_gas_used: simulation
-                    .events
-                    .iter()
-                    .map(|event| event.actual_gas_used)
-                    .collect(),
-                logs: simulation
-                    .logs
-                    .iter()
-                    .map(|log| vela_relay_core::settlement::SettlementLog {
-                        address: log.address,
-                        topics: log.topics.clone(),
-                        data: log.data.clone(),
-                    })
-                    .collect(),
-            })
-        }
-        SimulationVerdict::NonceMismatch => core_execution::BundleSimVerdict::NonceMismatch,
-        SimulationVerdict::Rejected(reason) => core_execution::BundleSimVerdict::Rejected {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Pending(reason) => core_execution::BundleSimVerdict::Pending {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Transient(reason) => core_execution::BundleSimVerdict::Transient {
-            reason: reason.to_string(),
-        },
-    }
-}
+// --- reply conversions (docker engine arm mappings, verbatim; the simulation
+// verdicts convert through the core's `From` impls) ---
 
 fn broadcast_reply(
     outcome: crate::arms::trusted::BroadcastOutcome,

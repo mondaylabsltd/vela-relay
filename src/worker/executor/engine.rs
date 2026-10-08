@@ -39,8 +39,8 @@ use super::{
     deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
-    settlement::{ChainAssetConfig, SettlementLog, StablecoinConfig},
-    simulation::{SimulationVerdict, simulate_bundle, simulate_individually},
+    settlement::{ChainAssetConfig, StablecoinConfig},
+    simulation::{simulate_bundle, simulate_individually},
     transaction::{
         TempoTransactionPlan, TransactionPlan, sign_eip1559, sign_tempo, signer_address,
     },
@@ -1956,29 +1956,7 @@ impl BatchShell<'_> {
                 Out::OperationVerdicts {
                     verdicts: verdicts
                         .into_iter()
-                        .map(|verdict| match verdict {
-                            SimulationVerdict::Success(_) => {
-                                core_execution::OperationSimVerdict::Success
-                            }
-                            SimulationVerdict::NonceMismatch => {
-                                core_execution::OperationSimVerdict::NonceMismatch
-                            }
-                            SimulationVerdict::Rejected(reason) => {
-                                core_execution::OperationSimVerdict::Rejected {
-                                    reason: reason.to_string(),
-                                }
-                            }
-                            SimulationVerdict::Pending(reason) => {
-                                core_execution::OperationSimVerdict::Pending {
-                                    reason: reason.to_string(),
-                                }
-                            }
-                            SimulationVerdict::Transient(reason) => {
-                                core_execution::OperationSimVerdict::Transient {
-                                    reason: reason.to_string(),
-                                }
-                            }
-                        })
+                        .map(core_execution::OperationSimVerdict::from)
                         .collect(),
                 }
             }
@@ -2049,47 +2027,7 @@ impl BatchShell<'_> {
                 )
                 .await;
                 Out::BundleVerdict {
-                    verdict: match verdict {
-                        SimulationVerdict::Success(simulation) => {
-                            core_execution::BundleSimVerdict::Success(
-                                core_execution::BundleSimulationData {
-                                    gas_used: simulation.gas_used,
-                                    operation_gas_used: simulation
-                                        .events
-                                        .iter()
-                                        .map(|event| event.actual_gas_used)
-                                        .collect(),
-                                    logs: simulation
-                                        .logs
-                                        .iter()
-                                        .map(|log| SettlementLog {
-                                            address: log.address,
-                                            topics: log.topics.clone(),
-                                            data: log.data.clone(),
-                                        })
-                                        .collect(),
-                                },
-                            )
-                        }
-                        SimulationVerdict::NonceMismatch => {
-                            core_execution::BundleSimVerdict::NonceMismatch
-                        }
-                        SimulationVerdict::Rejected(reason) => {
-                            core_execution::BundleSimVerdict::Rejected {
-                                reason: reason.to_string(),
-                            }
-                        }
-                        SimulationVerdict::Pending(reason) => {
-                            core_execution::BundleSimVerdict::Pending {
-                                reason: reason.to_string(),
-                            }
-                        }
-                        SimulationVerdict::Transient(reason) => {
-                            core_execution::BundleSimVerdict::Transient {
-                                reason: reason.to_string(),
-                            }
-                        }
-                    },
+                    verdict: core_execution::BundleSimVerdict::from(verdict),
                 }
             }
             Op::FetchTransactionContext {

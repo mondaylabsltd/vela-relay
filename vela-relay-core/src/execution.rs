@@ -34,6 +34,7 @@ use crate::{
         ChainAssetConfig, FeeContext, SettlementDecision, SettlementLog, decide_settlement,
         has_stablecoin_payment, settlement_rejection_reason, verify_stable_transfer_logs,
     },
+    simulation::{SimulationResult, SimulationVerdict},
     task::{
         PreparedBundleIntent, PreparedFundingIntent, QueuedUserOperation, RoutedUserOperation,
         StoredUserOperation, UserOperation, UserOperationStatus,
@@ -94,6 +95,11 @@ pub struct ResolvedChainAssets {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationSimVerdict {
     Success,
+    /// Succeeded in a full execution of its own one-operation `handleOps`
+    /// (`eth_simulateV1` or `debug_traceCall`, see
+    /// [`SimulationResult::full_execution`]), carried with its gas and logs:
+    /// exactly what a bundle simulation of this operation alone reports.
+    Executed(BundleSimulationData),
     NonceMismatch,
     Rejected {
         reason: String,
@@ -124,6 +130,71 @@ pub struct BundleSimulationData {
     pub operation_gas_used: Vec<U256>,
     /// Logs from the exact final handleOps simulation (settlement evidence).
     pub logs: Vec<SettlementLog>,
+}
+
+impl From<&SimulationResult> for BundleSimulationData {
+    fn from(simulation: &SimulationResult) -> Self {
+        Self {
+            gas_used: simulation.gas_used,
+            operation_gas_used: simulation
+                .events
+                .iter()
+                .map(|event| event.actual_gas_used)
+                .collect(),
+            logs: simulation
+                .logs
+                .iter()
+                .map(|log| SettlementLog {
+                    address: log.address,
+                    topics: log.topics.clone(),
+                    data: log.data.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The shells' `SimulateIndividually` answer, one verdict per operation.
+impl From<SimulationVerdict<SimulationResult>> for OperationSimVerdict {
+    fn from(verdict: SimulationVerdict<SimulationResult>) -> Self {
+        match verdict {
+            SimulationVerdict::Success(simulation) if simulation.full_execution => {
+                Self::Executed(BundleSimulationData::from(&simulation))
+            }
+            SimulationVerdict::Success(_) => Self::Success,
+            SimulationVerdict::NonceMismatch => Self::NonceMismatch,
+            SimulationVerdict::Rejected(reason) => Self::Rejected {
+                reason: reason.to_string(),
+            },
+            SimulationVerdict::Pending(reason) => Self::Pending {
+                reason: reason.to_string(),
+            },
+            SimulationVerdict::Transient(reason) => Self::Transient {
+                reason: reason.to_string(),
+            },
+        }
+    }
+}
+
+/// The shells' `SimulateBundle` answer.
+impl From<SimulationVerdict<SimulationResult>> for BundleSimVerdict {
+    fn from(verdict: SimulationVerdict<SimulationResult>) -> Self {
+        match verdict {
+            SimulationVerdict::Success(simulation) => {
+                Self::Success(BundleSimulationData::from(&simulation))
+            }
+            SimulationVerdict::NonceMismatch => Self::NonceMismatch,
+            SimulationVerdict::Rejected(reason) => Self::Rejected {
+                reason: reason.to_string(),
+            },
+            SimulationVerdict::Pending(reason) => Self::Pending {
+                reason: reason.to_string(),
+            },
+            SimulationVerdict::Transient(reason) => Self::Transient {
+                reason: reason.to_string(),
+            },
+        }
+    }
 }
 
 /// Fee/nonce/balance context for the outer transaction, fetched by the shell.
@@ -1325,10 +1396,19 @@ async fn execute_with_lane_lease(
     }
 
     let mut survivors = Vec::new();
+    // Each survivor's own full execution, when its simulation was one.
+    let mut executions = Vec::new();
     let mut nonce_mismatches = Vec::new();
     for (candidate, verdict) in candidates.drain(..).zip(verdicts) {
         match verdict {
-            OperationSimVerdict::Success => survivors.push(candidate),
+            OperationSimVerdict::Success => {
+                survivors.push(candidate);
+                executions.push(None);
+            }
+            OperationSimVerdict::Executed(simulation) => {
+                survivors.push(candidate);
+                executions.push(Some(simulation));
+            }
             OperationSimVerdict::NonceMismatch => nonce_mismatches.push(candidate),
             OperationSimVerdict::Rejected { reason } => {
                 // A store failure here defers the whole lane batch: nothing
@@ -1398,14 +1478,17 @@ async fn execute_with_lane_lease(
     // If a multi-op bundle has a state interaction that does not exist in
     // isolated simulation, fall back to the first op. Later ops stay queued
     // instead of poisoning the whole handleOps transaction.
-    let mut bundle_verdict = simulate_bundle(ctx, entry_point, &survivors).await?;
+    let mut bundle_verdict =
+        simulate_bundle_unless_executed(ctx, entry_point, &survivors, &executions).await?;
     if matches!(
         bundle_verdict,
         BundleSimVerdict::Rejected { .. } | BundleSimVerdict::NonceMismatch
     ) && survivors.len() > 1
     {
         survivors.truncate(1);
-        bundle_verdict = simulate_bundle(ctx, entry_point, &survivors).await?;
+        executions.truncate(1);
+        bundle_verdict =
+            simulate_bundle_unless_executed(ctx, entry_point, &survivors, &executions).await?;
     }
     let bundle_simulation = match bundle_verdict {
         BundleSimVerdict::Success(simulation) => simulation,
@@ -3167,6 +3250,25 @@ async fn ensure_lane_lease(ctx: &Ctx) -> Result<(), String> {
     }
 }
 
+/// The bundle's simulation, unless one operation alone makes the bundle and
+/// its own simulation already executed it in full: the same `handleOps`
+/// calldata, from the same relayer, at `latest`, moments ago. On Avalanche
+/// that was a second `debug_traceCall` walk for the identical call (vela-wallet
+/// #464). A survivor proven only by the Pimlico `eth_call` (gas 0, no logs)
+/// is always simulated as a bundle: its settlement evidence and gas come from
+/// there.
+async fn simulate_bundle_unless_executed(
+    ctx: &Ctx,
+    entry_point: Address,
+    survivors: &[Candidate],
+    executions: &[Option<BundleSimulationData>],
+) -> Result<BundleSimVerdict, String> {
+    if let ([_], [Some(execution)]) = (survivors, executions) {
+        return Ok(BundleSimVerdict::Success(execution.clone()));
+    }
+    simulate_bundle(ctx, entry_point, survivors).await
+}
+
 async fn simulate_bundle(
     ctx: &Ctx,
     entry_point: Address,
@@ -3350,8 +3452,12 @@ mod tests {
     }
 
     fn user_op_with_nonce(paid: u128, nonce: &str) -> UserOperationV0_7 {
+        user_op_from(paid, nonce, SENDER)
+    }
+
+    fn user_op_from(paid: u128, nonce: &str, sender: &str) -> UserOperationV0_7 {
         UserOperationV0_7 {
-            sender: SENDER.into(),
+            sender: sender.into(),
             nonce: nonce.into(),
             factory: None,
             factory_data: None,
@@ -3389,12 +3495,16 @@ mod tests {
     }
 
     fn fixture_with_nonce(paid: u128, nonce: &str) -> Fixture {
-        let operation = UserOperation::V0_7(Box::new(user_op_with_nonce(paid, nonce)));
+        fixture_from(paid, nonce, SENDER)
+    }
+
+    fn fixture_from(paid: u128, nonce: &str, sender: &str) -> Fixture {
+        let operation = UserOperation::V0_7(Box::new(user_op_from(paid, nonce, sender)));
         let packed = PackedOperation::try_from(&operation).expect("fixture packs");
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
         let hash = user_operation_hash(&packed, entry_point, CHAIN_ID);
         let hash_string = hash.to_string().to_ascii_lowercase();
-        let lane = relayer_index_for_sender(SENDER, 10) as u8;
+        let lane = relayer_index_for_sender(sender, 10) as u8;
         let value: Value = serde_json::to_value(&operation).unwrap();
         let routed = RoutedUserOperation {
             schema_version: 1,
@@ -3402,7 +3512,7 @@ mod tests {
             chain_id: CHAIN_ID,
             entry_point: ENTRY_POINT.into(),
             user_operation: value,
-            sender: SENDER.into(),
+            sender: sender.into(),
             lane,
             stream: "chain-42161".into(),
             partition_id: 1,
@@ -3774,6 +3884,267 @@ mod tests {
             ExecutionOutcome::Indexed { indexed: 1 },
         );
         driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    /// A lone operation whose own simulation executed its one-op `handleOps`
+    /// in full is not simulated again as a bundle: on Avalanche that was a
+    /// second `debug_traceCall` walk for the identical call (vela-wallet
+    /// #464). Its figure is still believed only up to the declared bound
+    /// (#440): a trace naming no gas there reports 25,000,000.
+    #[test]
+    fn a_lone_operation_executed_in_full_is_not_simulated_again_and_its_gas_is_still_bounded() {
+        let fixture = fixture(310_000);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Executed(BundleSimulationData {
+                    gas_used: U256::from(25_000_000u64),
+                    ..sim_data()
+                })],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        // No SimulateBundle: straight on to the outer transaction.
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata: calldata.clone(),
+            },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    relayer_balance: U256::from(1_000_000u64),
+                    ..context()
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        // The declared bound, as in the test above — not 25M.
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 110_203,
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 0,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Failed {
+                message: "keystore unavailable".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: "keystore unavailable".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: "keystore unavailable".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                    reason: "keystore unavailable".into(),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: super::DEFERRED_FINISH.into(),
+        }]);
+    }
+
+    /// Two operations each executed in isolation still make a bundle that
+    /// was never run: it is simulated. When it is refused and the first
+    /// operation goes alone, that one's own execution is its simulation.
+    #[test]
+    fn a_bundle_of_two_is_simulated_and_the_first_alone_reuses_its_own_execution() {
+        let first = fixture(310_000);
+        let lane = relayer_index_for_sender(SENDER, 10);
+        let other_sender = (0xabu64..)
+            .map(|tail| format!("0x{tail:040x}"))
+            .find(|sender| relayer_index_for_sender(sender, 10) == lane)
+            .unwrap();
+        let second = fixture_from(310_000, "0x0", &other_sender);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(start(vec![first.routed.clone(), second.routed.clone()]));
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![first.hash_string.clone(), second.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(first.record.clone()), Some(second.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        let both = vec![
+            (first.hash_string.parse().unwrap(), first.packed.clone()),
+            (second.hash_string.parse().unwrap(), second.packed.clone()),
+        ];
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: both.clone(),
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![
+                    OperationSimVerdict::Executed(sim_data()),
+                    OperationSimVerdict::Executed(sim_data()),
+                ],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: both,
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Rejected {
+                    reason: "handleOps reverted during simulation".into(),
+                },
+            },
+        );
+        // The first alone: no second SimulateBundle.
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&first.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata,
+            },
+            ExecutionOutcome::Failed {
+                message: "trusted RPC is temporarily unavailable".into(),
+            },
+        );
+        for fixture in [&first, &second] {
+            driver.step(
+                ExecutionOperation::RecordDeferred {
+                    hash: fixture.hash_string.clone(),
+                    stage: "execution",
+                    reason: "trusted RPC is temporarily unavailable".into(),
+                },
+                ExecutionOutcome::Done,
+            );
+            driver.step(
+                ExecutionOperation::NotifyIssue {
+                    hash: fixture.hash_string.clone(),
+                    stage: "execution",
+                    reason: "trusted RPC is temporarily unavailable".into(),
+                },
+                ExecutionOutcome::Done,
+            );
+        }
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                    reason: "trusted RPC is temporarily unavailable".into(),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[
+            ItemResolution::Failed {
+                reason: super::DEFERRED_FINISH.into(),
+            },
+            ItemResolution::Failed {
+                reason: super::DEFERRED_FINISH.into(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn only_a_full_execution_is_carried_as_one() {
+        use crate::simulation::{
+            SimulatedLog, SimulatedUserOperation, SimulationResult, SimulationVerdict,
+        };
+        let result = |full_execution: bool| SimulationResult {
+            gas_used: U256::from(120u64),
+            events: vec![SimulatedUserOperation {
+                user_operation_hash: alloy::primitives::B256::ZERO,
+                success: true,
+                actual_gas_used: U256::from(90u64),
+            }],
+            logs: vec![SimulatedLog {
+                address: TREASURY,
+                topics: Vec::new(),
+                data: Default::default(),
+            }],
+            full_execution,
+        };
+        assert_eq!(
+            OperationSimVerdict::from(SimulationVerdict::Success(result(true))),
+            OperationSimVerdict::Executed(BundleSimulationData {
+                gas_used: U256::from(120u64),
+                operation_gas_used: vec![U256::from(90u64)],
+                logs: vec![crate::settlement::SettlementLog {
+                    address: TREASURY,
+                    topics: Vec::new(),
+                    data: Default::default(),
+                }],
+            })
+        );
+        // The Pimlico eth_call: gas 0, no logs — never a bundle's evidence.
+        assert_eq!(
+            OperationSimVerdict::from(SimulationVerdict::Success(result(false))),
+            OperationSimVerdict::Success
+        );
     }
 
     #[test]

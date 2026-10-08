@@ -419,6 +419,7 @@ async fn simulate_with_pimlico(
                 actual_gas_used: U256::ZERO,
             }],
             logs: Vec::new(),
+            full_execution: false,
         }),
         Err(RpcError::Reverted { message, data }) => {
             if revert_reports_nonce_mismatch(&message, data.as_deref()) {
@@ -475,6 +476,7 @@ async fn simulate_bundle_with_eth_call(
                     })
                     .collect(),
                 logs: Vec::new(),
+                full_execution: false,
             }),
             None => SimulationVerdict::Transient(
                 "Pimlico eth_call fallback returned an invalid eth_estimateGas quantity",
