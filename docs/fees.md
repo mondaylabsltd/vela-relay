@@ -279,7 +279,7 @@ for byte (`2 × base_fee + market tip`, the market tip signed).
 ```
 window    = eth_feeHistory over the chain's last minute of blocks, at least 20   (tip_window_blocks)
 least     = 0.001 gwei if the window paid any tip, else 0
-node      = eth_maxPriorityFeePerGas, unless the window paid tips and it is above their median p50
+node      = eth_maxPriorityFeePerGas, unless it is above the window's median p50 and that median is a tip
 rewarded  = max( the window's median p25 , least )
 
 busy window  (mean gasUsedRatio ≥ 30%):   tip[slow] = max(rewarded, node),  tip[standard] = max(median p50, slow),
@@ -287,7 +287,7 @@ busy window  (mean gasUsedRatio ≥ 30%):   tip[slow] = max(rewarded, node),  ti
 quiet window (mean gasUsedRatio < 30%):   tip[slow] = max(node, least) (rewarded without a node),
                                           tip[standard] = max(min(1.25 × slow, median p50), slow),
                                           tip[fast] = max(min(2 × slow, median p70), standard)
-tips.floor = rewarded (the node's tip where the window paid none); below a 40% mean, the lower of
+tips.floor = rewarded (the node's tip where the median block paid none); below a 40% mean, the lower of
              that and the quiet tip[slow]                                                     (TierTips)
 
 absent  ⇒ cap = 2 × base_fee + market_tip,  signed tip = market_tip           (unchanged)
@@ -334,8 +334,9 @@ alike (`TierTips::resolve`).
   0.1, 1 and 3 gwei over blocks whose median paid 0.05 (2026-10-09), and an
   executor reading 1 gwei signed `slow` at 1 gwei — holding, then rejecting,
   every send quoted at 0.05. An answer above the window's median p50 is that
-  node's opinion and is left out. A window that paid no tip at all (Stable,
-  XRPL EVM) contradicts nothing, and the node is believed.
+  node's opinion and is left out. A window whose median block paid no tip
+  (Stable, XRPL EVM, Arbitrum: blocks nearly empty) contradicts nothing, and
+  the node is believed, as before.
 - **A quiet window signs the node's tip.** Where the window's blocks used less
   than 30% of their gas limit on average, every transaction paying the
   chain's minimum fits in the next block, and the percentiles are what a few

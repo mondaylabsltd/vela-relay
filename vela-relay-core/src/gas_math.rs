@@ -184,7 +184,8 @@ pub struct TierTips {
     /// to before the executor holds it (`settlement::decide_submission_fees`):
     /// the window's own 25th-percentile reward — what a quarter of its gas
     /// really paid, which no node's opinion moves (the node's tip where the
-    /// window paid none, since empty blocks prove nothing) — and, in a window that may
+    /// median block paid none, since empty blocks prove nothing) — and, in a
+    /// window that may
     /// have been quiet when the quote was read
     /// ([`NEAR_UNCONGESTED_GAS_USED_RATIO_BPS`]), the quiet reading's `slow`
     /// tip if that is lower. Never above `slow`. A quote read from another
@@ -222,7 +223,7 @@ impl TierTips {
     ///
     /// ```text
     /// least     = MIN_POSITIVE_TIP if the window paid any tip, else 0
-    /// node      = the market tip, where the window paid no tip or it is ≤ the median p50;
+    /// node      = the market tip, where it is ≤ the median p50 or that median is zero;
     ///             otherwise no floor at all
     /// rewarded  = max( median p25 , least )                     the window's own slow price
     ///
@@ -231,8 +232,8 @@ impl TierTips {
     /// quiet (mean gasUsedRatio < 30%):
     ///   slow = max( node , least ) — or `rewarded` when the node's answer was discarded —
     ///   standard = max( min( 1.25 × slow , median p50 ) , slow ),  fast = max( min( 2 × slow , median p70 ) , standard )
-    /// floor = rewarded — the node's tip where the window paid none — or the
-    ///         lower of that and the quiet slow below a 40% mean
+    /// floor = rewarded — the node's tip where the median block paid none —
+    ///         or the lower of that and the quiet slow below a 40% mean
     /// ```
     ///
     /// **The node's tip is a floor only where the blocks do not contradict
@@ -244,9 +245,9 @@ impl TierTips {
     /// block's median paid 0.05 (2026-10-09). The quote and the executor ask
     /// different nodes, so an executor reading 1 gwei held — then rejected —
     /// sends quoted at 0.05; above the median the answer is that node's
-    /// opinion, and it is left out. A window that paid no tip at all (Stable,
-    /// XRPL EVM: every reward zero) says nothing either way, and the node is
-    /// believed as before.
+    /// opinion, and it is left out. A window whose median block paid no tip
+    /// (Stable, XRPL EVM, Arbitrum: rewards almost all zero, blocks almost
+    /// empty) says nothing either way, and the node is believed, as before.
     ///
     /// **A quiet window signs the node's tip.** Where blocks have room for
     /// every transaction paying the minimum, the percentiles price a few bots'
@@ -285,14 +286,16 @@ impl TierTips {
             .iter()
             .any(|row| row.iter().any(|reward| *reward > 0));
         let least = if paid_any { MIN_POSITIVE_TIP } else { 0 };
-        let node = (!paid_any || market_tip <= median(1)).then_some(market_tip);
+        // The window is evidence of what the chain takes only where its median
+        // block paid a tip; a column of mostly zeros may be empty blocks.
+        let evidence = median(1) > 0;
+        let node = (!evidence || market_tip <= median(1)).then_some(market_tip);
         let rewarded = median(0).max(least);
         let quiet_slow = node.map_or(rewarded, |tip| tip.max(least));
         // The least tip the window proves the chain takes: a quarter of its
-        // gas paid `rewarded` or less. A window that paid no tip proves
-        // nothing (its blocks may simply be empty), and the node's answer
+        // gas paid `rewarded` or less. Without evidence the node's answer
         // stands.
-        let proven = if paid_any { rewarded } else { quiet_slow };
+        let proven = if evidence { rewarded } else { quiet_slow };
         let ratio = window.gas_used_ratio_bps;
         if ratio.is_some_and(|ratio| ratio < UNCONGESTED_GAS_USED_RATIO_BPS) {
             let standard = scaled_market_tip(SubmissionTier::Standard, quiet_slow)?
@@ -1494,6 +1497,19 @@ mod tests {
                 standard: 50_000_000,
                 fast: 100_000_000,
                 floor: 1_100_000,
+            }
+        );
+        // A window whose median block paid no tip is no evidence against the
+        // node (XRPL EVM, 2026-10-09: blocks almost empty, the node 0.2141
+        // gwei): it is believed, and is the floor, as before.
+        let xrpl = [[0, 0, 0], [0, 0, 0], [0, 0, 3_000_000]];
+        assert_eq!(
+            TierTips::from_window(&window(&xrpl, Some(0)), 214_100_000).unwrap(),
+            TierTips {
+                slow: 214_100_000,
+                standard: 214_100_000,
+                fast: 214_100_000,
+                floor: 214_100_000,
             }
         );
         // An answer at or below the median is still a floor: a chain's
