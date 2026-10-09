@@ -2065,9 +2065,9 @@ fn broadcast_reply(
     }
 }
 
-/// Docker engine `transaction_context`: one five-call batch (estimate, block,
-/// tip, nonce, balance) with the legacy-gas-price tip fallback; every error
-/// string byte-identical.
+/// Docker engine `transaction_context`: one six-call batch (estimate, block,
+/// tip, nonce, balance, the tier tips' fee history) with the legacy-gas-price
+/// tip fallback; every error string byte-identical.
 async fn transaction_context(
     trusted: &TrustedRpcClient<'_>,
     chain_id: u64,
@@ -2100,6 +2100,11 @@ async fn transaction_context(
         RpcBatchCall {
             method: "eth_getBalance",
             params: json!([relayer.to_string(), "pending"]),
+        },
+        // The tier tips, read by the rule the quote reads them with.
+        RpcBatchCall {
+            method: "eth_feeHistory",
+            params: vela_relay_core::gas_math::tip_history_params(),
         },
     ];
     let responses = trusted
@@ -2138,6 +2143,12 @@ async fn transaction_context(
     let nonce = u64::try_from(response_quantity(&responses, 3, "eth_getTransactionCount")?)
         .map_err(|_| "relayer nonce exceeds uint64".to_owned())?;
     let relayer_balance = response_quantity(&responses, 4, "eth_getBalance")?;
+    // A failed or unreadable fee history is not fatal: the tiers then scale
+    // the market tip, as the quote does without one.
+    let tip_rewards = responses
+        .get(5)
+        .and_then(|response| response.as_ref().ok())
+        .and_then(vela_relay_core::gas_math::tip_rewards);
 
     Ok(core_execution::TransactionContext {
         estimated_gas,
@@ -2146,6 +2157,7 @@ async fn transaction_context(
         max_priority_fee_per_gas: tip,
         nonce,
         relayer_balance,
+        tip_rewards,
     })
 }
 

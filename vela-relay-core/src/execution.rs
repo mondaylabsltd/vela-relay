@@ -212,6 +212,12 @@ pub struct TransactionContext {
     pub max_priority_fee_per_gas: u128,
     pub nonce: u64,
     pub relayer_balance: U256,
+    /// The reward rows of `eth_feeHistory(TIP_WINDOW_BLOCKS, "latest",
+    /// TIP_REWARD_PERCENTILES)` read beside the rest — the tier tips are
+    /// resolved from them exactly as the quote resolves them
+    /// ([`crate::gas_math::TierTips`]). `None` when the call failed or the
+    /// answer carried no readable rewards: the tiers then scale the market tip.
+    pub tip_rewards: Option<Vec<Vec<u128>>>,
 }
 
 /// The signed outer transaction as produced by the shell's keystore.
@@ -1629,6 +1635,13 @@ async fn execute_with_lane_lease(
         max_priority_fee_per_gas: context.max_priority_fee_per_gas,
         inclusion_floor_bps: policy.settlement_inclusion_floor_bps,
         requested_tier: bundle_submission_tier(&survivors),
+        // The tier tips the quote showed, from the same rule over the blocks
+        // just before this submission.
+        tier_tips: crate::gas_math::TierTips::resolve(
+            context.tip_rewards.as_deref(),
+            context.max_priority_fee_per_gas,
+        )
+        .unwrap_or_default(),
     };
     // A client may name how fast it wants its operation in. Resolving the name
     // here, against the base fee and tip the shell just read, is what makes a
@@ -3595,6 +3608,7 @@ mod tests {
             max_priority_fee_per_gas: 0,
             nonce: 7,
             relayer_balance: U256::from(10_000u64),
+            tip_rewards: None,
         }
     }
 
@@ -4316,15 +4330,16 @@ mod tests {
     }
 
     #[test]
-    fn a_client_named_speed_signs_above_the_pace_the_relay_keeps_on_its_own() {
-        // The same batch as the test above, but the client asked for `fast`
-        // and paid 420 instead of 280. Base fee 1, tip 0: the relay's own cap
-        // is 2 and `fast` asks for 3×1 = 3, which 420 funds exactly
-        // (300 gas cost × 1.4 = 420). So the outer transaction is signed at 3
-        // — strictly faster than the 2 the untiered twin signs at, which is
-        // the whole point of the feature and the direction a reported-tier
-        // price would have got wrong.
-        let fixture = fixture_at(420, SubmissionTier::Fast);
+    fn a_client_named_speed_signs_the_reward_percentile_tip_the_quote_showed() {
+        // The client asked for `fast` on Ethereum's shape of market: base
+        // 1 gwei and a node that suggests no tip at all, while the blocks'
+        // rewards read 0.2 / 1.0 / 1.5 gwei at the 25th / 50th / 70th
+        // percentile. The relay's own pace signs 2 gwei with that zero tip;
+        // `fast` signs its cap 1.75 × 1 + 1.5 = 3.25 gwei and TIPS 1.5 gwei —
+        // the tip `pimlico_getUserOperationGasPrice` reported for `fast` from
+        // the same rows. 100 gas at 3.25 gwei × 1.4 = 455 gwei funds it
+        // exactly.
+        let fixture = fixture_at(455_000_000_000, SubmissionTier::Fast);
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
         let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
 
@@ -4386,7 +4401,16 @@ mod tests {
                 entry_point,
                 calldata: calldata.clone(),
             },
-            ExecutionOutcome::Context { context: context() },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    base_fee_per_gas: 1_000_000_000,
+                    max_fee_per_gas: 2_000_000_000,
+                    max_priority_fee_per_gas: 0,
+                    relayer_balance: U256::from(1_000_000_000_000u64),
+                    tip_rewards: Some(vec![vec![200_000_000, 1_000_000_000, 1_500_000_000]; 20]),
+                    ..context()
+                },
+            },
         );
         // The one line an operator can read the decision off: the speed asked
         // for, the cap the relay would have used, and what it resolved to.
@@ -4394,14 +4418,10 @@ mod tests {
             ExecutionOperation::EmitDiagnostic {
                 diagnostic: ExecutionDiagnostic::SubmissionTierCap {
                     tier: SubmissionTier::Fast,
-                    quoted_fee: 2,
-                    cap: 3,
-                    base_fee: 1,
-                    // This market has no tip at all, so `2 ×` it is still 0
-                    // and only the cap can differ. The tip-scaling half of a
-                    // tier is exercised by
-                    // `a_named_speed_signs_the_tiers_tip_not_the_market_one`.
-                    tip: 0,
+                    quoted_fee: 2_000_000_000,
+                    cap: 3_250_000_000,
+                    base_fee: 1_000_000_000,
+                    tip: 1_500_000_000,
                     market_tip: 0,
                 },
             },
@@ -4424,9 +4444,9 @@ mod tests {
                 request: super::BundleSignRequest {
                     nonce: 7,
                     gas_limit: 100,
-                    // 3, not the 2 the untiered pipeline signs at.
-                    max_fee_per_gas: 3,
-                    max_priority_fee_per_gas: 0,
+                    // The tier's pair, not the untiered 2 gwei and no tip.
+                    max_fee_per_gas: 3_250_000_000,
+                    max_priority_fee_per_gas: 1_500_000_000,
                     entry_point,
                     calldata,
                 },
@@ -4501,9 +4521,11 @@ mod tests {
         // (base 100, market tip 40) through the whole pipeline and pins BOTH
         // numbers in the signed request.
         //
-        // fast: cap = 3 × 100 + 2 × 40 = 380, tip = 80.
-        // Funding: 100 gas at the untiered quote 240 costs 24_000, × 1.4 =
-        // 33_600 required; 60_000 paid funds a 428 cap, so nothing clamps.
+        // No reward column in this market, so the tier tips are the market
+        // tip scaled 1.00 / 1.25 / 2.00: fast: cap = 1.75 × 100 + 80 = 255,
+        // tip = 80. Funding: 100 gas at the untiered quote 240 costs 24_000,
+        // × 1.4 = 33_600 required; 60_000 paid funds a 428 cap, so nothing
+        // clamps.
         let fixture = fixture_at(60_000, SubmissionTier::Fast);
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
         let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
@@ -4574,6 +4596,7 @@ mod tests {
                     max_priority_fee_per_gas: 40,
                     nonce: 7,
                     relayer_balance: U256::from(1_000_000u64),
+                    tip_rewards: None,
                 },
             },
         );
@@ -4585,7 +4608,7 @@ mod tests {
                 diagnostic: ExecutionDiagnostic::SubmissionTierCap {
                     tier: SubmissionTier::Fast,
                     quoted_fee: 240,
-                    cap: 380,
+                    cap: 255,
                     base_fee: 100,
                     tip: 80,
                     market_tip: 40,
@@ -4610,10 +4633,10 @@ mod tests {
                 request: super::BundleSignRequest {
                     nonce: 7,
                     gas_limit: 100,
-                    // Both levers, not one. 380 = 3 × 100 + 80, and the tip
-                    // is `fast`'s 80 — the market 40 would have bought the
-                    // same block as `slow`.
-                    max_fee_per_gas: 380,
+                    // Both levers, not one. 255 = 1.75 × 100 + 80, and the
+                    // tip is `fast`'s 80 — the market 40 would have bought
+                    // the same block as `slow`.
+                    max_fee_per_gas: 255,
                     max_priority_fee_per_gas: 80,
                     entry_point,
                     calldata,

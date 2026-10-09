@@ -563,22 +563,61 @@ pub enum InBandGasQuoteAsset {
     Erc20,
 }
 
-/// One tier of `pimlico_getUserOperationGasPrice`. The last two fields are
+/// One tier of `pimlico_getUserOperationGasPrice`. The last three fields are
 /// the Vela extension the in-band fee contract is built on
-/// (`docs/fees.md` §2b): a generic bundler omits them, this relay never does.
+/// (`docs/fees.md` §2b): a generic bundler omits them.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GasPriceTier {
     /// The cap the relay will submit this tier at.
     pub max_fee_per_gas: Quantity,
+    /// The tip the relay will sign this tier with.
     pub max_priority_fee_per_gas: Quantity,
-    /// `R`: what the client's in-band reimbursement must be priced against.
-    /// Absent, vela-core silently falls back to its own chain measurement and
-    /// every tier costs the same — the defect this field exists to close.
+    /// `R`: what a wallet pricing the gas LIMITS reimburses against, frozen at
+    /// its definition before `settlementGas` (`docs/fees.md` §3).
     pub network_fee_per_gas: Quantity,
-    /// `maxFeePerGas − networkFeePerGas`, the inclusion headroom above the
-    /// reimbursement basis. Reported so no client has to infer it.
+    /// `maxFeePerGas − networkFeePerGas`, saturating at zero.
     pub relayer_fee_per_gas: Quantity,
+    /// The wei per unit of `settlementGas` a client pays for this tier:
+    /// `settlement markup × drift allowance × maxFeePerGas`, rounded up
+    /// (`gas_math::in_band_fee_per_gas`). Published exactly where
+    /// `eth_estimateUserOperationGas` returns `settlementGas` — on a chain whose
+    /// executor bills the gas a bundle uses — and absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_band_fee_per_gas: Option<Quantity>,
+}
+
+/// The wire rows for the three quoted tiers, shared by both shells so the
+/// bytes cannot drift. `inBandFeePerGas` is priced with the executor's own
+/// markup (`terms`) and published only where `settlementGas` is
+/// ([`crate::cost::SettlementGasRule::Measured`]).
+pub fn gas_price_tiers(
+    tiers: crate::gas_math::GasPriceTiers,
+    chain_id: u64,
+    terms: &crate::cost::BillingTerms,
+) -> UserOperationGasPrice {
+    let measured =
+        crate::cost::settlement_gas_rule(chain_id) == crate::cost::SettlementGasRule::Measured;
+    let tier = |price: crate::gas_math::GasPrice| GasPriceTier {
+        max_fee_per_gas: format!("0x{:x}", price.max_fee_per_gas),
+        max_priority_fee_per_gas: format!("0x{:x}", price.max_priority_fee_per_gas),
+        network_fee_per_gas: format!("0x{:x}", price.network_fee_per_gas),
+        relayer_fee_per_gas: format!("0x{:x}", price.relayer_fee_per_gas),
+        in_band_fee_per_gas: measured
+            .then(|| {
+                crate::gas_math::in_band_fee_per_gas(
+                    price.max_fee_per_gas,
+                    terms.settlement_markup_bps,
+                )
+            })
+            .flatten()
+            .map(|fee| format!("0x{fee:x}")),
+    };
+    UserOperationGasPrice {
+        slow: tier(tiers.slow),
+        standard: tier(tiers.standard),
+        fast: tier(tiers.fast),
+    }
 }
 
 pub use crate::task::UserOperationStatus as UserOperationStatusKind;

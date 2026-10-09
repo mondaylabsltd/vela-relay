@@ -391,7 +391,10 @@ async fn rpc_dispatch(
             {
                 Ok(quote) => {
                     *rpc_domain = Some(quote.rpc_domain);
-                    result_value(request.id, gas_price_result(quote.tiers))
+                    result_value(
+                        request.id,
+                        wire::gas_price_tiers(quote.tiers, chain_id, &config.billing_terms()),
+                    )
                 }
                 Err(error) => {
                     worker::console_warn!(
@@ -529,25 +532,6 @@ async fn estimate_gas(
         );
     }
     Ok((outcome.estimate, validation.domain))
-}
-
-/// The docker handler's tier → wire conversion, byte-for-byte.
-fn gas_price_result(
-    tiers: vela_relay_core::gas_math::GasPriceTiers,
-) -> vela_relay_core::wire::UserOperationGasPrice {
-    fn tier(price: vela_relay_core::gas_math::GasPrice) -> vela_relay_core::wire::GasPriceTier {
-        vela_relay_core::wire::GasPriceTier {
-            max_fee_per_gas: format!("0x{:x}", price.max_fee_per_gas),
-            max_priority_fee_per_gas: format!("0x{:x}", price.max_priority_fee_per_gas),
-            network_fee_per_gas: format!("0x{:x}", price.network_fee_per_gas),
-            relayer_fee_per_gas: format!("0x{:x}", price.relayer_fee_per_gas),
-        }
-    }
-    vela_relay_core::wire::UserOperationGasPrice {
-        slow: tier(tiers.slow),
-        standard: tier(tiers.standard),
-        fast: tier(tiers.fast),
-    }
 }
 
 fn gas_price_error(error: vela_relay_core::gas_math::GasPriceError) -> RpcError {

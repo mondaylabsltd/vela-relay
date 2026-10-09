@@ -38,13 +38,13 @@ Call `POST /{chainId}` with the following request body:
 }
 ```
 
-The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it takes the base fee from `eth_feeHistory` and the tip from `eth_maxPriorityFeePerGas` (then `eth_gasPrice` minus the latest base fee) — the same tip rule the executor signs with, `gas_math::market_tip`. If fee history is unavailable, it falls back to `eth_gasPrice` for legacy-compatible pricing. `docs/fees.md` §2b has the per-tier arithmetic.
+The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it reads `eth_feeHistory(20, "latest", [25, 50, 70])` — the next block's base fee, and the reward rows each tier's tip is the 20-block median of — beside `eth_maxPriorityFeePerGas` (then `eth_gasPrice` minus the latest base fee), the tip that floors `slow`. The executor reads the same fee history when it signs, by the same rule, so the tip quoted for a tier is the tip it is signed with. If fee history is unavailable, it falls back to `eth_gasPrice` as an all-tip market. `docs/fees.md` §2a–§2c has the per-tier arithmetic and how its numbers were chosen.
 
-The manager returns slow (100%), standard (110%), and fast (120%) tiers. `maxFeePerGas` and `maxPriorityFeePerGas` are scaled independently, while preserving `maxFeePerGas >= maxPriorityFeePerGas`.
+Each tier reports `maxFeePerGas` (the cap the relay submits at: 1.5 / 1.5 / 1.75 × base fee + the tier's tip), `maxPriorityFeePerGas` (the tier's tip), `networkFeePerGas` and `relayerFeePerGas` (the reimbursement basis of wallets that price the gas limits, frozen), and — where `eth_estimateUserOperationGas` returns `settlementGas` — `inBandFeePerGas`, the wei per unit of `settlementGas` a client pays for the tier (the settlement markup × the cap).
 
 Successful gas-price quotes are cached for five seconds. The cache is isolated by `chainId` and caller-provided RPC identity, so callers with different RPC headers never share a quote. Concurrent cache misses for the same key are coalesced into one upstream calculation.
 
-Response:
+Response (Ethereum, block 26,149,237 — `docs/fees.md` §2a):
 
 ```json
 {
@@ -52,16 +52,25 @@ Response:
   "id": 1,
   "result": {
     "slow": {
-      "maxFeePerGas": "0x829b42b5",
-      "maxPriorityFeePerGas": "0x829b42b5"
+      "maxFeePerGas": "0x101bacf62",
+      "maxPriorityFeePerGas": "0x8c7ef3a",
+      "networkFeePerGas": "0x955e867f",
+      "relayerFeePerGas": "0x6c5c48e3",
+      "inBandFeePerGas": "0x11b80b0ec"
     },
     "standard": {
-      "maxFeePerGas": "0x88d36a75",
-      "maxPriorityFeePerGas": "0x88d36a75"
+      "maxFeePerGas": "0x1348daa28",
+      "maxPriorityFeePerGas": "0x3b9aca00",
+      "networkFeePerGas": "0xc728b354",
+      "relayerFeePerGas": "0x6d64f6d4",
+      "inBandFeePerGas": "0x15368a193"
     },
     "fast": {
-      "maxFeePerGas": "0x8f0b9234",
-      "maxPriorityFeePerGas": "0x8f0b9234"
+      "maxFeePerGas": "0x18d6ffe0f",
+      "maxPriorityFeePerGas": "0x6aff4de0",
+      "networkFeePerGas": "0x12abd0cfe",
+      "relayerFeePerGas": "0x62b2f111",
+      "inBandFeePerGas": "0x1b52e6444"
     }
   }
 }

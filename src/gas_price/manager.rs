@@ -1,7 +1,7 @@
 use std::{future::Future, time::Duration};
 
 use axum::http::HeaderValue;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 // All price arithmetic lives in the decision core; this manager owns polling,
@@ -11,7 +11,7 @@ use vela_relay_core::gas_math::{
     tiers,
 };
 pub use vela_relay_core::gas_math::{
-    GasPrice, GasPriceError, GasPricePolicy, GasPriceTiers, NetworkGasPrice,
+    GasPriceError, GasPricePolicy, GasPriceTiers, NetworkGasPrice,
 };
 
 use crate::utils::rpc;
@@ -21,11 +21,6 @@ use super::{
     chains::{ArbitrumManager, CitreaManager, MantleManager, OptimismManager},
 };
 
-const FEE_HISTORY_BLOCK_COUNT: &str = "0x5";
-// Still requested, so the call stays byte-identical to the one every upstream
-// has been answering, but the reward column is no longer read: the tip is the
-// node's `eth_maxPriorityFeePerGas` (`gas_math::market_tip`).
-const FEE_HISTORY_PERCENTILES: [u8; 3] = [25, 50, 75];
 const DEFAULT_HISTORY_SIZE: usize = 32;
 const RESPONSE_BUDGET: Duration = Duration::from_millis(2_800);
 const PRICE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -130,7 +125,7 @@ impl GasPriceManager {
                 chain_id,
                 user_rpc_url,
                 "eth_feeHistory",
-                json!([FEE_HISTORY_BLOCK_COUNT, "latest", FEE_HISTORY_PERCENTILES]),
+                vela_relay_core::gas_math::tip_history_params(),
             ),
             quantity(chain_id, user_rpc_url, "eth_maxPriorityFeePerGas"),
         );
