@@ -272,9 +272,6 @@ pub fn finish(
     let pre_verification_gas = plan
         .operation
         .pre_verification_gas(&plan.simulation_call_data);
-    let declared = verification_gas_limit
-        .saturating_add(call_gas_limit)
-        .saturating_add(pre_verification_gas);
     let settlement_gas = (crate::cost::settlement_gas_rule(plan.chain_id)
         == crate::cost::SettlementGasRule::Measured)
         .then_some(execution_gas)
@@ -284,12 +281,16 @@ pub fn finish(
                 plan,
                 pre_op_gas,
                 execution_gas,
-                [verification_gas_limit, call_gas_limit, pre_verification_gas],
+                [
+                    verification_gas_limit,
+                    call_gas_limit,
+                    pre_verification_gas,
+                    paymaster_verification_gas_limit,
+                    paymaster_post_op_gas_limit,
+                ],
                 terms,
             )
-        })
-        // Never above the limits it is returned beside.
-        .map(|gas| gas.min(declared));
+        });
     Ok(EstimateOutcome {
         estimate: UserOperationGasEstimate {
             pre_verification_gas: quantity(pre_verification_gas),
@@ -319,12 +320,22 @@ pub fn finish(
 /// the signature the request carried and an all-`0xff` beneficiary (the most
 /// a 20-byte address can cost). Predicted this way the four mined operations
 /// in [`ENTRY_POINT_OVERHEAD_GAS`] come out 0.2–6% above the gas they used.
-/// `None` on overflow.
+///
+/// Billed by the executor's own rule, [`crate::cost::billed_gas`]: the buffer
+/// never takes it above the limits returned beside it (verification, call,
+/// pre-verification and any paymaster limits), as the executor caps it at the
+/// limits the operation is signed with. `None` on overflow.
 fn settlement_gas(
     plan: &EstimatePlan,
     pre_op_gas: u128,
     execution_gas: u128,
-    [verification_gas_limit, call_gas_limit, pre_verification_gas]: [u128; 3],
+    [
+        verification_gas_limit,
+        call_gas_limit,
+        pre_verification_gas,
+        paymaster_verification_gas_limit,
+        paymaster_post_op_gas_limit,
+    ]: [u128; 5],
     terms: &crate::cost::BillingTerms,
 ) -> Option<u128> {
     let handle_ops = plan.operation.handle_ops_calldata(
@@ -337,8 +348,14 @@ fn settlement_gas(
         .checked_add(pre_op_gas)?
         .checked_add(execution_gas)?
         .checked_add(ENTRY_POINT_OVERHEAD_GAS)?;
-    u128::try_from(crate::cost::buffered_gas(
+    let declared = verification_gas_limit
+        .checked_add(call_gas_limit)?
+        .checked_add(pre_verification_gas)?
+        .checked_add(paymaster_verification_gas_limit)?
+        .checked_add(paymaster_post_op_gas_limit)?;
+    u128::try_from(crate::cost::billed_gas(
         alloy::primitives::U256::from(used),
+        Some(alloy::primitives::U256::from(declared)),
         terms.gas_buffer_bps,
         terms.fixed_gas_buffer,
     )?)
@@ -1295,6 +1312,86 @@ mod tests {
         .unwrap()
         .estimate;
         assert_eq!(blind.settlement_gas, None);
+    }
+
+    /// Review F8: the estimate capped `settlementGas` at the limits it
+    /// returned, the executor its bill at the outer gas allocation — which,
+    /// built on the same measurement plus the same buffer, never binds. Where
+    /// the buffer outgrows an operation's limits (here an operator's 200,000
+    /// fixed buffer over the 2026-10-02 send) the wallet was promised 316,696
+    /// gas and billed 378,070, and its payment came up short. Both now bill
+    /// by one rule, `cost::billed_gas`, over the same limits.
+    #[test]
+    fn the_estimate_promises_the_gas_the_executor_bills_when_the_buffer_outgrows_the_limits() {
+        use alloy::primitives::U256;
+        let terms = crate::cost::BillingTerms {
+            fixed_gas_buffer: 200_000,
+            ..crate::cost::BillingTerms::default()
+        };
+        let plan = super::plan(
+            1,
+            estimation_request(
+                "0x88cca0eedbf2c4426110bbfc998f048689266894",
+                "0x1",
+                None,
+                SEND_OF_2026_10_02_CALL_DATA,
+            ),
+            ENTRY_POINT,
+            None,
+        )
+        .unwrap();
+        let estimate = super::finish(
+            &plan,
+            &json!(MAINNET_VALIDATION_DEPLOYED),
+            super::CallGasSource::Estimated(json!("0x12b7d")),
+            &terms,
+        )
+        .unwrap()
+        .estimate;
+        let declared = quantity_of(&estimate.verification_gas_limit)
+            + quantity_of(&estimate.call_gas_limit)
+            + quantity_of(&estimate.pre_verification_gas);
+        assert_eq!(declared, 316_696);
+        let promised = quantity_of(estimate.settlement_gas.as_deref().unwrap());
+        assert_eq!(promised, 316_696);
+
+        // The executor, measuring the gas the estimate predicted (154,843)
+        // in a bundle of this one operation signed with these limits.
+        let measured = U256::from(154_843u64);
+        let limit = crate::cost::allocate_bundle_gas(
+            measured,
+            U256::from(322_126u64),
+            &[U256::from(231_186u64)],
+            terms.gas_buffer_bps,
+            terms.fixed_gas_buffer,
+        )
+        .unwrap();
+        let bill = |declared: Option<U256>| {
+            crate::cost::settlement_gas_allocations(
+                crate::cost::SettlementGasRule::Measured,
+                Some(measured),
+                &limit,
+                &[U256::from(231_186u64)],
+                declared,
+                terms.gas_buffer_bps,
+                terms.fixed_gas_buffer,
+            )
+            .unwrap()[0]
+        };
+        assert_eq!(bill(Some(U256::from(declared))), U256::from(promised));
+        // Capped at the allocation alone, it billed the whole buffer.
+        assert_eq!(bill(None), U256::from(378_070u64));
+
+        // The cap never bills less than was measured, whatever the limits.
+        assert_eq!(
+            crate::cost::billed_gas(
+                U256::from(400_000u64),
+                Some(U256::from(300_000u64)),
+                1_500,
+                30_000
+            ),
+            Some(U256::from(400_000u64))
+        );
     }
 
     #[test]

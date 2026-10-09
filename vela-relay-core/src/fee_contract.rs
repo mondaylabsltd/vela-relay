@@ -355,6 +355,7 @@ fn avalanche_bills_at_least_the_gas_the_chain_charges() {
             Some(U256::from(used)),
             &limit,
             &[U256::from(used)],
+            None,
             1_500,
             30_000,
         )

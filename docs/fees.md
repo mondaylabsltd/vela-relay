@@ -57,11 +57,17 @@ Two gas figures exist for every bundle, and they used to be one:
 - **The settlement gas** each operation is billed for
   (`cost::settlement_gas_allocations`): on a chain that charges `gasUsed ×
   price` and whose bundle simulation ran in full (`eth_simulateV1` or
-  `debug_traceCall`), the **measured** gas plus the same buffer,
-  `cost::buffered_gas(used) = used + ⌈15% × used⌉ + 30,000`, never more than
-  the limit allocation. It is split across a bundle's operations in proportion
-  to the gas the EntryPoint accounts to each (`UserOperationEvent.actualGasUsed`),
-  summing to the total exactly; a bundle of one operation bills the whole.
+  `debug_traceCall`), the **measured** gas plus the same buffer, the buffer
+  never taking it past the operations' own declared limits:
+
+  ```
+  billed_gas(used) = min( used + ⌈15% × used⌉ + 30,000 ,  max( declared limits , used ) )      (cost::billed_gas)
+  declared limits  = Σ verificationGasLimit + callGasLimit + preVerificationGas (+ paymaster limits)
+  ```
+
+  It is split across a bundle's operations in proportion to the gas the
+  EntryPoint accounts to each (`UserOperationEvent.actualGasUsed`), summing to
+  the total exactly; a bundle of one operation bills the whole.
 
 The 2026-10-02 Ethereum send that exposed the gap (tx `0x7132ee31…`): the
 bundle used **146,824** gas, its `eth_estimateGas` was 322,126, and the relay
@@ -93,7 +99,7 @@ used = 21,000 + calldata gas of handleOps([op], 0xff…ff)     (the returned lim
      + preOpGas                                              (simulateValidation: validation, and any deployment)
      + execution                                             (the call's measured gas less its own 21,000 + calldata)
      + 10,000                                                (ENTRY_POINT_OVERHEAD_GAS)
-settlementGas = min( buffered_gas(used) , verificationGasLimit + callGasLimit + preVerificationGas )
+settlementGas = billed_gas(used)     over the limits returned beside it — the executor's own rule
 ```
 
 The execution of a **deployed** account is `eth_estimateGas` of its
@@ -107,6 +113,14 @@ measurement, as for a deployed one). Where no endpoint performs that, the old
 `eth_estimateGas` answers and `settlementGas` is omitted. It is omitted on
 every chain that is not `Measured`, too: there the executor bills the limit
 and nothing smaller can be promised.
+
+**One cap at both ends.** The estimate and the executor cap the buffer by the
+same rule over the same limits (`cost::billed_gas`). They used to differ — the
+estimate capped at the limits it returned, the executor at the outer gas
+allocation, which, built on the same measurement plus the same buffer, never
+binds — so an operation whose buffer outgrew its limits was promised less
+than it was billed (pinned by
+`the_estimate_promises_the_gas_the_executor_bills_when_the_buffer_outgrows_the_limits`).
 
 The 10,000 overhead is measured, not derived. The relay's two estimate calls,
 replayed at the parent block of four mined Vela operations (archive state),

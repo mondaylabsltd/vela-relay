@@ -49,7 +49,19 @@ pub fn allocate_bundle_gas(
 /// past its own limits, so no real execution of the bundle needs more.
 /// `None` on overflow.
 pub fn declared_bundle_gas(operations: &[&PackedOperation]) -> Option<U256> {
-    let declared = operations.iter().try_fold(U256::ZERO, |total, operation| {
+    declared_limits(operations)?
+        .checked_mul(U256::from(64u8))
+        .map(|value| value / U256::from(63u8))?
+        .checked_add(U256::from(operations.len()).checked_mul(U256::from(PER_OPERATION_OVERHEAD))?)?
+        .checked_add(U256::from(BUNDLE_OVERHEAD))
+}
+
+/// The gas the operations' own limits declare, summed: each one's
+/// verification, call, paymaster verification and postOp limits and its
+/// pre-verification gas — what `eth_estimateUserOperationGas` returned beside
+/// its `settlementGas`. `None` on overflow.
+pub fn declared_limits(operations: &[&PackedOperation]) -> Option<U256> {
+    operations.iter().try_fold(U256::ZERO, |total, operation| {
         let limits = operation.packed.accountGasLimits.as_slice();
         let paymaster = operation.packed.paymasterAndData.as_ref();
         // EntryPoint v0.7: paymaster (20) ‖ verification gas (16) ‖ postOp gas (16) ‖ data.
@@ -67,12 +79,7 @@ pub fn declared_bundle_gas(operations: &[&PackedOperation]) -> Option<U256> {
             .checked_add(paymaster_verification)?
             .checked_add(paymaster_post_op)?
             .checked_add(operation.packed.preVerificationGas)
-    })?;
-    declared
-        .checked_mul(U256::from(64u8))
-        .map(|value| value / U256::from(63u8))?
-        .checked_add(U256::from(operations.len()).checked_mul(U256::from(PER_OPERATION_OVERHEAD))?)?
-        .checked_add(U256::from(BUNDLE_OVERHEAD))
+    })
 }
 
 /// Per-operation and per-bundle headroom over the declared limits — Tempo's.
@@ -193,6 +200,32 @@ pub fn buffered_gas(gas: U256, buffer_bps: u64, fixed_buffer: u64) -> Option<U25
     .checked_add(U256::from(fixed_buffer))
 }
 
+/// The gas `used` units of measured gas are billed as on a chain that bills
+/// measured gas: [`buffered_gas`], except that the buffer never takes the
+/// bill above the operations' own `declared` limits ([`declared_limits`]) —
+/// and the bill never falls below what was used, should the limits declare
+/// less. `None` for `declared` (an overflow) leaves the buffer uncapped.
+///
+/// ONE rule for both ends of the contract: `eth_estimateUserOperationGas`
+/// prices the `settlementGas` it promises with it, over the limits it returns,
+/// and the executor bills with it over the limits the operation was signed
+/// with. They used to cap differently — the estimate at the limits, the
+/// executor at the outer gas allocation, which never binds — so an operation
+/// whose buffer outgrew its limits was promised less gas than it was billed,
+/// and its payment came up short (review F8, 2026-10-09). `None` on overflow.
+pub fn billed_gas(
+    used: U256,
+    declared: Option<U256>,
+    buffer_bps: u64,
+    fixed_buffer: u64,
+) -> Option<U256> {
+    let buffered = buffered_gas(used, buffer_bps, fixed_buffer)?;
+    Some(match declared {
+        Some(declared) => buffered.min(declared.max(used)),
+        None => buffered,
+    })
+}
+
 /// The gas each operation's reimbursement is evaluated against — its share of
 /// the bundle's settlement gas (`docs/fees.md` §1).
 ///
@@ -200,8 +233,11 @@ pub fn buffered_gas(gas: U256, buffer_bps: u64, fixed_buffer: u64) -> Option<U25
 ///   bundle in full (`measured_outer_gas` is `None`: the Pimlico `eth_call`
 ///   and the bundle's `eth_estimateGas` stand-in measure no gas), bills the
 ///   outer-limit allocation exactly as before.
-/// - [`SettlementGasRule::Measured`] bills [`buffered_gas`] of the measured
-///   outer gas, never more than the limit allocation in total.
+/// - [`SettlementGasRule::Measured`] bills [`billed_gas`] of the measured
+///   outer gas over the operations' `declared` limits — the rule
+///   `settlementGas` is promised by — never more than the limit allocation in
+///   total (which, built on the same measurement plus the same buffer, never
+///   binds).
 /// - [`SettlementGasRule::MeasuredAtLeastHalfTheLimit`] also never less than
 ///   half the outer limit, rounded up — what Avalanche charges.
 ///
@@ -216,6 +252,7 @@ pub fn settlement_gas_allocations(
     measured_outer_gas: Option<U256>,
     limit_allocations: &[U256],
     per_operation_gas: &[U256],
+    declared: Option<U256>,
     buffer_bps: u64,
     fixed_buffer: u64,
 ) -> Option<Vec<U256>> {
@@ -234,7 +271,7 @@ pub fn settlement_gas_allocations(
     let limit = limit_allocations
         .iter()
         .try_fold(U256::ZERO, |sum, gas| sum.checked_add(*gas))?;
-    let mut total = buffered_gas(measured, buffer_bps, fixed_buffer)?.min(limit);
+    let mut total = billed_gas(measured, declared, buffer_bps, fixed_buffer)?.min(limit);
     if rule == SettlementGasRule::MeasuredAtLeastHalfTheLimit {
         total = total.max(ceil_div(limit, U256::from(2u8))?);
     }
@@ -424,6 +461,7 @@ mod tests {
             Some(used),
             &limit,
             &accounted,
+            None,
             1_500,
             30_000,
         )
@@ -437,6 +475,7 @@ mod tests {
                 None,
                 &limit,
                 &accounted,
+                None,
                 1_500,
                 30_000
             ),
@@ -450,6 +489,7 @@ mod tests {
                     Some(used),
                     &limit,
                     &accounted,
+                    None,
                     1_500,
                     30_000
                 ),
@@ -478,6 +518,7 @@ mod tests {
                 Some(U256::from(100_000u64)),
                 &limit,
                 &accounted,
+                None,
                 1_500,
                 30_000,
             ),
@@ -490,6 +531,7 @@ mod tests {
                 Some(U256::from(500_000u64)),
                 &limit,
                 &accounted,
+                None,
                 1_500,
                 30_000,
             ),
@@ -507,6 +549,7 @@ mod tests {
             Some(U256::from(414_000u64)),
             &limit,
             &accounted,
+            None,
             1_500,
             30_000,
         )
@@ -520,6 +563,7 @@ mod tests {
             Some(U256::from(100_001u64)),
             &[U256::from(500_000u64); 3],
             &[U256::ZERO; 3],
+            None,
             0,
             0,
         )
@@ -539,6 +583,7 @@ mod tests {
                 Some(U256::from(1_000_000u64)),
                 &[U256::from(300_000u64)],
                 &[U256::from(1u64)],
+                None,
                 1_500,
                 30_000,
             ),

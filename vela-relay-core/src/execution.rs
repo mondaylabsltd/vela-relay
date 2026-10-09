@@ -1597,14 +1597,21 @@ async fn execute_with_lane_lease(
     )
     .ok_or_else(|| "bundle gas allocation overflow".to_owned())?;
     // What each operation is BILLED for: on a chain that charges the gas a
-    // transaction uses, the measured gas plus the same buffer — the figure
-    // `eth_estimateUserOperationGas` returned as `settlementGas` — never the
-    // limit (`docs/fees.md` §1).
+    // transaction uses, the measured gas plus the same buffer, the buffer
+    // capped at the operations' own limits — the rule
+    // `eth_estimateUserOperationGas` promised `settlementGas` by
+    // (`cost::billed_gas`) — never the limit (`docs/fees.md` §1).
     let allocations = crate::cost::settlement_gas_allocations(
         crate::cost::settlement_gas_rule(start.operations[0].chain_id),
         bundle_simulation.full_execution.then_some(simulated_gas),
         &limit_allocations,
         &bundle_simulation.operation_gas_used,
+        crate::cost::declared_limits(
+            &survivors
+                .iter()
+                .map(|candidate| &candidate.packed)
+                .collect::<Vec<_>>(),
+        ),
         policy.gas_buffer_bps,
         policy.fixed_gas_buffer,
     )
