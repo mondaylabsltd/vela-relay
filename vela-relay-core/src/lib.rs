@@ -14,6 +14,8 @@
 //! - [`lifecycle`] — the single authoritative status transition table and the
 //!   patch/bundle-submission decisions every durable status write flows
 //!   through.
+//! - [`nonce_slot`] — one live operation per account nonce: the slot an
+//!   admission claims, and when its holder stops holding it.
 //! - [`rejection`] — the machine reason every terminal rejection carries.
 //! - [`vault`] — deterministic HKDF key derivation for the treasury and the
 //!   relayer pool, and sender→lane routing.
@@ -64,6 +66,7 @@ pub mod funding;
 pub mod gas_math;
 pub mod hold;
 pub mod lifecycle;
+pub mod nonce_slot;
 pub mod pace;
 pub mod quote;
 pub mod receipt;

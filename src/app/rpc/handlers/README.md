@@ -289,6 +289,60 @@ The reimbursement is decoded from the signed calls, not from a wallet-supplied a
 transfer-shaped payload does not count unless it is actually nested under the trusted Safe
 MultiSend delegatecall.
 
+#### One operation per account nonce
+
+An account executes one operation per nonce, so the relay admits one at a time
+(`vela_relay_core::nonce_slot`). Before it writes any record, admission claims the operation's
+**nonce slot**, `(chainId, entryPoint, sender, nonce)` over the full 256-bit nonce (keyed nonces
+are separate slots):
+
+- **The same operation again** (same `userOpHash`, any signature) finds its own hash there and is
+  answered with that hash, as always.
+- **A different operation** is refused while the slot's holder is **live**: its record is
+  `queued`, `not_submitted` or `submitted` (waiting, funding, held for fees, or in a bundle
+  awaiting inclusion), or its own admission is still running (no record yet, or one the queue has
+  not confirmed, within 120 s of its claim).
+- Once the holder is **final** (`included`, `rejected`, `failed`), its record has expired (one
+  hour), or its admission was abandoned (still no confirmed, executor-touched record 120 s after
+  the claim), the different operation is admitted and takes the slot over. A retry after a
+  failure goes through.
+
+The refusal is the old TypeScript bundler's, byte for byte, plus structured `data`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "Already have a pending UserOperation from this sender [existingHash:0x9c1f…e47a]",
+    "data": {
+      "reason": "nonce_in_flight",
+      "existingHash": "0x9c1f…e47a",
+      "sender": "0x88cc…6894",
+      "nonce": "0x5"
+    }
+  }
+}
+```
+
+vela-wallet (v0.9.7 and later) reads the `[existingHash:0x…]` marker from the raw error and
+reports "another transaction is still pending"; the desktop app waits for it and sends again.
+
+**Two different operations at once.** Claims are atomic — a Redis Lua script on
+`vela:relay:nonce-slot:{slot}` in docker, a single-threaded RecordDO instance named
+`nonce:{slot}` on Cloudflare — so of two operations racing for one nonce exactly one claims it.
+The other finds the winner, whose record may not exist yet; a holder within its admission is live,
+so the loser is refused naming the winner. A takeover replaces only the holder the admission
+judged final, so two takeovers cannot both win either. If the winner's admission then fails before
+its record exists (store or queue unavailable), it gives the slot back, so the loser's retry is
+admitted.
+
+**Not covered.** A holder whose record expired (an operation still unsettled after an hour, such
+as a bundle wedged by a spike) no longer holds the slot; if it lands after a twin was admitted,
+the executor rejects the twin as `nonce_used`, as before. There is no fee-bump replacement: a
+different operation at a live nonce is always refused.
+
 After admission, the relay first creates a Redis record with `status: "queued"` and a one-hour
 TTL, then appends the following envelope to Iggy. It returns the `userOpHash` only after both
 writes are acknowledged; an Iggy failure removes the still-unadmitted Redis record. It does not

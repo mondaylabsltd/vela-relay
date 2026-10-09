@@ -226,6 +226,11 @@ toward the inclusion floor rather than rejecting an honest-but-short payment.
 the speed tiers and their tips, the backtest that chose the numbers, what a client
 pays, and stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
 
+One operation per account nonce is in flight at a time: `eth_sendUserOperation` refuses a
+different operation at a nonce whose earlier operation is still pending, with the
+`[existingHash:0x…]` marker wallets read, and every rejected operation's status names why in
+`rejection_reason` ([src/app/rpc/handlers/README.md](src/app/rpc/handlers/README.md)).
+
 ## HTTP endpoints
 
 | Endpoint | Purpose |

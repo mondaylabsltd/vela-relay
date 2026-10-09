@@ -138,6 +138,23 @@ impl RpcError {
         )
     }
 
+    /// `eth_sendUserOperation` refused: another operation of the sender still
+    /// holds this nonce (`nonce_slot`). The message is the old TypeScript
+    /// bundler's, byte for byte, with the `[existingHash:0x…]` marker shipped
+    /// wallets read; `data` says the same as structured fields.
+    pub fn nonce_in_flight(existing_user_operation_hash: &str, sender: &str, nonce: &str) -> Self {
+        Self::new(
+            -32602,
+            crate::nonce_slot::nonce_in_flight_message(existing_user_operation_hash),
+            Some(serde_json::json!({
+                "reason": crate::nonce_slot::NONCE_IN_FLIGHT_REASON,
+                "existingHash": existing_user_operation_hash,
+                "sender": sender,
+                "nonce": nonce,
+            })),
+        )
+    }
+
     pub fn estimation_unavailable() -> Self {
         Self::new(
             -32000,
@@ -902,6 +919,29 @@ mod tests {
         assert_eq!(
             bytes(&rejected),
             r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32500,"message":"UserOperation simulation failed","data":"in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin"}}"#
+        );
+    }
+
+    /// The refusal of a second operation at a nonce still in flight, byte for
+    /// byte: the old TypeScript bundler's code and sentence, carrying the
+    /// `[existingHash:0x…]` marker that v0.9.7 and later wallets read from the
+    /// raw error, and the same facts as structured `data`.
+    #[test]
+    fn renders_the_nonce_in_flight_refusal_with_the_marker_old_wallets_parse() {
+        let existing = "0x1c9a5c0c4e0b8e4e1f7f1e5b2a6d3c4b5a69788716253443526170819a8b7c6d";
+        let refused = RpcResponse::<Value>::error(
+            json!(7),
+            RpcError::nonce_in_flight(
+                existing,
+                "0x88cc22f5b4e0a3b1d0d3a2bd6f6e0e7f1d2f6894",
+                "0x5",
+            ),
+        );
+        assert_eq!(
+            bytes(&refused),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"error":{{"code":-32602,"message":"Already have a pending UserOperation from this sender [existingHash:{existing}]","data":{{"existingHash":"{existing}","nonce":"0x5","reason":"nonce_in_flight","sender":"0x88cc22f5b4e0a3b1d0d3a2bd6f6e0e7f1d2f6894"}}}}}}"#
+            )
         );
     }
 

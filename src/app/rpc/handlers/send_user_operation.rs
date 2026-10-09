@@ -11,6 +11,7 @@ use vela_relay_core::admission::{
     AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
     AdmissionResult, CONFLICT_MESSAGE, SubmitRequest,
 };
+use vela_relay_core::nonce_slot::NonceClaim;
 
 use crate::{
     app::AppState,
@@ -34,6 +35,10 @@ pub async fn handle(
         user_operation,
         settlement_recipient: state.settlement_recipient().map(str::to_owned),
         submission_tier,
+        now_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default(),
     })));
 
     loop {
@@ -78,6 +83,75 @@ async fn execute(
                 Ok(decimals) => AdmissionResult::Decimals { decimals },
                 Err(()) => AdmissionResult::DecimalsUnavailable,
             }
+        }
+        AdmissionOperation::ClaimNonce { slot, holder } => {
+            let Some(status_store) = state.user_operation_status_store() else {
+                return AdmissionResult::StoreFailed;
+            };
+            match status_store.claim_nonce_slot(slot, holder).await {
+                Ok(claim) => AdmissionResult::NonceClaim { claim },
+                Err(error) => {
+                    tracing::warn!(
+                        chain_id,
+                        user_operation_hash = %holder.user_operation_hash,
+                        %error,
+                        "could not claim the UserOperation nonce slot in Redis"
+                    );
+                    AdmissionResult::StoreFailed
+                }
+            }
+        }
+        AdmissionOperation::TakeOverNonce {
+            slot,
+            judged_user_operation_hash,
+            holder,
+        } => {
+            let Some(status_store) = state.user_operation_status_store() else {
+                return AdmissionResult::StoreFailed;
+            };
+            match status_store
+                .take_over_nonce_slot(slot, judged_user_operation_hash, holder)
+                .await
+            {
+                Ok(claim) => {
+                    if claim == (NonceClaim::Claimed { fresh: true }) {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %holder.user_operation_hash,
+                            previous_user_operation_hash = %judged_user_operation_hash,
+                            "UserOperation took over a nonce whose earlier operation is settled"
+                        );
+                    }
+                    AdmissionResult::NonceClaim { claim }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        chain_id,
+                        user_operation_hash = %holder.user_operation_hash,
+                        %error,
+                        "could not take over the UserOperation nonce slot in Redis"
+                    );
+                    AdmissionResult::StoreFailed
+                }
+            }
+        }
+        AdmissionOperation::ReleaseNonce {
+            slot,
+            user_operation_hash,
+        } => {
+            if let Some(status_store) = state.user_operation_status_store()
+                && let Err(error) = status_store
+                    .release_nonce_slot(slot, user_operation_hash)
+                    .await
+            {
+                tracing::warn!(
+                    chain_id,
+                    user_operation_hash = %user_operation_hash,
+                    %error,
+                    "could not release the nonce slot of a failed admission; it lapses after the admission grace"
+                );
+            }
+            AdmissionResult::NonceReleased
         }
         AdmissionOperation::CreateQueued { operation } => {
             let Some(status_store) = state.user_operation_status_store() else {
@@ -209,6 +283,23 @@ fn render(id: Value, chain_id: u64, outcome: AdmissionOutcome) -> RpcResponse<Va
                 "existing Redis admission does not match the submitted UserOperation"
             );
             RpcResponse::error(id, RpcError::invalid_params(CONFLICT_MESSAGE))
+        }
+        AdmissionOutcome::NonceInFlight {
+            existing_user_operation_hash,
+            sender_hex,
+            nonce,
+        } => {
+            tracing::info!(
+                chain_id,
+                sender = %sender_hex,
+                nonce = %nonce,
+                existing_user_operation_hash = %existing_user_operation_hash,
+                "UserOperation refused: another operation of the sender holds this nonce"
+            );
+            RpcResponse::error(
+                id,
+                RpcError::nonce_in_flight(&existing_user_operation_hash, &sender_hex, &nonce),
+            )
         }
         AdmissionOutcome::Invalid { message } => {
             RpcResponse::error(id, RpcError::invalid_params(message))

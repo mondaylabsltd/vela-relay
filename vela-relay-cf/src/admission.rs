@@ -7,6 +7,7 @@ use vela_relay_core::admission::{
     AdmissionApp, AdmissionEffect, AdmissionEvent, AdmissionOperation, AdmissionOutcome,
     AdmissionResult, CONFLICT_MESSAGE, SubmitRequest,
 };
+use vela_relay_core::nonce_slot::{NonceClaim, NonceSlot};
 use vela_relay_core::wire::{RpcError, RpcResponse, SendUserOperationParams};
 use worker::Env;
 
@@ -36,6 +37,7 @@ pub async fn handle(
         user_operation,
         settlement_recipient: config.settlement_recipient.clone(),
         submission_tier,
+        now_ms: worker::Date::now().as_millis(),
     })));
 
     loop {
@@ -83,6 +85,80 @@ async fn execute(
                 Ok(decimals) => AdmissionResult::Decimals { decimals },
                 Err(()) => AdmissionResult::DecimalsUnavailable,
             }
+        }
+        AdmissionOperation::ClaimNonce { slot, holder } => {
+            match nonce_slot_command(
+                env,
+                slot,
+                &RecordCommand::ClaimNonce {
+                    holder: holder.clone(),
+                },
+            )
+            .await
+            {
+                Ok(RecordReply::Nonce { claim }) => AdmissionResult::NonceClaim { claim },
+                _ => {
+                    worker::console_warn!(
+                        "could not claim the nonce slot for {}",
+                        holder.user_operation_hash
+                    );
+                    AdmissionResult::StoreFailed
+                }
+            }
+        }
+        AdmissionOperation::TakeOverNonce {
+            slot,
+            judged_user_operation_hash,
+            holder,
+        } => {
+            match nonce_slot_command(
+                env,
+                slot,
+                &RecordCommand::TakeOverNonce {
+                    judged_user_operation_hash: judged_user_operation_hash.clone(),
+                    holder: holder.clone(),
+                },
+            )
+            .await
+            {
+                Ok(RecordReply::Nonce { claim }) => {
+                    if claim == (NonceClaim::Claimed { fresh: true }) {
+                        worker::console_log!(
+                            "UserOperation {} took over a nonce whose earlier operation {judged_user_operation_hash} is settled",
+                            holder.user_operation_hash
+                        );
+                    }
+                    AdmissionResult::NonceClaim { claim }
+                }
+                _ => {
+                    worker::console_warn!(
+                        "could not take over the nonce slot for {}",
+                        holder.user_operation_hash
+                    );
+                    AdmissionResult::StoreFailed
+                }
+            }
+        }
+        AdmissionOperation::ReleaseNonce {
+            slot,
+            user_operation_hash,
+        } => {
+            if !matches!(
+                nonce_slot_command(
+                    env,
+                    slot,
+                    &RecordCommand::ReleaseNonce {
+                        user_operation_hash: user_operation_hash.clone(),
+                    },
+                )
+                .await,
+                Ok(RecordReply::Released { .. })
+            ) {
+                worker::console_warn!(
+                    "could not release the nonce slot of a failed admission {user_operation_hash}; it lapses after the admission grace"
+                );
+            }
+            AdmissionResult::NonceReleased
         }
         AdmissionOperation::CreateQueued { operation } => {
             if env.queue(QUEUE_BINDING).is_err() {
@@ -170,10 +246,26 @@ pub async fn record_command(
     hash: &str,
     command: &RecordCommand,
 ) -> Result<RecordReply, ()> {
+    record_instance_command(env, &format!("{chain_id}:{hash}"), command).await
+}
+
+/// One command to a nonce slot's RecordDO instance (`nonce:{slot}`), the
+/// single-threaded home of who holds that nonce.
+async fn nonce_slot_command(
+    env: &Env,
+    slot: &NonceSlot,
+    command: &RecordCommand,
+) -> Result<RecordReply, ()> {
+    record_instance_command(env, &format!("nonce:{}", slot.key()), command).await
+}
+
+async fn record_instance_command(
+    env: &Env,
+    name: &str,
+    command: &RecordCommand,
+) -> Result<RecordReply, ()> {
     let namespace = env.durable_object(RECORDS_BINDING).map_err(|_| ())?;
-    let id = namespace
-        .id_from_name(&format!("{chain_id}:{hash}"))
-        .map_err(|_| ())?;
+    let id = namespace.id_from_name(name).map_err(|_| ())?;
     let stub = id.get_stub().map_err(|_| ())?;
 
     let body = serde_json::to_string(command).map_err(|_| ())?;
@@ -222,6 +314,19 @@ fn render(id: Value, chain_id: u64, outcome: AdmissionOutcome) -> RpcResponse<Va
                 "existing admission does not match the submitted UserOperation: {user_operation_hash} existing_chain_id={existing_chain_id} existing_entry_point={existing_entry_point}"
             );
             RpcResponse::error(id, RpcError::invalid_params(CONFLICT_MESSAGE))
+        }
+        AdmissionOutcome::NonceInFlight {
+            existing_user_operation_hash,
+            sender_hex,
+            nonce,
+        } => {
+            worker::console_log!(
+                "UserOperation refused: another operation of the sender holds this nonce: chain_id={chain_id} sender={sender_hex} nonce={nonce} existing_user_operation_hash={existing_user_operation_hash}"
+            );
+            RpcResponse::error(
+                id,
+                RpcError::nonce_in_flight(&existing_user_operation_hash, &sender_hex, &nonce),
+            )
         }
         AdmissionOutcome::Invalid { message } => {
             RpcResponse::error(id, RpcError::invalid_params(message))
