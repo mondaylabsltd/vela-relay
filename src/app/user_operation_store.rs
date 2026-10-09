@@ -1748,6 +1748,8 @@ mod tests {
             transaction_hash: "0xtransaction".into(),
             nonce: 42,
             user_operation_hashes: vec!["0xuserop".into()],
+            billed_gas: None,
+            billed_fee_per_gas: None,
         };
 
         assert!(validate_prepared_bundle_intent(&intent).is_ok());
@@ -1793,6 +1795,8 @@ mod tests {
             transaction_hash: format!("0x{chain_id:x}{lane:x}{nonce:x}"),
             nonce,
             user_operation_hashes: vec!["0xuserop".into()],
+            billed_gas: None,
+            billed_fee_per_gas: None,
         };
         let payloads = [intent(10, 2, 4), intent(1, 9, 3), intent(1, 1, 8)]
             .into_iter()

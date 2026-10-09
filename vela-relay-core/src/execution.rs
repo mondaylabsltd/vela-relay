@@ -1975,6 +1975,13 @@ async fn execute_with_lane_lease(
             .iter()
             .map(|candidate| candidate.hash_string.clone())
             .collect(),
+        // What the receipt is checked against (`receipt::bundle_billing`):
+        // the gas the payments were evaluated for, at the cap signed.
+        billed_gas: allocations
+            .iter()
+            .try_fold(U256::ZERO, |sum, gas| sum.checked_add(*gas))
+            .map(|gas| format!("0x{gas:x}")),
+        billed_fee_per_gas: Some(format!("0x{:x}", outer_fee.max_fee_per_gas)),
     };
     ensure_lane_lease(ctx).await?;
     match request(
@@ -2250,6 +2257,8 @@ async fn execute_tempo_bundle(
             .iter()
             .map(|candidate| candidate.hash_string.clone())
             .collect(),
+        billed_gas: None,
+        billed_fee_per_gas: None,
     };
     ensure_lane_lease(ctx).await?;
     match request(
@@ -3748,6 +3757,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -3912,6 +3923,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x1ae7b".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -4599,6 +4612,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0xc1b71080".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -4799,6 +4814,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0xff".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -5450,6 +5467,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![hash_string.clone()],
+            billed_gas: None,
+            billed_fee_per_gas: None,
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -5780,6 +5799,8 @@ mod tests {
             transaction_hash: bundle_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -6277,6 +6298,8 @@ mod tests {
             transaction_hash: "0xbundle".into(),
             nonce: 1,
             user_operation_hashes: vec!["0x01".into(), "0x02".into(), "0x03".into(), "0x04".into()],
+            billed_gas: None,
+            billed_fee_per_gas: None,
         };
         let mut queued = fixture.record.clone();
         queued.status = UserOperationStatus::Queued;
@@ -6510,6 +6533,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {

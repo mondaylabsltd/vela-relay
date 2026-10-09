@@ -1725,6 +1725,32 @@ impl LaneDo {
         if receipt.is_null() {
             return;
         }
+        // The receipt-time check of used-gas billing (`docs/fees.md` §1a,
+        // `receipt::bundle_billing`), as the docker engine logs it.
+        if let Some(billing) = vela_relay_core::receipt::bundle_billing(intent, &receipt) {
+            let line = format!(
+                "chain_id={} lane={} transaction_hash={} operations={} billed_gas={} gas_used={} used_over_billed_bps={} billed_at_cap_wei={} charged_wei={}",
+                intent.chain_id,
+                intent.lane,
+                intent.transaction_hash,
+                intent.user_operation_hashes.len(),
+                billing.billed_gas,
+                billing.gas_used,
+                billing.used_over_billed_bps,
+                billing.billed_at_cap,
+                billing
+                    .charged
+                    .map(|charged| charged.to_string())
+                    .unwrap_or_default(),
+            );
+            if billing.under_billed {
+                worker::console_warn!(
+                    "bundle used more gas than its operations were billed for: {line}"
+                );
+            } else {
+                worker::console_log!("bundle gas used against the gas billed: {line}");
+            }
+        }
         let members: Vec<String> = self
             .state
             .storage()

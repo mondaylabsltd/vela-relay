@@ -24,7 +24,9 @@ required = max( markup × settlement_gas × cap ,  floor )
 
 - **`markup`** — default **11000 bps = 1.1×** (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`,
   hard lower bound 1.0×). Because the chain never charges more than the cap per
-  gas, this is the relay's **guaranteed** margin over the gas it is billed for;
+  gas, this is the relay's **guaranteed** margin over the gas it is billed for
+  — which on the chains that bill measured gas is not quite the gas a bundle
+  burns (§1b);
   in any calm market the cap sits well above `base + tip` and the margin is far
   larger (§2c measures it). It was 1.4× while the gas billed was the outer
   limit (§1a); the backtest in §2c chose 1.1×.
@@ -159,6 +161,46 @@ USD conversion, Binance price parse, Tempo cost) rounds **toward the relay**, an
 every multiply/scale is `checked_` and fails closed on overflow. The relay can
 never round in the payer's favor or wrap silently.
 
+## 1b. What the relay can lose
+
+The relay is paid at least `markup × billed gas × cap` and charged `gas used
+× effective gas price`, which is never more than `gas used × cap`. So it
+never loses while a bundle burns no more than `markup × billed gas`:
+
+- **`OuterLimit` chains** bill the outer gas limit, more than any execution of
+  the bundle can burn: never a loss, by construction.
+- **`Measured` chains** (and Avalanche, whose half-the-limit term is billed as
+  it is charged) bill `billed_gas(simulated)` — the simulation plus 15% plus
+  30,000 — which is not an upper bound on what the bundle burns on-chain. The
+  executor simulates at `latest` moments before signing, and a bundle burns
+  what it simulated when it reads the same state: the 2026-10-02 send burned
+  exactly its simulated 146,824. It burns more when the state it reads changed
+  in between (a storage slot written first in the meantime costs up to 20,000
+  gas more) or when its own code branches on the block it runs in. The relay
+  then loses only past `1.1 × (1.15 × simulated + 30,000)` gas — 1.49× the
+  2026-10-02 send's simulated gas, 1.33× a 504,609-gas first operation's —
+  when a spike has consumed the whole cap, and past 2.2× that send's at the
+  investigation block's prices (a `slow` cap 1.47× the effective price).
+  Whatever a bundle does it cannot burn more than its outer gas limit, so the
+  loss on one operation is at most `(gas limit − markup × billed gas) ×
+  effective price`: for that send 181,712 gas, $0.09 at its 0.2033 gwei —
+  from a payer who paid `1.1 × 198,848 × cap` for it, so a bundle built to
+  burn more than it simulated costs its sender more than it costs the relay.
+  Over the replay of §2c, at the gas it measured, the relay never earned
+  under +33% of the chain's charge.
+
+**Watched, not assumed.** Every mined bundle's receipt is checked against
+what its operations were billed for (`receipt::bundle_billing`, over the
+`billedGas` and `billedFeePerGas` its prepared intent now records). The docker
+executor logs `bundle gas used against the gas billed` (info) — or `bundle
+used more gas than its operations were billed for` (warn) — with
+`billed_gas`, `gas_used`, `used_over_billed_bps`, `billed_at_cap_wei` (`billed
+gas × cap`, the requirement before the markup) and `charged_wei` (`gas used ×
+effectiveGasPrice`); the Worker logs the same line. A warning is the event to
+look at; `charged_wei` above `1.1 × billed_at_cap_wei` would be a loss. A
+bundle of several operations is one receipt, so the line is per bundle — per
+operation for the single-operation bundles that are nearly all of them.
+
 ## 2. Repricing — the safety valve that makes a fixed client payment work
 
 A client signs its payment at quote time; the base fee at *inclusion* time may be
@@ -183,8 +225,8 @@ payment CAN cover, because the cap was headroom, not cost
 4. If `affordable` is below the inclusion floor → **FloorUnfundable**: the
    operation is held in the delayed inbox while the market may come back
    (`VELA_RELAY_EXECUTOR_SETTLEMENT_HOLD_MAX_ATTEMPTS`, 12 attempts ≈ 35 min),
-   then rejected. Never a loss — the relay never signs an outer transaction it
-   would lose money on.
+   then rejected. The relay never signs a cap the payment does not fund at the
+   gas it bills (§1b says where the gas burned can exceed that).
 
 The floor is 1.25× — two blocks of the largest EIP-1559 rise. A signed
 transaction cannot be bumped (the outbox broadcasts exact bytes), so a cap
@@ -341,7 +383,8 @@ Pinned by `the_ethereum_tiers_at_the_block_the_overcharge_was_measured`.
   `fast` neighbour can never price a slower operation out of its own bundle.
   A bundle takes the fastest speed any member named, and a member that named
   none counts as `standard`.
-- *Never at a loss.* The cap is never above what the reimbursements fund, and a
+- *Never above what the payment funds.* The cap is never above what the
+  reimbursements fund at the billed gas (§1b), and a
   payment that cannot fund even the floor at the slowest tip reaches §2's
   `FloorUnfundable` and the ordinary hold.
 - *`base + tip` is the invariant.* Every branch keeps the cap at or above the
@@ -704,10 +747,15 @@ speed.)
   is signed with, and the `0.00001`-coin / `$0.01` dust floor. It rounds every
   step in its own favor with fail-closed overflow.
 - **It bills the gas a bundle uses, not the gas it reserves** (§1a): on
-  Ethereum and the other listed chains, the measured gas plus 15% and 30,000;
-  the outer LIMIT stays estimate-based so no bundle runs out of gas. Avalanche
-  is billed at least half the signed limit, which is what it charges; every
-  other chain is billed the limit, as before.
+  Ethereum and the other listed chains, the measured gas plus 15% and 30,000
+  (never past the operations' own limits, the same cap `settlementGas` is
+  promised by); the outer LIMIT stays estimate-based so no bundle runs out of
+  gas. Avalanche is billed at least half the signed limit, which is what it
+  charges; every other chain is billed the limit, as before. A simulation
+  that measured nothing is retried, never billed, where gas is measured. The
+  measured gas plus its buffer is not an upper bound on what a bundle burns:
+  §1b bounds what that can cost (the 2026-10-02 send: at most $0.09, from a
+  payer who paid more) and every receipt is checked against it in the logs.
   `eth_estimateUserOperationGas` returns the same figure as `settlementGas`
   before the client signs, and its `verificationGasLimit` is now the measured
   validation gas.
@@ -724,7 +772,8 @@ speed.)
   bear it out. The quote and the executor read the tips by one rule, so what
   is quoted is what is signed. A payment that cannot fund its tier gives back
   cap headroom first, then priority down to what the window proves the chain
-  takes, then is held — never signed at a loss. Naming nothing is the relay's
+  takes, then is held — never signed above what the payment funds. Naming
+  nothing is the relay's
   own pace, unchanged.
 - `pimlico_getUserOperationGasPrice` reports each tier's cap and tip, its
   `inBandFeePerGas` (`markup × cap`) where `settlementGas` is returned, and a

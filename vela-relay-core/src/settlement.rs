@@ -50,9 +50,13 @@ const TRUSTED_MULTISEND: Address = address!("38869bf66a61cf6bdb996a6ae40d5853fd4
 /// The executor's default settlement markup
 /// (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`): the reimbursement must cover
 /// this multiple of the settlement gas's cost at the cap the outer
-/// transaction is signed with — the relay's GUARANTEED margin, since the
-/// chain never charges more than that cap. 1.1×, chosen by the backtest in
-/// `docs/fees.md` §2c (it was 1.4× while the gas billed was the outer limit).
+/// transaction is signed with — the relay's GUARANTEED margin over the gas it
+/// bills, since the chain never charges more than that cap. Where the gas
+/// billed is the measured gas plus its buffer, a bundle can burn more than
+/// that; `docs/fees.md` §1b bounds the loss and the receipt check
+/// (`receipt::bundle_billing`) watches for it. 1.1×, chosen by the backtest
+/// in `docs/fees.md` §2c (it was 1.4× while the gas billed was the outer
+/// limit).
 pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 11_000;
 /// The executor's default inclusion floor
 /// (`VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS`): the lowest cap,
@@ -902,9 +906,10 @@ impl std::error::Error for SettlementDecisionError {}
 /// - **What a payment funds is measured at the tier's cap.** A payment the
 ///   `$0.01` floor dominates funds far more than the gas costs; measured at
 ///   the shell's untiered quote it read as funding that quote and no more.
-/// - **Never at a loss.** The cap is never above what the reimbursements fund,
-///   and a payment that cannot fund even the floor with the slowest tip
-///   reaches [`decide_settlement`]'s `FloorUnfundable` and the ordinary hold.
+/// - **Never above what the payment funds.** The cap is never above what the
+///   reimbursements fund at the billed gas, and a payment that cannot fund
+///   even the floor with the slowest tip reaches [`decide_settlement`]'s
+///   `FloorUnfundable` and the ordinary hold.
 /// - **`base + tip` is the last word.** Every branch keeps the cap at or above
 ///   the base fee plus the tip it signs, so
 ///   [`crate::gas_math::OuterFee::delivers_full_tip_at`] holds of the result.
