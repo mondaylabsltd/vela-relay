@@ -99,6 +99,7 @@ struct TransactionContext {
     max_priority_fee_per_gas: u128,
     nonce: u64,
     relayer_balance: U256,
+    tip_window: Option<vela_relay_core::gas_math::TipWindow>,
 }
 
 #[derive(Clone, Debug)]
@@ -727,6 +728,11 @@ impl ExecutorEngine {
                 method: "eth_getBalance",
                 params: json!([relayer.to_string(), "pending"]),
             },
+            // The tier tips, read by the rule the quote reads them with.
+            RpcBatchCall {
+                method: "eth_feeHistory",
+                params: vela_relay_core::gas_math::tip_history_params(chain_id),
+            },
         ];
         let responses = self
             .rpc
@@ -774,6 +780,12 @@ impl ExecutorEngine {
         let nonce = u64::try_from(response_quantity(&responses, 3, "eth_getTransactionCount")?)
             .map_err(|_| ExecutorItemError("relayer nonce exceeds uint64".into()))?;
         let relayer_balance = response_quantity(&responses, 4, "eth_getBalance")?;
+        // A failed or unreadable fee history is not fatal: the tiers then
+        // scale the market tip, as the quote does without one.
+        let tip_window = responses
+            .get(5)
+            .and_then(|response| response.as_ref().ok())
+            .and_then(vela_relay_core::gas_math::tip_window);
 
         Ok(TransactionContext {
             estimated_gas,
@@ -782,6 +794,7 @@ impl ExecutorEngine {
             max_priority_fee_per_gas: tip,
             nonce,
             relayer_balance,
+            tip_window,
         })
     }
 
@@ -1241,6 +1254,9 @@ impl ExecutorEngine {
                 };
                 if receipt.is_null() {
                     continue;
+                }
+                if let Some(billing) = vela_relay_core::receipt::bundle_billing(&intent, &receipt) {
+                    log_bundle_billing(chain_id, &intent, &billing);
                 }
                 let persisted = match receipt_succeeded(&receipt) {
                     Some(false) => {
@@ -2052,6 +2068,7 @@ impl BatchShell<'_> {
                             max_priority_fee_per_gas: context.max_priority_fee_per_gas,
                             nonce: context.nonce,
                             relayer_balance: context.relayer_balance,
+                            tip_window: context.tip_window,
                         },
                     },
                     Err(error) => Out::Failed {
@@ -2938,6 +2955,47 @@ fn unique_token(prefix: &str) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{prefix}:{}:{timestamp}:{counter}", std::process::id())
+}
+
+/// The receipt-time check of used-gas billing (`docs/fees.md` §1a,
+/// `receipt::bundle_billing`): one line per mined bundle, a warning when it
+/// burned more gas than its operations were billed for.
+fn log_bundle_billing(
+    chain_id: u64,
+    intent: &PreparedBundleIntent,
+    billing: &vela_relay_core::receipt::BundleBilling,
+) {
+    let charged_wei = billing
+        .charged
+        .map(|charged| charged.to_string())
+        .unwrap_or_default();
+    if billing.under_billed {
+        tracing::warn!(
+            chain_id,
+            lane = intent.lane,
+            transaction_hash = %intent.transaction_hash,
+            operations = intent.user_operation_hashes.len(),
+            billed_gas = %billing.billed_gas,
+            gas_used = %billing.gas_used,
+            used_over_billed_bps = billing.used_over_billed_bps,
+            billed_at_cap_wei = %billing.billed_at_cap,
+            %charged_wei,
+            "bundle used more gas than its operations were billed for"
+        );
+    } else {
+        tracing::info!(
+            chain_id,
+            lane = intent.lane,
+            transaction_hash = %intent.transaction_hash,
+            operations = intent.user_operation_hashes.len(),
+            billed_gas = %billing.billed_gas,
+            gas_used = %billing.gas_used,
+            used_over_billed_bps = billing.used_over_billed_bps,
+            billed_at_cap_wei = %billing.billed_at_cap,
+            %charged_wei,
+            "bundle gas used against the gas billed"
+        );
+    }
 }
 
 #[cfg(test)]

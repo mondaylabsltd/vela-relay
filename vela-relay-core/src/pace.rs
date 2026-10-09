@@ -12,8 +12,9 @@ pub fn block_interval_ms(chain_id: u64) -> Option<u64> {
         1 => 12_000,
         // OP Mainnet, Base.
         10 | 8_453 => 2_000,
-        // BNB Smart Chain, since the Maxwell upgrade (June 2025).
-        56 => 750,
+        // BNB Smart Chain: 100 blocks in 45 s (2026-10-09), since its
+        // upgrades after Maxwell's 0.75 s (June 2025).
+        56 => 450,
         // Gnosis.
         100 => 5_000,
         // Unichain.

@@ -6,7 +6,7 @@
 
 use futures_util::future::{Either, join, select};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use vela_relay_core::gas_math::{
     FeeHistory, GasPriceError, GasPricePolicy, GasPriceTiers, NetworkGasPrice,
     legacy_price_from_result, parse_quantity, price_from_fee_history, quote_market_tip, tiers,
@@ -16,10 +16,6 @@ use worker::{Date, Delay, Env};
 use super::rpc;
 use crate::config::CfConfig;
 
-const FEE_HISTORY_BLOCK_COUNT: &str = "0x5";
-// Still requested, so the call stays byte-identical to the docker shell's, but
-// the reward column is no longer read (`gas_math::market_tip`).
-const FEE_HISTORY_PERCENTILES: [u8; 3] = [25, 50, 75];
 const RESPONSE_BUDGET_MS: u64 = 2_800;
 const PRICE_CACHE_TTL_MS: u64 = 5_000;
 const KV_BINDING: &str = "CACHE";
@@ -113,7 +109,7 @@ async fn network_gas_price(
             chain_id,
             user_rpc_url,
             "eth_feeHistory",
-            json!([FEE_HISTORY_BLOCK_COUNT, "latest", FEE_HISTORY_PERCENTILES]),
+            vela_relay_core::gas_math::tip_history_params(chain_id),
         ),
         quantity(
             config,

@@ -60,6 +60,7 @@ pub async fn handle(
                 chain_id,
                 headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
                 gas_price,
+                state.billing_terms(),
             )
             .await;
             response_with_rpc_domain(response_body, rpc_domain)
@@ -99,6 +100,7 @@ pub async fn handle(
                 request.id,
                 chain_id,
                 headers.get(crate::utils::rpc::USER_RPC_URL_HEADER),
+                state.billing_terms(),
                 params,
             )
             .await;

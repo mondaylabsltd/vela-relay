@@ -242,6 +242,18 @@ pub struct PreparedBundleIntent {
     pub transaction_hash: String,
     pub nonce: u64,
     pub user_operation_hashes: Vec<String>,
+    /// The gas the bundle's operations were billed for, summed (hex): what
+    /// their reimbursements were evaluated against
+    /// (`cost::settlement_gas_allocations`). The receipt's `gasUsed` is
+    /// checked against it when the bundle is mined
+    /// ([`crate::receipt::bundle_billing`]). Absent on an intent written before
+    /// it was recorded, and on Tempo's pathUSD bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billed_gas: Option<String>,
+    /// The cap (`maxFeePerGas`, hex) the billed gas was evaluated at — the one
+    /// the transaction is signed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billed_fee_per_gas: Option<String>,
 }
 
 /// A signed treasury transfer persisted before broadcast. Only one funding transaction may be

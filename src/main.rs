@@ -41,6 +41,7 @@ async fn run(config: Config) -> Result<(), AppError> {
         worker::JOB_NAMES,
         config.settlement_recipient.clone(),
     )
+    .with_billing_terms(config.executor.billing_terms())
     .with_user_operation_queue(user_operation_queue)
     .with_user_operation_status_store(user_operation_status_store);
     let app = app::router(&config.http, state.clone());

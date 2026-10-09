@@ -57,6 +57,8 @@ pub mod chain_directory;
 pub mod cost;
 pub mod estimate;
 pub mod execution;
+#[cfg(test)]
+mod fee_contract;
 pub mod funding;
 pub mod gas_math;
 pub mod hold;

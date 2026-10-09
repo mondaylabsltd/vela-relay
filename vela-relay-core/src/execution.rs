@@ -130,6 +130,11 @@ pub struct BundleSimulationData {
     pub operation_gas_used: Vec<U256>,
     /// Logs from the exact final handleOps simulation (settlement evidence).
     pub logs: Vec<SettlementLog>,
+    /// Whether `gas_used` was MEASURED by running the bundle in full
+    /// (`eth_simulateV1`, `debug_traceCall`) — the only figure the relay may
+    /// bill on ([`crate::cost::settlement_gas_allocations`]). The bundle's
+    /// `eth_estimateGas` stand-in is a limit, not a measurement.
+    pub full_execution: bool,
 }
 
 impl From<&SimulationResult> for BundleSimulationData {
@@ -150,6 +155,7 @@ impl From<&SimulationResult> for BundleSimulationData {
                     data: log.data.clone(),
                 })
                 .collect(),
+            full_execution: simulation.full_execution,
         }
     }
 }
@@ -206,6 +212,13 @@ pub struct TransactionContext {
     pub max_priority_fee_per_gas: u128,
     pub nonce: u64,
     pub relayer_balance: U256,
+    /// The tip window of `eth_feeHistory` over the chain's tip window
+    /// ([`crate::gas_math::tip_history_params`]), read beside the rest — the
+    /// tier tips are resolved from it exactly as the quote resolves them
+    /// ([`crate::gas_math::TierTips::from_window`]). `None` when the call
+    /// failed or the answer carried no readable rewards: the tiers then scale
+    /// the market tip.
+    pub tip_window: Option<crate::gas_math::TipWindow>,
 }
 
 /// The signed outer transaction as produced by the shell's keystore.
@@ -1089,6 +1102,11 @@ pub const FUNDING_WAIT_FINISH: &str = "UserOperation is waiting for its relayer'
 const TOP_UP_SIGNED_AGAIN: &str = "it will be signed again";
 const NO_OUTCOME_FINISH: &str = "no durable executor outcome";
 
+/// The deferral of a bundle on a measured-gas chain whose simulation measured
+/// no gas ([`crate::cost::SettlementGasRule::Measured`]).
+pub const UNMEASURED_SIMULATION: &str =
+    "final handleOps simulation measured no gas on a chain billed on measured gas";
+
 /// The whole lane-batch program. Sequential: at most one operation is ever in
 /// flight (the Driver tests assert this invariant).
 async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
@@ -1523,6 +1541,18 @@ async fn execute_with_lane_lease(
         }
         BundleSimVerdict::Transient { reason } => return Err(reason),
     };
+    // Where the relay bills the gas a bundle measurably uses, a simulation
+    // that measured nothing — the Pimlico `eth_call` stand-in, whose bundle
+    // figure is an `eth_estimateGas` limit with no logs — is no basis to bill
+    // on: billed the outer limit, a wallet that paid for `settlementGas` is
+    // short by half and held, then rejected. It is a simulation that did not
+    // happen yet, and is retried like one (review F2).
+    if !bundle_simulation.full_execution
+        && crate::cost::settlement_gas_rule(start.operations[0].chain_id)
+            == crate::cost::SettlementGasRule::Measured
+    {
+        return Err(UNMEASURED_SIMULATION.to_owned());
+    }
     ensure_lane_lease(ctx).await?;
 
     if policy.is_tempo {
@@ -1572,10 +1602,33 @@ async fn execute_with_lane_lease(
         context.estimated_gas,
         declared,
     );
-    let allocations = allocate_bundle_gas(
+    // The outer gas LIMIT: the estimate-based allocation, which carries the
+    // EntryPoint's reservation for every declared limit, so no bundle runs out
+    // of gas.
+    let limit_allocations = allocate_bundle_gas(
         simulated_gas,
         context.estimated_gas,
         &bundle_simulation.operation_gas_used,
+        policy.gas_buffer_bps,
+        policy.fixed_gas_buffer,
+    )
+    .ok_or_else(|| "bundle gas allocation overflow".to_owned())?;
+    // What each operation is BILLED for: on a chain that charges the gas a
+    // transaction uses, the measured gas plus the same buffer, the buffer
+    // capped at the operations' own limits — the rule
+    // `eth_estimateUserOperationGas` promised `settlementGas` by
+    // (`cost::billed_gas`) — never the limit (`docs/fees.md` §1).
+    let allocations = crate::cost::settlement_gas_allocations(
+        crate::cost::settlement_gas_rule(start.operations[0].chain_id),
+        bundle_simulation.full_execution.then_some(simulated_gas),
+        &limit_allocations,
+        &bundle_simulation.operation_gas_used,
+        crate::cost::declared_limits(
+            &survivors
+                .iter()
+                .map(|candidate| &candidate.packed)
+                .collect::<Vec<_>>(),
+        ),
         policy.gas_buffer_bps,
         policy.fixed_gas_buffer,
     )
@@ -1607,6 +1660,13 @@ async fn execute_with_lane_lease(
         max_priority_fee_per_gas: context.max_priority_fee_per_gas,
         inclusion_floor_bps: policy.settlement_inclusion_floor_bps,
         requested_tier: bundle_submission_tier(&survivors),
+        // The tier tips the quote showed, from the same rule over the blocks
+        // just before this submission.
+        tier_tips: crate::gas_math::TierTips::resolve(
+            context.tip_window.as_ref(),
+            context.max_priority_fee_per_gas,
+        )
+        .unwrap_or_default(),
     };
     // A client may name how fast it wants its operation in. Resolving the name
     // here, against the base fee and tip the shell just read, is what makes a
@@ -1799,7 +1859,7 @@ async fn execute_with_lane_lease(
         return Ok(());
     }
 
-    let gas_limit = allocations
+    let gas_limit = limit_allocations
         .iter()
         .try_fold(U256::ZERO, |sum, gas| sum.checked_add(*gas))
         .ok_or_else(|| "bundle gas limit overflow".to_owned())?;
@@ -1915,6 +1975,13 @@ async fn execute_with_lane_lease(
             .iter()
             .map(|candidate| candidate.hash_string.clone())
             .collect(),
+        // What the receipt is checked against (`receipt::bundle_billing`):
+        // the gas the payments were evaluated for, at the cap signed.
+        billed_gas: allocations
+            .iter()
+            .try_fold(U256::ZERO, |sum, gas| sum.checked_add(*gas))
+            .map(|gas| format!("0x{gas:x}")),
+        billed_fee_per_gas: Some(format!("0x{:x}", outer_fee.max_fee_per_gas)),
     };
     ensure_lane_lease(ctx).await?;
     match request(
@@ -2190,6 +2257,8 @@ async fn execute_tempo_bundle(
             .iter()
             .map(|candidate| candidate.hash_string.clone())
             .collect(),
+        billed_gas: None,
+        billed_fee_per_gas: None,
     };
     ensure_lane_lease(ctx).await?;
     match request(
@@ -3499,22 +3568,26 @@ mod tests {
     }
 
     fn fixture_from(paid: u128, nonce: &str, sender: &str) -> Fixture {
+        fixture_on(paid, nonce, sender, CHAIN_ID)
+    }
+
+    fn fixture_on(paid: u128, nonce: &str, sender: &str, chain_id: u64) -> Fixture {
         let operation = UserOperation::V0_7(Box::new(user_op_from(paid, nonce, sender)));
         let packed = PackedOperation::try_from(&operation).expect("fixture packs");
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
-        let hash = user_operation_hash(&packed, entry_point, CHAIN_ID);
+        let hash = user_operation_hash(&packed, entry_point, chain_id);
         let hash_string = hash.to_string().to_ascii_lowercase();
         let lane = relayer_index_for_sender(sender, 10) as u8;
         let value: Value = serde_json::to_value(&operation).unwrap();
         let routed = RoutedUserOperation {
             schema_version: 1,
             user_operation_hash: hash_string.clone(),
-            chain_id: CHAIN_ID,
+            chain_id,
             entry_point: ENTRY_POINT.into(),
             user_operation: value,
             sender: sender.into(),
             lane,
-            stream: "chain-42161".into(),
+            stream: format!("chain-{chain_id}"),
             partition_id: 1,
             offset: 7,
             submission_tier: None,
@@ -3522,8 +3595,8 @@ mod tests {
         let record = StoredUserOperation {
             status: UserOperationStatus::Queued,
             transaction_hash: None,
-            chain_id: CHAIN_ID,
-            chain_id_text: CHAIN_ID.to_string(),
+            chain_id,
+            chain_id_text: chain_id.to_string(),
             entry_point: ENTRY_POINT.into(),
             user_operation: operation,
             admitted: true,
@@ -3557,6 +3630,7 @@ mod tests {
             gas_used: U256::from(100u64),
             operation_gas_used: vec![U256::from(100u64)],
             logs: Vec::new(),
+            full_execution: true,
         }
     }
 
@@ -3568,6 +3642,7 @@ mod tests {
             max_priority_fee_per_gas: 0,
             nonce: 7,
             relayer_balance: U256::from(10_000u64),
+            tip_window: None,
         }
     }
 
@@ -3682,6 +3757,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -3846,6 +3923,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x1ae7b".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -3982,6 +4061,246 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: super::DEFERRED_FINISH.into(),
+        }]);
+    }
+
+    /// The 2026-10-02 Ethereum send (tx 0x7132ee31…): its bundle used
+    /// 146,824 gas, eth_estimateGas of it answered 322,126, and the relay
+    /// signed a 400,445 limit. The limit is still what is signed; what the
+    /// payment is measured against is the gas used plus the buffer, 198,848.
+    /// The payment here covers 1.4 × 198,848 × the cap to the wei and is
+    /// accepted at the quoted cap — under the old rule it was short by half
+    /// and held.
+    #[test]
+    fn ethereum_measures_the_payment_against_the_gas_used_and_signs_the_estimated_limit() {
+        // ceil(1.4 × 198,848 × 2) at the quoted cap of 2.
+        let fixture = fixture_on(556_775, "0x0", SENDER, 1);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(StartBatch {
+            operations: vec![fixture.routed.clone()],
+            policy: ExecutionPolicy {
+                gas_buffer_bps: 1_500,
+                fixed_gas_buffer: 30_000,
+                ..policy()
+            },
+            lease_token: "lane-token-1".into(),
+        });
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Executed(BundleSimulationData {
+                    gas_used: U256::from(146_824u64),
+                    operation_gas_used: vec![U256::from(231_186u64)],
+                    logs: Vec::new(),
+                    full_execution: true,
+                })],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata: calldata.clone(),
+            },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    estimated_gas: U256::from(322_126u64),
+                    relayer_balance: U256::from(1_000_000u64),
+                    ..context()
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        // No reprice, no hold: signed at the quoted cap, with the
+        // estimate-based limit (322,126 × 1.15 + 30,000), so the bundle has
+        // every gas the EntryPoint reserves.
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 400_445,
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 0,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Failed {
+                message: "keystore unavailable".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: "keystore unavailable".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: "keystore unavailable".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                    reason: "keystore unavailable".into(),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: super::DEFERRED_FINISH.into(),
+        }]);
+    }
+
+    /// Review F2: on Ethereum the relay bills the gas a bundle measurably
+    /// uses. When `eth_simulateV1` is unavailable for a pass, the Pimlico
+    /// `eth_call` decides membership and its bundle stand-in answers an
+    /// `eth_estimateGas` limit — a simulation that measured nothing. Billed
+    /// the outer limit, a wallet that paid for its `settlementGas` was short
+    /// by half and held, then rejected; now the bundle is deferred and
+    /// retried, as when no simulation ran, and nothing is fetched or signed.
+    #[test]
+    fn an_ethereum_bundle_whose_simulation_measured_nothing_is_retried_not_billed_the_limit() {
+        let fixture = fixture_on(556_775, "0x0", SENDER, 1);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(StartBatch {
+            operations: vec![fixture.routed.clone()],
+            policy: policy(),
+            lease_token: "lane-token-1".into(),
+        });
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(BundleSimulationData {
+                    gas_used: U256::from(322_126u64),
+                    operation_gas_used: vec![U256::ZERO],
+                    logs: Vec::new(),
+                    full_execution: false,
+                }),
+            },
+        );
+        for (operation, outcome) in [
+            (
+                ExecutionOperation::RecordDeferred {
+                    hash: fixture.hash_string.clone(),
+                    stage: "execution",
+                    reason: super::UNMEASURED_SIMULATION.into(),
+                },
+                ExecutionOutcome::Done,
+            ),
+            (
+                ExecutionOperation::NotifyIssue {
+                    hash: fixture.hash_string.clone(),
+                    stage: "execution",
+                    reason: super::UNMEASURED_SIMULATION.into(),
+                },
+                ExecutionOutcome::Done,
+            ),
+            (
+                ExecutionOperation::EmitDiagnostic {
+                    diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                        reason: super::UNMEASURED_SIMULATION.into(),
+                    },
+                },
+                ExecutionOutcome::Done,
+            ),
+        ] {
+            driver.step(operation, outcome);
+        }
         driver.assert_settled(&[ItemResolution::Failed {
             reason: super::DEFERRED_FINISH.into(),
         }]);
@@ -4138,6 +4457,7 @@ mod tests {
                     topics: Vec::new(),
                     data: Default::default(),
                 }],
+                full_execution: true,
             })
         );
         // The Pimlico eth_call: gas 0, no logs — never a bundle's evidence.
@@ -4148,15 +4468,16 @@ mod tests {
     }
 
     #[test]
-    fn a_client_named_speed_signs_above_the_pace_the_relay_keeps_on_its_own() {
-        // The same batch as the test above, but the client asked for `fast`
-        // and paid 420 instead of 280. Base fee 1, tip 0: the relay's own cap
-        // is 2 and `fast` asks for 3×1 = 3, which 420 funds exactly
-        // (300 gas cost × 1.4 = 420). So the outer transaction is signed at 3
-        // — strictly faster than the 2 the untiered twin signs at, which is
-        // the whole point of the feature and the direction a reported-tier
-        // price would have got wrong.
-        let fixture = fixture_at(420, SubmissionTier::Fast);
+    fn a_client_named_speed_signs_the_reward_percentile_tip_the_quote_showed() {
+        // The client asked for `fast` on Ethereum's shape of market: base
+        // 1 gwei and a node that suggests no tip at all, while the blocks'
+        // rewards read 0.2 / 1.0 / 1.5 gwei at the 25th / 50th / 70th
+        // percentile. The relay's own pace signs 2 gwei with that zero tip;
+        // `fast` signs its cap 1.75 × 1 + 1.5 = 3.25 gwei and TIPS 1.5 gwei —
+        // the tip `pimlico_getUserOperationGasPrice` reported for `fast` from
+        // the same rows. 100 gas at 3.25 gwei × 1.4 = 455 gwei funds it
+        // exactly.
+        let fixture = fixture_at(455_000_000_000, SubmissionTier::Fast);
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
         let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
 
@@ -4218,7 +4539,19 @@ mod tests {
                 entry_point,
                 calldata: calldata.clone(),
             },
-            ExecutionOutcome::Context { context: context() },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    base_fee_per_gas: 1_000_000_000,
+                    max_fee_per_gas: 2_000_000_000,
+                    max_priority_fee_per_gas: 0,
+                    relayer_balance: U256::from(1_000_000_000_000u64),
+                    tip_window: Some(crate::gas_math::TipWindow {
+                        rewards: vec![vec![200_000_000, 1_000_000_000, 1_500_000_000]; 20],
+                        gas_used_ratio_bps: None,
+                    }),
+                    ..context()
+                },
+            },
         );
         // The one line an operator can read the decision off: the speed asked
         // for, the cap the relay would have used, and what it resolved to.
@@ -4226,14 +4559,10 @@ mod tests {
             ExecutionOperation::EmitDiagnostic {
                 diagnostic: ExecutionDiagnostic::SubmissionTierCap {
                     tier: SubmissionTier::Fast,
-                    quoted_fee: 2,
-                    cap: 3,
-                    base_fee: 1,
-                    // This market has no tip at all, so `2 ×` it is still 0
-                    // and only the cap can differ. The tip-scaling half of a
-                    // tier is exercised by
-                    // `a_named_speed_signs_the_tiers_tip_not_the_market_one`.
-                    tip: 0,
+                    quoted_fee: 2_000_000_000,
+                    cap: 3_250_000_000,
+                    base_fee: 1_000_000_000,
+                    tip: 1_500_000_000,
                     market_tip: 0,
                 },
             },
@@ -4256,9 +4585,9 @@ mod tests {
                 request: super::BundleSignRequest {
                     nonce: 7,
                     gas_limit: 100,
-                    // 3, not the 2 the untiered pipeline signs at.
-                    max_fee_per_gas: 3,
-                    max_priority_fee_per_gas: 0,
+                    // The tier's pair, not the untiered 2 gwei and no tip.
+                    max_fee_per_gas: 3_250_000_000,
+                    max_priority_fee_per_gas: 1_500_000_000,
                     entry_point,
                     calldata,
                 },
@@ -4283,6 +4612,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0xc1b71080".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -4333,9 +4664,11 @@ mod tests {
         // (base 100, market tip 40) through the whole pipeline and pins BOTH
         // numbers in the signed request.
         //
-        // fast: cap = 3 × 100 + 2 × 40 = 380, tip = 80.
-        // Funding: 100 gas at the untiered quote 240 costs 24_000, × 1.4 =
-        // 33_600 required; 60_000 paid funds a 428 cap, so nothing clamps.
+        // No reward column in this market, so the tier tips are the market
+        // tip scaled 1.00 / 1.25 / 2.00: fast: cap = 1.75 × 100 + 80 = 255,
+        // tip = 80. Funding: 100 gas at the untiered quote 240 costs 24_000,
+        // × 1.4 = 33_600 required; 60_000 paid funds a 428 cap, so nothing
+        // clamps.
         let fixture = fixture_at(60_000, SubmissionTier::Fast);
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
         let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
@@ -4406,6 +4739,7 @@ mod tests {
                     max_priority_fee_per_gas: 40,
                     nonce: 7,
                     relayer_balance: U256::from(1_000_000u64),
+                    tip_window: None,
                 },
             },
         );
@@ -4417,7 +4751,7 @@ mod tests {
                 diagnostic: ExecutionDiagnostic::SubmissionTierCap {
                     tier: SubmissionTier::Fast,
                     quoted_fee: 240,
-                    cap: 380,
+                    cap: 255,
                     base_fee: 100,
                     tip: 80,
                     market_tip: 40,
@@ -4442,10 +4776,10 @@ mod tests {
                 request: super::BundleSignRequest {
                     nonce: 7,
                     gas_limit: 100,
-                    // Both levers, not one. 380 = 3 × 100 + 80, and the tip
-                    // is `fast`'s 80 — the market 40 would have bought the
-                    // same block as `slow`.
-                    max_fee_per_gas: 380,
+                    // Both levers, not one. 255 = 1.75 × 100 + 80, and the
+                    // tip is `fast`'s 80 — the market 40 would have bought
+                    // the same block as `slow`.
+                    max_fee_per_gas: 255,
                     max_priority_fee_per_gas: 80,
                     entry_point,
                     calldata,
@@ -4480,6 +4814,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0xff".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -5075,6 +5411,7 @@ mod tests {
                     gas_used: U256::from(100_000u64),
                     operation_gas_used: vec![U256::from(100_000u64)],
                     logs: vec![path_usd_transfer_log(10_000)],
+                    full_execution: true,
                 }),
             },
         );
@@ -5130,6 +5467,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![hash_string.clone()],
+            billed_gas: None,
+            billed_fee_per_gas: None,
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -5460,6 +5799,8 @@ mod tests {
             transaction_hash: bundle_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {
@@ -5957,6 +6298,8 @@ mod tests {
             transaction_hash: "0xbundle".into(),
             nonce: 1,
             user_operation_hashes: vec!["0x01".into(), "0x02".into(), "0x03".into(), "0x04".into()],
+            billed_gas: None,
+            billed_fee_per_gas: None,
         };
         let mut queued = fixture.record.clone();
         queued.status = UserOperationStatus::Queued;
@@ -6190,6 +6533,8 @@ mod tests {
             transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
+            billed_gas: Some("0x64".into()),
+            billed_fee_per_gas: Some("0x2".into()),
         };
         driver.step(
             ExecutionOperation::SavePreparedBundle {

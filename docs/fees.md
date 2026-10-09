@@ -19,41 +19,194 @@ For each operation, evaluated independently (surplus on one op never subsidizes
 another in the same bundle):
 
 ```
-required = max( markup × gas_native_cost ,  floor )
+required = max( markup × settlement_gas × cap ,  floor )
 ```
 
-- **`markup`** — default **14000 bps = 1.4×** (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`,
-  hard lower bound 1.0×). The relay recovers 1.4× the gas it spends.
-- **`gas_native_cost`** = the operation's allocated gas × the **submit cap**,
-  which by default is `max_fee_per_gas = 2 × base_fee + tip`
-  (`gas_math::quoted_outer_fee`). The `2×` is **inclusion headroom, not cost** —
-  the chain only ever charges `base_fee + effective tip`; the extra base-fee
-  multiple lets the outer transaction survive a rising base fee without a
-  re-sign. A client may raise or lower this multiple, **and the tip the relay
-  signs with**, by naming a submission speed (§2a); when it names none, the cap
-  is exactly the `2×` above and the tip is the raw market reading.
+- **`markup`** — default **11000 bps = 1.1×** (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`,
+  hard lower bound 1.0×). Because the chain never charges more than the cap per
+  gas, this is the relay's **guaranteed** margin over the gas it is billed for
+  — which on the chains that bill measured gas is not quite the gas a bundle
+  burns (§1b);
+  in any calm market the cap sits well above `base + tip` and the margin is far
+  larger (§2c measures it). It was 1.4× while the gas billed was the outer
+  limit (§1a); the backtest in §2c chose 1.1×.
+- **`settlement_gas`** — the gas the operation is billed for (§1a): on Ethereum
+  and the other chains listed there, the gas its bundle measurably used plus
+  the buffer; elsewhere, its share of the outer gas limit.
+- **`cap`** — the `maxFeePerGas` the outer transaction is signed with. When the
+  client names no speed it is `2 × base_fee + tip`
+  (`gas_math::quoted_outer_fee`), the raw market tip, exactly as always. A
+  client that names a speed gets that tier's cap and tip (§2a), clamped to what
+  its payment funds. The cap is **inclusion headroom, not cost** — the chain
+  only ever charges `base_fee + effective tip`.
 - **`floor`** — a dust guard: `0.00001` native coin, or `0.01` of a stablecoin
-  (≈ **1 cent**). This is NOT the price; it only bites when `1.4 × gas` rounds
-  below it (near-zero-gas ops). Both the quote layer and the settlement layer
-  compute it through the same `minimum_amount(decimals, fraction)` with the same
-  constants, so they can never disagree.
+  (≈ **1 cent**). This is NOT the price; it only bites when `markup × gas`
+  rounds below it (near-zero-gas ops). Both the quote layer and the settlement
+  layer compute it through the same `minimum_amount(decimals, fraction)` with
+  the same constants, so they can never disagree (pinned by
+  `the_dust_floor_is_the_requirement_when_the_gas_costs_less`).
 
-Gas is split across a bundle by `cost::allocate_bundle_gas`: each op pays its own
-simulated gas plus an even share of the outer overhead + buffer; the per-op
-allocations sum to the bundle total exactly (no wei lost or double-charged), and
-every op is guaranteed ≥ its own direct gas (no free-riding).
+## 1a. The gas an operation pays for — used, not reserved
+
+Two gas figures exist for every bundle, and they used to be one:
+
+- **The outer gas LIMIT** the relay signs: `cost::allocate_bundle_gas` over
+  `max(simulated gas, eth_estimateGas of the bundle, the ops' own gas)` plus
+  the buffer (`VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS` 15%, `…_FIXED_GAS_BUFFER`
+  30,000). `eth_estimateGas` of `handleOps` answers the gas the EntryPoint
+  RESERVES for every declared limit, not the gas the bundle burns, so this is
+  the figure that keeps a bundle from running out of gas. It is unchanged.
+- **The settlement gas** each operation is billed for
+  (`cost::settlement_gas_allocations`): on a chain that charges `gasUsed ×
+  price` and whose bundle simulation ran in full (`eth_simulateV1` or
+  `debug_traceCall`), the **measured** gas plus the same buffer, the buffer
+  never taking it past the operations' own declared limits:
+
+  ```
+  billed_gas(used) = min( used + ⌈15% × used⌉ + 30,000 ,  max( declared limits , used ) )      (cost::billed_gas)
+  declared limits  = Σ verificationGasLimit + callGasLimit + preVerificationGas (+ paymaster limits)
+  ```
+
+  It is split across a bundle's operations in proportion to the gas the
+  EntryPoint accounts to each (`UserOperationEvent.actualGasUsed`), summing to
+  the total exactly; a bundle of one operation bills the whole.
+
+The 2026-10-02 Ethereum send that exposed the gap (tx `0x7132ee31…`): the
+bundle used **146,824** gas, its `eth_estimateGas` was 322,126, and the relay
+signed — and billed — a **400,445** limit. It now still signs 400,445 and bills
+**198,848**. Pinned by
+`ethereum_measures_the_payment_against_the_gas_used_and_signs_the_estimated_limit`.
+
+Which chains settle on measured gas is a list, never an assumption
+(`cost::settlement_gas_rule`):
+
+| rule | chains | billed gas |
+|---|---|---|
+| `Measured` | Ethereum, Sepolia, Holesky, Hoodi; Gnosis, Chiado; Polygon, Amoy; BNB Smart Chain and its testnet | `buffered_gas(measured)` |
+| `MeasuredAtLeastHalfTheLimit` | Avalanche C-Chain, Fuji | the same, but never under half the signed outer limit — Avalanche charges `max(gasUsed, gasLimit / 2)` since 2026-09-22, and its only simulation (`debug_traceCall`) is believed only up to `max(estimate, declared limits)` (`cost::credible_simulated_gas`) |
+| `OuterLimit` | every other chain: Arbitrum (its L1 data cost rides inside gas units its simulation need not show), the OP stack (its L1 fee is charged beside gas), anything unlisted | the limit allocation, as before |
+
+A simulation that measured nothing — the Pimlico `eth_call` stand-in, whose
+bundle figure is an `eth_estimateGas` limit — is never billed on a `Measured`
+chain: billed the limit, a wallet that paid for its `settlementGas` would be
+short by half, held and rejected. The bundle is deferred and retried, as when
+no simulation answered at all (`execution::UNMEASURED_SIMULATION`), and on
+those chains `eth_simulateV1` is always asked first, whatever a recent walk
+seemed to prove (`simulation::simulate_v1_turn`, `docs/rpc.md`). Elsewhere it
+bills the limit allocation, which is what those chains bill anyway.
+
+**`settlementGas` — the same figure, promised before signing.**
+`eth_estimateUserOperationGas` returns an optional `settlementGas` (hex) on a
+`Measured` chain: the executor's own rule, `buffered_gas`, over the gas a
+one-operation `handleOps` carrying this operation is predicted to use
+(`estimate::settlement_gas`):
+
+```
+used = 21,000 + calldata gas of handleOps([op], 0xff…ff)     (the returned limits, the request's signature)
+     + preOpGas                                              (simulateValidation: validation, and any deployment)
+     + execution                                             (the call's measured gas less its own 21,000 + calldata)
+     + 10,000                                                (ENTRY_POINT_OVERHEAD_GAS)
+settlementGas = billed_gas(used)     over the limits returned beside it — the executor's own rule
+```
+
+The execution of a **deployed** account is `eth_estimateGas` of its
+`callData` from the EntryPoint. An **undeployed** account has no code to
+estimate against — that call measured a plain transfer (a first send was
+estimated at the 50,000 call-gas floor and used 52,804; a first backup at
+~30,000 and used 4,315,038) — so its execution is measured with
+`eth_simulateV1` of `[factory call from the SenderCreator, callData from the
+EntryPoint]` in one block, which also sets its `callGasLimit` (1.5 × the
+measurement, as for a deployed one). Where no endpoint performs that, the old
+`eth_estimateGas` answers and `settlementGas` is omitted. It is omitted on
+every chain that is not `Measured`, too: there the executor bills the limit
+and nothing smaller can be promised.
+
+**One cap at both ends.** The estimate and the executor cap the buffer by the
+same rule over the same limits (`cost::billed_gas`). They used to differ — the
+estimate capped at the limits it returned, the executor at the outer gas
+allocation, which, built on the same measurement plus the same buffer, never
+binds — so an operation whose buffer outgrew its limits was promised less
+than it was billed (pinned by
+`the_estimate_promises_the_gas_the_executor_bills_when_the_buffer_outgrows_the_limits`).
+
+The 10,000 overhead is measured, not derived. The relay's two estimate calls,
+replayed at the parent block of four mined Vela operations (archive state),
+left this much of the receipt unexplained, and the predicted `settlementGas`
+against what the executor bills for the same bundle:
+
+| operation | receipt gas | unexplained | `settlementGas` | executor bills | ratio |
+|---|---|---|---|---|---|
+| ETH send `0x7132ee31…` | 146,824 | 1,249 | 208,070 | 198,848 | 1.046 |
+| USDT send `0xe42fb6b9…` | 183,941 | 2,368 | 249,371 | 241,533 | 1.032 |
+| USDT send `0x22cbfbd6…` | 169,192 | 3,511 | 228,988 | 224,571 | 1.020 |
+| first op + backup `0x86795d08…` | 5,034,866 | −930 | 5,831,838 | 5,820,096 | 1.002 |
+
+(`settlementGas` here with vela-wallet's dummy signature, which costs 3,060
+gas of calldata against a real one's 3,792.) Signed with the limits the same
+estimate returns, every one of the four executes in full at its parent block
+(`simulateHandleOp`, `UserOperationEvent.success`), and with a third of the
+call limit none does. Pinned by
+`the_settlement_gas_of_a_mined_ethereum_send_covers_what_the_executor_billed` and
+`an_undeployed_safe_is_measured_with_its_code_in_place`.
+
+**The limits are still what the operation must carry.** `verificationGasLimit`
+is 1.5 × the measured `preOpGas` (at least 100,000) — the measured value since
+the `ValidationResult` decode was fixed: 61,906 for a deployed Safe's send on
+Ethereum (so 100,000), 412,195 for a counterfactual one's first (so 618,293;
+it was answered 100,000 before). `callGasLimit` is 1.5 × the measured
+execution (at least 50,000).
 
 Every rounding step in the chain (`mul_div_ceil` markup, `native_to_usd_stable_ceil`
 USD conversion, Binance price parse, Tempo cost) rounds **toward the relay**, and
 every multiply/scale is `checked_` and fails closed on overflow. The relay can
 never round in the payer's favor or wrap silently.
 
+## 1b. What the relay can lose
+
+The relay is paid at least `markup × billed gas × cap` and charged `gas used
+× effective gas price`, which is never more than `gas used × cap`. So it
+never loses while a bundle burns no more than `markup × billed gas`:
+
+- **`OuterLimit` chains** bill the outer gas limit, more than any execution of
+  the bundle can burn: never a loss, by construction.
+- **`Measured` chains** (and Avalanche, whose half-the-limit term is billed as
+  it is charged) bill `billed_gas(simulated)` — the simulation plus 15% plus
+  30,000 — which is not an upper bound on what the bundle burns on-chain. The
+  executor simulates at `latest` moments before signing, and a bundle burns
+  what it simulated when it reads the same state: the 2026-10-02 send burned
+  exactly its simulated 146,824. It burns more when the state it reads changed
+  in between (a storage slot written first in the meantime costs up to 20,000
+  gas more) or when its own code branches on the block it runs in. The relay
+  then loses only past `1.1 × (1.15 × simulated + 30,000)` gas — 1.49× the
+  2026-10-02 send's simulated gas, 1.33× a 504,609-gas first operation's —
+  when a spike has consumed the whole cap, and past 2.2× that send's at the
+  investigation block's prices (a `slow` cap 1.47× the effective price).
+  Whatever a bundle does it cannot burn more than its outer gas limit, so the
+  loss on one operation is at most `(gas limit − markup × billed gas) ×
+  effective price`: for that send 181,712 gas, $0.09 at its 0.2033 gwei —
+  from a payer who paid `1.1 × 198,848 × cap` for it, so a bundle built to
+  burn more than it simulated costs its sender more than it costs the relay.
+  Over the replay of §2c, at the gas it measured, the relay never earned
+  under +33% of the chain's charge.
+
+**Watched, not assumed.** Every mined bundle's receipt is checked against
+what its operations were billed for (`receipt::bundle_billing`, over the
+`billedGas` and `billedFeePerGas` its prepared intent now records). The docker
+executor logs `bundle gas used against the gas billed` (info) — or `bundle
+used more gas than its operations were billed for` (warn) — with
+`billed_gas`, `gas_used`, `used_over_billed_bps`, `billed_at_cap_wei` (`billed
+gas × cap`, the requirement before the markup) and `charged_wei` (`gas used ×
+effectiveGasPrice`); the Worker logs the same line. A warning is the event to
+look at; `charged_wei` above `1.1 × billed_at_cap_wei` would be a loss. A
+bundle of several operations is one receipt, so the line is per bundle — per
+operation for the single-operation bundles that are nearly all of them.
+
 ## 2. Repricing — the safety valve that makes a fixed client payment work
 
 A client signs its payment at quote time; the base fee at *inclusion* time may be
 higher. The relay does not simply reject a payment that falls short of the nominal
 `required` — it first tries to **reprice the outer transaction down** to a fee the
-payment CAN cover, because the `2×base` quote was headroom, not cost
+payment CAN cover, because the cap was headroom, not cost
 (`settlement::decide_settlement`):
 
 1. Evaluate at the quoted fee. If every op is fully paid → **KeepQuote** (submit
@@ -63,512 +216,501 @@ payment CAN cover, because the `2×base` quote was headroom, not cost
    fee** the weakest payer funds: `affordable = quoted_fee × (paid / required)`.
 3. If `affordable` is at least the **inclusion floor**
    (`inclusion_floor_bps × base_fee + the tip the transaction is signed with`,
-   default **1.5×base + tip**) and below the quoted fee → **Reprice** to
-   `affordable` and submit. Repricing preserves the full markup (reimbursement
-   still covers `markup × gas × new_fee`, and the chain can never charge more
-   than `new_fee`). Because the floor carries the **signed** tip — the tier's,
-   once one has resolved (§2a) — a reprice can never drop the cap below
-   `base_fee + tip` and shave the priority the client paid for.
-4. If `affordable` is below the inclusion floor → **FloorUnfundable**: reject.
-   This is a clean rejection, never a loss — the relay never signs an outer
-   transaction it would lose money on.
+   default **1.25×base + tip**, `VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS`)
+   and below the quoted fee → **Reprice** to `affordable` and submit. Repricing
+   preserves the full markup (reimbursement still covers `markup × gas ×
+   new_fee`, and the chain can never charge more than `new_fee`). Because the
+   floor carries the **signed** tip, a reprice can never drop the cap below
+   `base_fee + tip`.
+4. If `affordable` is below the inclusion floor → **FloorUnfundable**: the
+   operation is held in the delayed inbox while the market may come back
+   (`VELA_RELAY_EXECUTOR_SETTLEMENT_HOLD_MAX_ATTEMPTS`, 12 attempts ≈ 35 min),
+   then rejected. The relay never signs a cap the payment does not fund at the
+   gas it bills (§1b says where the gas burned can exceed that).
+
+The floor is 1.25× — two blocks of the largest EIP-1559 rise. A signed
+transaction cannot be bumped (the outbox broadcasts exact bytes), so a cap
+that a rising base fee passes leaves the bundle unminable, and its lane's
+later nonces with it, until the base fee falls back: a **wedge**. The floor
+decides only which payments are signed at the low end of their cap rather
+than held: a repriced cap is whatever the payment funds, at any floor. A
+quote a block old always funds more than 1.33× the base fee, so for a fresh
+quote the floor changes next to nothing. For an older one it trades wedges for
+holds: over 10.4 days (§2c, lenient inclusion) a 1.125× floor — the
+backtest's first choice — let 30 s-old `slow` quotes sign caps that were
+priced out 5× as often as at 1.25× (0.035% against 0.007%), the longest
+wedging its lane 8.7 hours against 1.9, while 1.25× holds them instead and
+rejects 0.19% of them after the hold budget (0.01% at 1.125×). It was 1.5×
+before the backtest; at 1.5× a fifth of fresh `slow` sends are held. No
+floor prevents the longest wedges of all: a `slow` bundle signed at its
+whole 1.5× cap just before a sustained spike (2026-09-29 10:58 UTC, base
+fee 0.34 gwei rising to 7.05 and not back under 0.51 for 8.7 hours) waits out
+the spike at any floor — only a fee-bump path would end that.
 
 Because the floor uses `max(cost, dust_floor)` on the stablecoin path, a payment
 below the *dust* floor can never be repriced into acceptance (the requirement is
-pinned at the floor at every fee) — a case now pinned by
+pinned at the floor at every fee) — a case pinned by
 `a_stablecoin_below_the_floor_cannot_be_repriced_into_acceptance`.
 
 ## 2a. Submission speed — the client may name a tier
 
-Repricing (§2) only ever moves the cap **down**. A client that wants its
-operation in *sooner* may name a submission speed on `eth_sendUserOperation`, as
-an **optional third parameter**:
+Repricing (§2) only ever moves the cap **down**. A client may name a submission
+speed on `eth_sendUserOperation`, as an **optional third parameter**:
 
 ```jsonc
-["eth_sendUserOperation", [ <userOperation>, <entryPoint>, "fast" ]]
+["eth_sendUserOperation", [ <userOperation>, <entryPoint>, "standard" ]]
 ```
 
 The value is a **tier NAME** (`"slow" | "standard" | "fast"`), never a wei
-amount. The relay resolves the name against the base fee *and the tip* it reads
+amount. The relay resolves the name against the base fee and the tips it reads
 at submit time, so a quote that went stale between signing and inclusion can
 never set the price. An unknown name is refused with `-32602 invalid params`
-before any handler runs; omitting the parameter is today's wire and today's
-behaviour, byte for byte.
+before any handler runs; omitting the parameter is the relay's own pace, byte
+for byte (`2 × base_fee + market tip`, the market tip signed).
 
 ### A tier is TWO levers
 
-| tier | `base_fee_bps` — the cap | `tip_bps` — the priority | what each buys |
+| tier | cap — `base_fee_bps` | tip — the reward percentile it signs | what each buys |
 |---|---|---|---|
-| `slow` | **1.5×** base_fee | **1.00×** market tip | equals the default inclusion floor exactly |
-| `standard` | **2.0×** base_fee | **1.25×** market tip | the relay's own cap multiple, with a tip premium |
-| `fast` | **3.0×** base_fee | **2.00×** market tip | the default the vela-wallet client sends |
+| `slow` | **1.5×** base_fee | **25th** percentile, floored | the cheapest tip that is still mined within a few blocks |
+| `standard` | **1.5×** base_fee | **50th** percentile (the median) | next-block inclusion in the backtest |
+| `fast` | **1.75×** base_fee | **70th** percentile | outbids seven tenths of a block's gas |
 
 ```
-tip[tier] = tip_bps[tier] × market_tip / 10_000                      (rounded up)
+window    = eth_feeHistory over the chain's last minute of blocks, at least 20   (tip_window_blocks)
+least     = 0.001 gwei if the window paid any tip, else 0
+node      = eth_maxPriorityFeePerGas, unless it is above the window's median p50 and that median is a tip
+rewarded  = max( the window's median p25 , least )
 
-absent  ⇒ cap = 2 × base_fee + market_tip,  signed tip = market_tip
-                                                       (exactly §1, unchanged)
-present ⇒ cap = max( min( base_fee_bps[tier] × base_fee + tip[tier] ,
-                          what the reimbursements fund ) ,
-                     inclusion_floor(base_fee, tip[tier]) ,
-                     base_fee + tip[tier] )
-          signed tip = tip[tier]                               (never clamped)
+busy window  (mean gasUsedRatio ≥ 30%):   tip[slow] = max(rewarded, node),  tip[standard] = max(median p50, slow),
+                                          tip[fast] = max(median p70, standard)
+quiet window (mean gasUsedRatio < 30%):   tip[slow] = max(node, least) (rewarded without a node),
+                                          tip[standard] = max(min(1.25 × slow, median p50), slow),
+                                          tip[fast] = max(min(2 × slow, median p70), standard)
+tips.floor = rewarded (the node's tip where the median block paid none); below a 40% mean, the lower of
+             that and the quiet tip[slow]                                                     (TierTips)
+
+absent  ⇒ cap = 2 × base_fee + market_tip,  signed tip = market_tip           (unchanged)
+present ⇒ funded = the cap the reimbursements fund, measured at the tier's own cap;   floor = inclusion_floor × base_fee
+          funded ≥ floor + tip[tier]     →  cap = min( max(base_fee_bps[tier] × base_fee, floor) + tip[tier] , funded ),
+                                            tip = tip[tier]
+          funded ≥ floor + tips.floor    →  cap = funded,  tip = funded − floor    (the tip shaved, never below tips.floor)
+          otherwise                      →  cap = floor + tips.floor,  tip = tips.floor  (held, §2)
 ```
 
 **The cap buys spike resilience. Only the tip buys priority.** They are
 different goods and a tier has to move both, because an EIP-1559 block builder
-orders transactions by the **effective tip**:
+orders transactions by the **effective tip**,
+`min(maxPriorityFeePerGas, maxFeePerGas − baseFee)`, which any cap above
+`base_fee + tip` leaves unchanged. Until 2026-09-21 the relay scaled only the
+cap, and a mined Polygon `fast` receipt (base 250.710, max 775.525, max
+priority 30.35 gwei) paid the builder exactly what `slow` would have. Every tier
+now signs its own tip.
 
-```
-effective_tip = min( maxPriorityFeePerGas , maxFeePerGas − baseFee )
-```
+**The tips are read from what blocks actually paid.** `eth_feeHistory(n,
+"latest", [25, 50, 70])` reports, per block, the effective tip at the 25th, 50th
+and 70th percentile of its gas, and how full the block was. A tier's tip is the
+median of its column over the window, so one odd block moves nothing. `slow` is
+never below 0.001 gwei once the window paid any tip at all, because a block's
+low percentiles are often a single wei on Ethereum. A chain whose blocks pay no
+tip (Arbitrum) keeps zero. Without a readable reward column (a legacy chain, a
+failed call) every tier falls back to the market tip scaled `1.00 / 1.25 /
+2.00` — the rule before rewards were read — on the quote and the executor
+alike (`TierTips::resolve`).
 
-Any cap above `base_fee + tip` leaves that number completely unchanged. Until
-this was fixed the relay scaled only the cap and signed every tier with the raw
-market tip, so **paying for `fast` bought no priority at all.** It is not a
-suspicion; a mined Polygon `fast` receipt shows it:
+- **The window is a minute of blocks, never fewer than 20**
+  (`gas_math::tip_window_blocks`, from `pace::block_interval_ms`): Ethereum
+  and Gnosis read 20, Polygon, OP Mainnet and Base 30, Avalanche and Unichain
+  60, BNB Smart Chain 134, Arbitrum 240 (at most 256; every endpoint probed
+  serves that many). Twenty BSC blocks are nine seconds, less than a quote's
+  own age: the executor's window held none of the quote's blocks, and 38% of
+  BSC `standard` and `fast` sends had their tip shaved below the one quoted.
+- **The node's tip is a floor only where the blocks do not contradict it.**
+  `eth_maxPriorityFeePerGas` carries a chain's enforced minimum (bor on
+  Polygon), which a tip must clear or be refused outright — and an enforced
+  minimum is never above what the median block paid, since every included
+  transaction cleared it. Nodes disagree, and the quote and the executor ask
+  different ones: on BNB Smart Chain the directory's endpoints answered 0.05,
+  0.1, 1 and 3 gwei over blocks whose median paid 0.05 (2026-10-09), and an
+  executor reading 1 gwei signed `slow` at 1 gwei — holding, then rejecting,
+  every send quoted at 0.05. An answer above the window's median p50 is that
+  node's opinion and is left out. A window whose median block paid no tip
+  (Stable, XRPL EVM, Arbitrum: blocks nearly empty) contradicts nothing, and
+  the node is believed, as before.
+- **A quiet window signs the node's tip.** Where the window's blocks used less
+  than 30% of their gas limit on average, every transaction paying the
+  chain's minimum fits in the next block, and the percentiles are what a few
+  bots bid: Polygon's 25th percentile read 166–265 gwei against the node's 30,
+  Avalanche's 2.5–6.2 gwei on blocks 3% full, Gnosis's 70th 1.5 gwei over an
+  8-wei base fee. There each tier signs the node's tip scaled `1.00 / 1.25 /
+  2.00` — what every tier signed before rewards were read, mined on Polygon at
+  30 gwei — but a faster tier never more than the window's blocks paid at its
+  own percentile: BNB Smart Chain's blocks pay 0.05 / 0.05 / 0.057 gwei, and
+  twice the node's 0.05 would have made `fast` 40% dearer for nothing. `fast`
+  bids twice `slow` wherever its blocks paid that much. The line is 30%, not
+  one half, because Ethereum's base fee targets half-full blocks: its 20-block
+  average is below 0.5 in 49% of windows and was never below 0.338 over the
+  10.4 days of §2c, so it always reads busy; BNB Smart Chain's minute reads
+  quiet 92% of the time, Polygon's 93%, Avalanche's always.
 
-```
-Base: 250.710118904 Gwei | Max: 775.52505875 Gwei | Max Priority: 30.35 Gwei
-Gas Price (effective): 281.060118904 Gwei   (= base + 30.35)
-```
-
-`775.52505875 = 3 × 248.39168625 + 30.35`, so the 3× **cap** was applied exactly
-right — that machinery always worked. But `maxPriorityFeePerGas` was the bare
-market tip, and `min(30.35, 775.525 − 250.710) = 30.35` gwei is precisely
-what a `slow` send would have offered the builder. The user paid `fast` and got
-`slow`'s place in the block. Under the two-lever tier the same market signs:
-
-| tier | signed tip | cap | effective tip a builder sees | effective gas price |
-|---|---|---|---|---|
-| `slow` | 30.350 gwei | 406.415 gwei | **30.350 gwei** | 281.060118904 gwei |
-| `standard` | 37.9375 gwei | 539.358 gwei | **37.9375 gwei** | 288.647618904 gwei |
-| `fast` | 60.700 gwei | 812.830 gwei | **60.700 gwei** | 311.410118904 gwei |
-
-The receipt's own `281.060118904` gwei is, to the wei, what `slow` now pays.
-Pinned by `a_fast_send_now_outbids_the_slow_one_on_the_receipt_that_proved_the_defect`.
-
-**`slow`'s tip is 1.00× — the market tip, and a floor that is never scaled
-below.** This is deliberate and load-bearing. The relay has **no per-chain
-minimum-tip knowledge**: it takes whatever the node's `eth_maxPriorityFeePerGas`
-reports (`gas_math::market_tip`, §2b), and that answer carries the minimum a
-chain enforces inside its client — bor on Polygon is the canonical one. A
-transaction tipping under that minimum is **rejected outright**, not merely
-mined late. A `slow` that shaved the tip would therefore
-buy a high rejection rate rather than a saving. `slow` earns its discount from
-the lower **cap** (and hence the lower reimbursement basis derived from it),
-never from underpaying the builder. Do not "simplify" this to a tip below
-10_000 bps without first giving the relay a per-chain minimum-tip source.
-
-**Naming `standard` is no longer byte-identical to naming nothing.** It shares
-the `2 × base_fee` cap multiple, but signs `1.25 ×` the market tip. **Naming
-nothing still is** byte-identical, and that is the guarantee that matters for
-existing clients: `settlement::decide_submission_fees` returns `None` and not
-one line of tier arithmetic runs.
-
-**A tier IS this pair, and every price reported for it derives from it.** The
-two basis-point tables above are the single definition of a tier, and they live
-on one enum (`gas_math::SubmissionTier::{base_fee_bps, tip_bps}`) precisely so
-they cannot be edited apart. The same enum produces the row
-`pimlico_getUserOperationGasPrice` returns for that speed (§2b), so the tip a
-wallet is shown is the tip the relay signs with.
-
-A higher cap is **not** a higher cost in a calm market: the chain charges
-`base_fee + effective_tip` whatever the cap says. A higher tip **is** a higher
-cost — that is what speed costs — and it is also carried whole into the
-reimbursement basis, so `fast` funds the priority it buys.
+On Ethereum the node's tip is no guide: on 2026-10-08 `eth_maxPriorityFeePerGas`
+answered 0 while blocks paid a median of 1 gwei, so the relay signed every tier
+with no tip at all and `fast` bought nothing. At block 26,149,237 the tiers read
+0.147 / 1.0 / 1.795 gwei; `standard`'s cap, `1.5 × 2.784 + 1.0 = 5.177` gwei, is
+to the wei the `maxFeePerGas` Uniswap quoted for its own swap in that block.
+Pinned by `the_ethereum_tiers_at_the_block_the_overcharge_was_measured`.
 
 **The clamps, and which wins.**
 
-- *Upper — what the reimbursement funds.* The signed payment must still cover
-  `markup × gas × cap` (§1). The **cap** is therefore held to the **weakest
-  payer in the bundle**, so a `fast` neighbour can never price a slower
-  operation out of its own transaction, and the relay never signs a cap it
-  would subsidise.
-- *The tip is never clamped.* Shaving it would hand back exactly the speed the
-  client is being charged for, and on a chain with an enforced minimum it would
-  turn a slow send into a rejected one. The cap absorbs the shortfall instead.
-- *Lower — the inclusion floor, and it wins over the upper clamp.* A cap the
-  chain will not mine is a rejection dressed as a saving, and the executor has
-  no fee-bump path to rescue it. So a request below the floor is **raised** to
-  the floor; if the reimbursement cannot fund even that, the operation reaches
-  §2's existing `FloorUnfundable` verdict and takes the ordinary shortfall
-  path — held in the delayed inbox while the market may still come back, then
-  rejected once the hold budget is exhausted. Never signed at a loss.
-- *Lowest — `base_fee + tip[tier]`, the invariant.* The floor is computed from
-  the **tier's** tip, so with `inclusion_floor_bps ≥ 10_000` it already implies
-  this; it is stated separately anyway, and asserted on the signed pair just
-  before `SignBundle`. A cap between `base_fee` and `base_fee + tip` is the
-  subtlest form of the original bug: includable, but silently truncating the
-  very tip that was paid for. `OuterFee::delivers_full_tip_at` is the
-  predicate, and the executor fails the batch rather than sign a pair that
-  breaks it.
+- *The cap gives way first.* A payment short of the full tier is repriced down
+  toward the inclusion floor, keeping the whole tip — the cap above `base +
+  tip` only ever bought resilience.
+- *Then the tip, never below what the window proves the chain takes.* A
+  payment that cannot fund the floor with its tier's whole tip — a quote
+  several blocks old in a rising market, a quote whose node answered a lower
+  tip, a quote read in a quiet window and submitted in a busy one, or a wallet
+  that priced a cheaper tier than it named — keeps the floor's base-fee
+  headroom and gives back priority, down to `tips.floor`: the window's own
+  25th-percentile reward, and within reach of the quiet line (a mean below
+  40%) the quiet `slow` tip if lower. A slower send, never a stuck or a
+  rejected one. (Until the tips were read from rewards the tip was never
+  shaved; the backtest in §2c measures how rarely this runs for a fresh quote.)
+- *What a payment funds is measured at the tier's own cap.* Where the `$0.01`
+  floor is the price, the payment funds far more than the gas costs. Measured
+  at the executor's untiered `2 × base + tip` — 17 wei on Gnosis — it read as
+  funding that and no more, and a Gnosis `fast` send quoted at a 1.5 gwei tip
+  was signed at the slow tier's 0.001 gwei.
+- *The weakest payer sets the cap.* A bundle is one transaction at one price; a
+  `fast` neighbour can never price a slower operation out of its own bundle.
+  A bundle takes the fastest speed any member named, and a member that named
+  none counts as `standard`.
+- *Never above what the payment funds.* The cap is never above what the
+  reimbursements fund at the billed gas (§1b), and a
+  payment that cannot fund even the floor at the slowest tip reaches §2's
+  `FloorUnfundable` and the ordinary hold.
+- *`base + tip` is the invariant.* Every branch keeps the cap at or above the
+  base fee plus the tip it signs; the executor asserts
+  `OuterFee::delivers_full_tip_at` on the signed pair just before `SignBundle`
+  and fails the batch rather than sign one that breaks it.
 
-**Headroom — why no tier needs a subsidy.** The client pays `3 × gas × max(C,R)`
-(§3) and the relay requires `1.4 × gas × cap`, so the highest cap a payment
-funds is `3 / 1.4 = 2.14 × R`. Because `R` is `0.6 ×` the cap's **base-fee
-term** plus the tier's **whole tip** (§2b), the funding property holds *by
-construction* rather than by a table that happens to work:
+Pinned by `each_tier_submits_at_its_own_cap_and_its_own_tip`,
+`a_payment_short_of_its_tier_at_the_floor_gives_back_priority_not_inclusion`,
+`no_clamp_can_resolve_a_cap_that_truncates_its_own_tip` and
+`a_client_named_speed_signs_the_reward_percentile_tip_the_quote_showed`.
 
-```
-3R − 1.4 × cap = 3(0.6·m·base + tip[tier]) − 1.4(m·base + tip[tier])
-               = 0.4·m·base  +  1.6·tip[tier]        ≥ 0,  term by term
-```
+**Where it lives.** `gas_math::{SubmissionTier, TierTips, tier_outer_fee}` (the
+tables and the one tip rule), `settlement::decide_submission_fees` (the clamps),
+`execution::bundle_submission_tier` (one transaction, one price). The tier
+rides the **queue envelope**, not the UserOperation: it is not part of what the
+user signed, so it never enters the `userOpHash`, the admission fingerprint or
+the durable record. Tempo (§5) prices gas in pathUSD with no base fee to
+multiply and ignores the tier.
 
-so every tier funds its own cap with at least `3 × 0.6 / 1.4 = 9/7 = 1.286`
-to spare — the same +29% floor at `slow`, `standard` and `fast` alike, and the
-full `3/1.4 = 2.14` on a chain with no base fee. Measured on Ethereum
-2026-09-20 (`base = 0.0535` gwei) the payment funds **2.70 / 3.27 / 4.98 ×
-base_fee** against caps of 1.5 / 2.0 / 3.0 × (it was 2.49 / 3.13 / 4.42 when
-the tip was unscaled: a bigger tip rides whole into `R`, so the payment grows
-with the cap rather than against it). Pinned by
-`every_tier_fits_inside_the_headroom_a_normal_client_payment_leaves` and
-`every_tier_funds_its_own_cap_with_at_least_the_twenty_nine_percent_band`.
-
-**One clamp did widen.** A client that prices the tier it names is unaffected —
-that is the property above. A client that anchors on its **own** chain
-measurement `C = base + tip` and then names `fast` (an old wallet that ignores
-`networkFeePerGas`, or one that priced `slow`) funds `3C/1.4 = 2.14 × (base +
-tip)` against a cap that grew from `3·base + tip` to `3·base + 2·tip`. That cap
-is now clamped whenever `tip < 6 × base`, where before it was clamped only
-below `tip < 0.75 × base`. Clamping is the safe direction — the relay buys what
-the payment funds and stops there, never a loss — but a mis-priced `fast` now
-degrades toward `standard` in far more markets, which is exactly the incentive
-to price the tier you name. Pinned by
-`scaling_the_tip_widens_the_clamp_for_a_client_that_did_not_price_the_tier`.
-
-**Where it lives.** `gas_math::{SubmissionTier, tier_tip, tier_outer_fee}` (the
-names and both multipliers; `tier_outer_fee` returns an `OuterFee` — the cap
-*and* the tip — so no caller can assign one and forget the other),
-`settlement::decide_submission_fees` (the clamps),
-`execution::bundle_submission_tier` (one transaction, one price: a bundle takes
-the fastest speed any member named, and a member that named none counts as
-`standard`). The tier rides the **queue envelope**, not the UserOperation: it is
-not part of what the user signed, so it never enters the `userOpHash`, the
-admission fingerprint or the durable record. Tempo (§5) prices gas in pathUSD
-with no base fee to multiply and ignores the tier.
-
-## 2b. The quote — the four numbers reported per tier
-
-`pimlico_getUserOperationGasPrice` returns one row per tier, and each number in
-it has exactly one meaning. With `m` the tier's base-fee multiplier and
-`tip[tier] = tip_bps × market_tip` its scaled tip, both from §2a:
+## 2b. The quote — what `pimlico_getUserOperationGasPrice` reports per tier
 
 | field | meaning | value |
 |---|---|---|
-| `maxFeePerGas` | the cap the relay **will actually submit at** | `m × base_fee + tip[tier]` |
-| `maxPriorityFeePerGas` | the tip the relay **will actually sign with** | `tip[tier]` |
-| `networkFeePerGas` (`R`) | what the client must **reimburse against** (§3) | `0.6 × m × base_fee + tip[tier]` |
-| `relayerFeePerGas` | `maxFeePerGas − networkFeePerGas`: the inclusion headroom the cap holds above the reimbursement basis | `0.4 × m × base_fee` |
+| `maxFeePerGas` | the cap the relay **will submit at** | `base_fee_bps × base_fee + tip[tier]` |
+| `maxPriorityFeePerGas` | the tip the relay **will sign with** | `tip[tier]` (§2a) |
+| `inBandFeePerGas` | what a client pays **per unit of `settlementGas`** (§3) | `markup × drift × maxFeePerGas`, rounded up — `1.1 × maxFeePerGas` by default |
+| `networkFeePerGas` (`R`) | what a wallet pricing the **limits** reimburses against (§3), frozen | `0.9 / 1.2 / 1.8 × base_fee + 1.00 / 1.25 / 2.00 × market tip` |
+| `relayerFeePerGas` | `maxFeePerGas − networkFeePerGas`, saturating at 0 | |
 
-So `R` is **0.9 / 1.2 / 1.8 × base_fee** plus **1.00 / 1.25 / 2.00 × the market
-tip** for `slow` / `standard` / `fast`. The tip terms cancel in
-`relayerFeePerGas`, which is why the headroom is purely the base-fee part.
+`base_fee` is the next block's (the last `baseFeePerGas` of the fee history);
+the executor prices the cap on the latest block's when it submits, which a
+block later is the same number.
 
-**The reported `maxPriorityFeePerGas` is per tier, and it is the number the
-relay signs with.** Both come from the same `tier_outer_fee`, applied to the
-same market tip, so a wallet can never be shown one tip and charged for
-another. That coherence is the quote-side half of the defect in §2a: a
-reported tip that did not match the signed one would mislead the tier picker
-exactly as a signed tip that did not match the tier misled the builder.
+**What is quoted is what is signed.** The quote and the executor read the tier
+tips by one rule (`gas_math::TierTips::resolve`) from the same
+`eth_feeHistory(tip_window_blocks(chain), "latest", [25, 50, 70])`
+(`gas_math::tip_history_params`): the quote through the request's failover
+chain, the executor in its transaction-context batch at submit time. Fed the
+same answers they produce the same tip and the same cap, to the wei (pinned by
+`the_tip_reported_for_a_tier_is_the_tip_the_executor_signs_given_the_same_rpc_answers`,
+over Polygon busy and quiet, Arbitrum, Base, Optimism, Ethereum, BSC and a
+rising base fee). They are not always fed the same answers — they ask
+different nodes, a little apart in time — so the reading is built to agree
+anyway: a median over at least a minute of blocks, which a quote and its
+submission mostly share; a node's tip only where the blocks bear it out
+(pinned by `a_quote_from_one_node_is_accepted_by_an_executor_that_asks_another`);
+and where they still differ, the clamps of §2a decide, shaving rather than
+holding (`a_quote_read_in_a_quiet_window_is_not_held_when_the_next_one_is_busy`).
 
-**The market tip is one reading, resolved one way.** `gas_math::market_tip` is
-called by the quote (`pimlico_getUserOperationGasPrice`, docker and Worker)
-and by the executor (`transaction_context`, docker and Worker, and the
-simulation-contract deployer):
+**`inBandFeePerGas`** — `settlement markup × IN_BAND_DRIFT × cap`
+(`gas_math::in_band_fee_per_gas`), with the operator's configured markup and
+`IN_BAND_DRIFT_BPS = 10000` (the backtest found no allowance was needed, §2c).
+Paid on `settlementGas`, it funds the executor's whole requirement at the cap
+the quote names; a base fee that rose before the submission is absorbed by
+repricing that cap down toward the inclusion floor, keeping the tip (§2).
+It is published exactly where `eth_estimateUserOperationGas` returns
+`settlementGas` — on a chain whose executor bills measured gas (§1a) — and
+omitted elsewhere, so no client can multiply it by gas the relay does not bill
+on.
 
-1. the node's `eth_maxPriorityFeePerGas`, whatever it returns — **zero
-   included**;
-2. only when that call gave no quantity: `eth_gasPrice −` the **latest**
-   block's base fee.
+**Why `networkFeePerGas` is frozen.** vela-wallet before `settlementGas` pays
+`3 × padded limits × max(C, R)` and **refuses** a quote with `R > 3 × C`, where
+`C = max(eth_gasPrice, base_fee + eth_maxPriorityFeePerGas)` is its own reading.
+On Ethereum that tip reads ~0, so `C` is the bare base fee; a reward-percentile
+tip carried into `R` would put `R` above `3 × C` whenever the base fee is low —
+most of the time — and those wallets could not send at all. So `R` keeps its
+earlier definition over the market tip, those wallets pay exactly what they
+did, and what they pay on their padded limits still funds the tier they name
+(§3; pinned by `a_wallet_that_prices_the_limits_is_still_accepted_at_its_tier`
+and `the_reimbursement_basis_is_frozen_for_wallets_that_price_limits`). The
+deployed relay's `R` at block 26,149,237 — 2,505,999,999 / 3,341,333,332 /
+5,011,999,998 wei — is reproduced to the wei.
 
-`eth_maxPriorityFeePerGas` is the node's own answer to what clears, so it
-carries a chain's enforced minimum, which is what makes `slow`'s unscaled
-`1.00×` safe (§2a). Step 2 subtracts the latest block's base fee because
-`eth_gasPrice` is built as `suggested tip + head base fee`: on Polygon on
-2026-09-21, `278.534895357 − 250.761673410 = 27.773221947` gwei,
-`eth_maxPriorityFeePerGas` to the wei. The quote takes that base fee from the
-fee history it already holds (the second-to-last `baseFeePerGas`); subtracting
-the last one, the next block's projection, would have read 30.729 gwei. A zero
-is an answer, not an absence: Arbitrum reports `0x0`, and the executor has
-always signed it.
+**The market tip is one reading, resolved one way** (`gas_math::market_tip`):
+the node's `eth_maxPriorityFeePerGas`, zero included; only when that call gave
+no quantity, `eth_gasPrice −` the latest block's base fee. It is the untiered
+pace's tip, the floor under `slow` where the blocks bear it out, every tier's
+tip (scaled) in a quiet window, and `R`'s tip term. When neither yields a
+tip, the executor refuses to submit and only the quote falls back, to
+`base_fee / 200` (`gas_math::quote_market_tip`).
 
-**2026-09-21 — the quote's tip was not the signed tip.** Until then the quote
-took the median of `eth_feeHistory`'s 50th-percentile reward column, fell back
-to `eth_maxPriorityFeePerGas` only when that median was zero, and to
-`base_fee / 200` after that; the executor always signed
-`eth_maxPriorityFeePerGas` (else `eth_gasPrice − base`). They are different
-statistics — what recent
-blocks' median transaction tipped, against what the node says clears — and on
-Polygon they were three times apart. A live `standard` send:
+**Where it lives.** `gas_math::{tiers, tier_price, TierTips,
+in_band_fee_per_gas}`, rendered by both shells through one function,
+`wire::gas_price_tiers` (`src/app/rpc/handlers/user_operation_gas_price.rs` and
+`vela-relay-cf/src/http.rs`). A generic ERC-4337 bundler omits the last three
+fields.
+
+## 2c. Choosing the numbers — the backtest
+
+The cap multiples, the tip percentiles and window, the drift allowance, the
+inclusion floor and the markup were chosen by replaying 10.4 days of Ethereum
+mainnet: `eth_feeHistory` for blocks 26,076,210–26,150,961 (2026-09-28 to
+2026-10-08, 74,752 blocks; base fee median 0.178 gwei, 90th percentile 1.43,
+99.9th 10.65, peak 13.09) with reward percentiles 1–99. `docs/fees-backtest.py`
+fetches the history, runs the replay and prints the tables below
+(`… table history.jsonl '<parameters>'`).
+
+**The model.** A wallet quotes at block `q` (base fee `B = base[q+1]`, tips from
+the window ending at `q`) and pays `F = settlementGas × inBandFeePerGas[tier]`.
+The executor submits `a` blocks later — 1, 3 or 5 for a quote 12, 30 or 60 s
+old — reading `base[s]` and the window ending at `s`, and applies §2a and §2
+exactly as coded (the full tier, a repriced cap, a tip shaved to `tips.floor`,
+or a hold retried on the delayed-inbox ladder: 5, 10, 20, 40, 80, 160 s then
+every 300 s, 12 attempts, then rejected). Ethereum's 20-block window never
+reads quiet (its mean `gasUsedRatio` was never under 0.338) and its node tip
+(0 or ~10,000 wei) sits under every floor, so the tips are the window's
+percentiles throughout; in the 0.25% of windows under 40% a short payment may
+be shaved to 0.001 gwei. A signed bundle is counted included in the first
+later block whose base fee its cap covers and whose 25th-percentile reward its
+effective tip meets (the "lenient" proxy uses the 10th), looked for over the
+next 3,000 blocks (10 hours). A bundle not mined within them stays in every
+statistic, unmined, its delay counted as 3,000 blocks. The chain charges `gas
+used × (base + effective tip)`; the person's baseline is a Uniswap-like `gas
+used × (B + the window's median tip)`. Operation sizes are the
+investigation's: an ETH send uses 146,824 gas, an ERC-20 send 163,719, a swap
+291,357, a first operation from an undeployed Safe 504,609, each billed
+`buffered_gas` of it.
+
+**Wedges.** A signed transaction cannot be bumped: the outbox rebroadcasts its
+exact bytes. A bundle whose cap a later base fee passes before it is mined is
+*priced out* — unminable, and its lane's later nonces with it, until the base
+fee falls back — and one whose tip no block will take waits the same way. The
+replay reports both as *wedged*: signed and still unmined 5 and 30 minutes
+later, and the longest such wait. Its first version looked only 400 blocks
+ahead and dropped the bundles it did not find mined there, and so reported
+that "a higher floor left no fewer bundles priced out"; the wedges were in
+what it dropped (review, 2026-10-09).
+
+**The targets** (the owner's, 2026-10-09): `standard` and `fast` accepted at the
+first pass ≥ 99% for a quote ≤ 12 s old and ≥ 97% at 30 s; `slow` may wait,
+but its median delay is a few blocks; `fast` measurably earlier than
+`standard`, and `standard` than `slow`; `fast` at most about twice `slow`'s
+price; the relay never negative; and, among the parameter sets meeting all of
+that, the cheapest.
+
+**The candidates.** 456 sets in a first sweep and 168 in a second around the
+front-runners: drift allowance 1.0 / 1.0625 / 1.125; caps
+(slow, standard, fast) from 1.25 to 3.0; inclusion floors 1.125 / 1.25 / 1.5;
+tip percentiles (10…30, 40…50, 60…90); windows of 10 and 20 blocks. What
+failed: `fast` dearer than twice `slow` (every `fast` tip at the 75th
+percentile or above, and a `fast` cap of 2.0 or more); slow sends rejected
+after the whole hold budget (every set whose inclusion floor was `slow`'s own
+cap — a 1.5× floor under a 1.5× cap); `standard` and `fast` acceptance at 30 s
+for the sets with the narrowest gap between cap and floor. The first choice
+was the cheapest survivor: caps 1.5 / 1.5 / 1.75, tips at the 25th / 50th /
+70th percentile over 20 blocks, drift allowance 1.0, inclusion floor 1.125,
+markup 1.1.
+
+**The inclusion floor, revisited.** The floor never changes what a signed
+cap is — a repriced cap is whatever the payment funds — only which payments
+are signed at the bottom of their cap and which are held. A quote a block old
+funds more than 1.33× the base fee plus its tip, so at 12 s the floors up to
+1.33× differ only where the window's tip itself jumped within the block (4 in
+100,000 `slow` quotes). Older quotes:
+
+| floor | tier, quote age | accepted at the first pass | rejected after the hold budget | priced out after signing | wedged ≥ 30 min | longest wedge | lenient: priced out / wedged ≥ 30 min / longest |
+|---|---|---|---|---|---|---|---|
+| 1.125× | `slow`, 12s | 100.00% | 0.000% | 0.238% | 0.082% | 522 min | 0.028% / 0.018% / 522 min |
+| 1.125× | `slow`, 30s | 99.95% | 0.013% | 0.337% | 0.110% | 522 min | 0.035% / 0.021% / 522 min |
+| 1.125× | `slow`, 60s | 99.40% | 0.159% | 0.340% | 0.102% | 522 min | 0.017% / 0.010% / 325 min |
+| 1.125× | `standard`, 30s | 100.00% | 0.000% | 0.034% | 0.018% | 52 min | 0.015% / 0.014% / 52 min |
+| 1.125× | `standard`, 60s | 99.96% | 0.011% | 0.060% | 0.028% | 66 min | 0.021% / 0.020% / 66 min |
+| 1.25× | `slow`, 12s | 99.99% | 0.000% | 0.238% | 0.082% | 522 min | 0.028% / 0.018% / 522 min |
+| 1.25× | `slow`, 30s | 99.04% | 0.193% | 0.256% | 0.074% | 522 min | 0.007% / 0.004% / 113 min |
+| 1.25× | `slow`, 60s | 97.10% | 0.514% | 0.230% | 0.076% | 522 min | 0.008% / 0.006% / 113 min |
+| 1.25× | `standard`, 30s | 99.96% | 0.006% | 0.039% | 0.020% | 52 min | 0.015% / 0.014% / 52 min |
+| 1.25× | `standard`, 60s | 99.72% | 0.066% | 0.055% | 0.024% | 72 min | 0.021% / 0.017% / 66 min |
+| 1.5× | `slow`, 12s | 80.40% | 1.610% | 0.169% | 0.055% | 522 min | 0.011% / 0.009% / 113 min |
+| 1.5× | `slow`, 30s | 53.02% | 6.622% | 0.100% | 0.036% | 522 min | 0.006% / 0.004% / 113 min |
+| 1.5× | `slow`, 60s | 53.51% | 7.740% | 0.095% | 0.039% | 522 min | 0.009% / 0.006% / 113 min |
+| 1.5× | `standard`, 30s | 96.48% | 0.414% | 0.049% | 0.021% | 73 min | 0.020% / 0.014% / 52 min |
+| 1.5× | `standard`, 60s | 95.10% | 0.650% | 0.044% | 0.020% | 75 min | 0.010% / 0.010% / 66 min |
+
+On the lenient proxy 1.25× cuts the priced-out `slow` bundles of 30 s-old
+quotes to a fifth (0.035% → 0.007%; 60 s: 0.017% → 0.008%) and their longest
+wedge from 8.7 hours to 1.9, at the price of holding — and after 35 minutes
+rejecting — 0.19% of 30 s-old `slow` quotes (0.51% at 60 s) that 1.125×
+signed. A wallet that refreshes its quote before signing (§3) sits in the
+12 s rows, where nothing changes. 1.5× holds a fifth of fresh `slow` sends.
+The floor is 1.25×. (A drift allowance of 1.0625 on top — 6% dearer for every
+tier — brings the 30 s `slow` rejections back to 0.043%; it is left at 1.0.)
+No floor touches the longest wedge of all: a `slow` bundle signed at its
+whole 1.5× cap at 10:58 UTC on 2026-09-29, when the base fee rose from 0.34
+gwei to 7.05 and stayed above that cap for 522 minutes. Only a fee-bump path
+would end that one.
+
+**The choice:** caps 1.5 / 1.5 / 1.75, tips at the 25th / 50th / 70th
+percentile over 20 blocks, drift allowance 1.0, inclusion floor 1.25, markup
+1.1. Over the 10.4 days:
+
+| tier | quote age | accepted at the first pass | of which the whole tip | rejected after the hold budget | blocks to inclusion, mean / p90 / p99 / p99.9 | priced out after signing | wedged ≥ 5 min / ≥ 30 min | longest wedge |
+|---|---|---|---|---|---|---|---|---|
+| `slow` | 12s | 99.99% | 99.99% | 0.000% | 2.48 / 4 / 12 / 109 | 0.238% | 0.266% / 0.0825% | 522 min |
+| `slow` | 30s | 99.04% | 99.04% | 0.193% | 2.79 / 4 / 14 / 156 | 0.256% | 0.266% / 0.0742% | 522 min |
+| `slow` | 60s | 97.10% | 97.10% | 0.514% | 3.39 / 4 / 52 / 177 | 0.230% | 0.235% / 0.0759% | 522 min |
+| `standard` | 12s | 100.00% | 99.88% | 0.000% | 1.06 / 1 / 2 / 4 | 0.021% | 0.017% / 0.0126% | 50 min |
+| `standard` | 30s | 99.96% | 98.33% | 0.006% | 1.10 / 1 / 2 / 7 | 0.039% | 0.034% / 0.0196% | 52 min |
+| `standard` | 60s | 99.72% | 95.79% | 0.066% | 1.23 / 1 / 2 / 77 | 0.055% | 0.049% / 0.0238% | 72 min |
+| `fast` | 12s | 100.00% | 99.65% | 0.000% | 1.01 / 1 / 1 / 2 | 0.003% | 0.001% / 0.0014% | 37 min |
+| `fast` | 30s | 100.00% | 98.47% | 0.000% | 1.01 / 1 / 1 / 2 | 0.007% | 0.006% / 0.0056% | 47 min |
+| `fast` | 60s | 99.99% | 96.77% | 0.000% | 1.03 / 1 / 1 / 2 | 0.013% | 0.010% / 0.0098% | 47 min |
+
+("Accepted" counts the full tier, a repriced cap and a shaved tip; "of which
+the whole tip" excludes the shaved tip. Blocks are counted from the first
+submission attempt, holds included; an unmined bundle counts as 3,000. No
+bundle in any row stayed unmined for the 10 hours.)
+
+| tier | price ÷ `slow`'s, median | ETH send: paid ÷ baseline, median (p90) | swap: ditto | relay profit ÷ chain charge, ETH send: min / 1st pct / median | undeployed first op: ditto |
+|---|---|---|---|---|---|
+| `slow` | 1.00 | 1.56 (1.97) | 1.44 (1.82) | +49% / +80% / +120% | +33% / +60% / +96% |
+| `standard` | 1.28 | 1.99 (2.13) | 1.84 (1.97) | +49% / +70% / +98% | +33% / +52% / +77% |
+| `fast` | 1.88 | 2.94 (3.63) | 2.72 (3.36) | +49% / +64% / +100% | +33% / +47% / +79% |
+
+The prices do not depend on the floor: they are the first choice's. With a
+gas estimate 3% short of what the executor bills, `standard` and `fast` are
+still accepted with their whole tip ≥ 99.29% at 12 s and ≥ 96.25% at 30 s,
+and 0.35% of 30 s-old `slow` quotes are rejected.
+
+**The markup.** It decides price and guaranteed margin only — acceptance is the
+same at every markup, because the published price scales with it. Over the
+replay (`standard`, ETH send, 12 s): 1.0× pays 1.81× the baseline with a
+worst-case profit of +35% (+21% on an undeployed first op); 1.05× 1.90× and
++42%; **1.1× 1.99× and +49% (+33%)**; 1.2× 2.17×; 1.4× 2.53×. 1.0× also meets
+every target; 1.1× is chosen so that the margin the relay is *guaranteed* — the
+one left when a spike consumes the whole cap and the operation burns its whole
+gas buffer — still pays for what no operation is billed for (relayer top-ups, a
+bundle that reverts on-chain) rather than breaking even. An operator who
+prefers the cheapest set sets `VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS=10000`;
+every published price follows, because both shells price `inBandFeePerGas`
+with the executor's own configured markup.
+
+The parameters were fitted to Ethereum, the chain where gas is a person's real
+cost. Elsewhere the same tables apply; on the cheap chains the `$0.01` floor is
+the price anyway (§1), and the tips carry each chain's own market (§2a: a
+minute of its blocks, the node's tip in quiet ones). Replayed over one to four
+hours of each chain's fee history (2026-10-09) for an ETH-send-sized operation
+quoted 12 s before its submission: BNB Smart Chain signs 0.05 / 0.05 / 0.057
+gwei, holds nothing — every send was held when the executor's node answered 1
+gwei before the node's tip stopped being an unconditional floor — and shaves
+4% of `fast` tips where the 20-block window shaved 19%; Polygon signs 30 /
+37.5 / 60 gwei where it signed the percentiles (82–126 gwei in that history),
+holds 0.4% of `slow` sends where it held 1.2%, and charges the `$0.01` floor
+93% of the time; Avalanche signs 0.001–0.002 gwei tips where it signed
+0.9–1.5 and holds none; Gnosis is the floor throughout.
+
+## 3. What a CLIENT should pay
+
+The relay publishes the price so the client does not re-derive it:
 
 ```
-quoted:  maxFeePerGas 600.7 gwei | maxPriorityFeePerGas 107.7 gwei    (slow 86.2, fast 172.4)
-signed:  Max 536.5544999 Gwei    | Max Priority 34.71688084 Gwei       (= 1.25 × 27.773504672)
-         Gas Price (effective) 282.5 gwei
+F = max( settlementGas × inBandFeePerGas[tier] ,  settlementGas × own_check(tier) ,  dust floor )
 ```
 
-The wallet showed a `standard` tip of 107.7 gwei and priced `R` on it — `R`
-carries the tip whole — while the relay paid the builder 34.72. The three
-tiers the picker compared were not the tips any send would buy. One batch per
-chain from a public endpoint (drpc) the same day shows how far the two
-statistics wander:
+- **`settlementGas`** comes from `eth_estimateUserOperationGas` (§1a), the gas
+  the executor will bill; **`inBandFeePerGas[tier]`** from
+  `pimlico_getUserOperationGasPrice` (§2b) for the tier the client will NAME on
+  `eth_sendUserOperation`.
+- **`own_check(tier)`** is the same published formula applied to the client's
+  own chain measurement, so a relay reading a lagging market cannot under-price
+  it: `markup × drift × (base_fee_bps[tier] × base_fee + tip[tier])`, with the
+  markup the relay applies (1.1× by default), the drift allowance (1.0), the
+  tables of §2a, and the client's own `base_fee` and tier tips — read, for an
+  exact match, as the relay reads them (§2a: `eth_feeHistory` over the
+  chain's tip window, the median of each column — or the node's tip scaled in
+  a quiet window — `slow` at least 0.001 gwei once the window paid any tip and
+  at least the node's tip where the blocks bear it out, each faster tier at
+  least the slower one).
+- **The dust floor**: at least `$0.01` of the native coin (and never below the
+  relay's `0.00001`-coin floor), or `$0.01` of a stablecoin.
+- **A fresh quote.** The acceptance table in §2c is for quotes 12, 30 and 60 s
+  old. A client that re-quotes once a block while the confirm surface is up,
+  and refreshes a quote older than a block before signing, sits in the 12 s
+  row.
+- **A sanity bound.** A relay figure far above the client's own reading is
+  refused rather than paid (vela-wallet: `R > 3 × C`).
 
-| chain | old quote tip (reward median, else its fallbacks) | `eth_maxPriorityFeePerGas` — signed then, quoted now |
-|---|---|---|
-| Polygon | 86.072 gwei | 27.773 gwei |
-| Ethereum | 0.2 gwei | 27,224 wei |
-| Optimism | 100,000 wei | 1,000,000 wei (the call timed out; `eth_gasPrice − base`) |
-| Base | 1,000,000 wei | 1,000,000 wei |
-| Arbitrum | 100,380 wei (median and node both 0, so `base / 200`) | 0 |
+**On a chain without `settlementGas`** (§1a: the executor bills the outer
+limit there), and with a relay older than this contract, the client prices the
+returned gas limits as before: `3 × (verificationGasLimit + callGasLimit +
+preVerificationGas + overhead) × max(C, R)`. That pays far more than the
+requirement and is always accepted.
 
-The fix is the shared function: both paths call `market_tip`, so a reported
-tier tip and a signed one come from the same reading by construction. Pinned
-by `the_tip_reported_for_a_tier_is_the_tip_the_executor_signs_given_the_same_rpc_answers`
-(every tier, over the markets above plus the no-answer and rising-base-fee
-shapes) and `the_polygon_quote_reports_the_tip_the_executor_signed_not_the_fee_history_median`
-(the verbatim Polygon batch, and the receipt's 34.71688084 gwei to the wei).
+**A wallet that prices the limits on a relay that bills used gas** — vela-wallet
+before `settlementGas` — overpays, and is accepted at the whole tier it names:
+at block 26,149,237 its `3 × padded limits × max(C, R)` funds every tier of
+every operation class at its full cap and tip (pinned by
+`a_wallet_that_prices_the_limits_is_still_accepted_at_its_tier`). Its `R`
+stays inside its own `R > 3 × C` refusal because `R` is frozen (§2b).
 
-**Where the quote and the executor still differ, and why.**
+### What it costs, worked out
 
-- *The base fee.* The quote prices every tier on the **next** block's base fee
-  (the last `baseFeePerGas`); the executor on the **latest** block's, read
-  again at submit time. The tip does not depend on it; the cap does, by at
-  most one block's 12.5% move, and a quote is always older than its
-  submission anyway.
-- *No tip at all.* When `eth_maxPriorityFeePerGas` gives no quantity and
-  `eth_gasPrice` is unusable (absent, or below the base fee), the executor
-  refuses to build the transaction and the operation waits for a later pass.
-  Only the quote falls back, to `base_fee / 200` (`gas_math::quote_market_tip`),
-  rather than going dark — a price for a market the relay will not sign in at
-  that moment.
-- *No fee history.* A chain whose `eth_feeHistory` fails is quoted from
-  `eth_gasPrice` alone as an all-tip market (base 0); the executor needs an
-  EIP-1559 base fee in the latest block and refuses without one. Unchanged.
-- *Transport.* The quote reads through the request's failover chain (the
-  caller's `x-vela-rpc-url`, then Alchemy, then the public list); the executor
-  through its own RPC, whose quantity parser also refuses a non-canonical
-  answer (`0x01`) the quote's accepts. The same rule over different nodes can
-  still read different numbers; the rule no longer adds a difference of its
-  own.
+The investigation's block, 26,149,237 (base 2.78 gwei, ETH $2,423.92), for the
+2026-10-02 ETH send (`settlementGas` 208,070, gas used 146,824):
 
-**Where the 0.6 comes from, and what it applies to.** Before per-tier pricing
-the relay reported one network price, `1.2 × base`, and submitted at one cap,
-`2 × base`. Neither number mattered alone — their **ratio** did, because the
-client pays `INBAND_MARKUP = 3 × gas × R` while the relay requires
-`1.4 × gas × cap` (§1):
-
-```
-1.2 / 2.0 = 0.6      →      3 × (0.6 × cap)     1.8
-                            ───────────────  =  ───  =  1.286     (+29%)
-                               1.4 × cap        1.4
-```
-
-**The 0.6 applies to the base-fee term only; the tier's tip rides into `R`
-whole**, exactly as it rides into the cap whole. Sharing the same `tip[tier]`
-on both sides is what makes the funding property algebraic rather than
-tabulated:
-
-```
-3R − 1.4 × cap  =  0.4 × m × base_fee  +  1.6 × tip[tier]   ≥ 0
-```
-
-`fast` funds a `3 × base` cap and a `2 × tip` priority with the same +29% floor
-that `standard` funds its own with. 1.286 is the **floor** of that margin, not
-its value: on a chain with no base fee `R = cap` and the margin is the full
-`3 / 1.4 = 2.14`.
-
-**Three consequences worth stating outright.**
-
-- **`standard` keeps the old single price's base-fee term, not its tip term.**
-  `0.6 × 2.0 = 1.2`, and the division rounds up exactly as the old
-  `base_fee_multiplier = 120` did, so `standard.networkFeePerGas`'s base-fee
-  part is the same wei for every base fee. Its tip part is now `1.25 ×` the
-  market tip, because a tier that did not move the tip bought no speed. Pinned
-  by `the_standard_base_fee_term_is_byte_for_byte_the_price_the_relay_used_to_report`.
-  What remains byte-for-byte unchanged end to end is **naming no tier at all**.
-- **A zero-base-fee chain finally differentiates.** On BSC `baseFeePerGas` is 0
-  and the whole price is the tip, so cap, `R` and the tip all coincide — and
-  under a cap-only tier all three rows were one number and one speed. Scaling
-  the tip is the *only* thing that can tell them apart there, and now does:
-  `1.00 / 1.25 / 2.00 ×` the tip, in every field. This was the second half of
-  the same defect, and BSC is the chain that HIDES it. **Never validate a
-  pricing or speed change on BSC alone.** Pinned by
-  `a_zero_base_fee_chain_finally_differentiates_its_tiers` and
-  `a_chain_with_no_base_fee_differentiates_its_tiers_through_the_tip`.
-- **The inclusion floor is computed from the tier's tip.** It is a multiple of
-  the base fee *plus the tip*, so with `base_fee = 0` it collapses to exactly
-  `tip[tier]` — which is also the cap. It binds precisely and does nothing
-  silly: it neither vanishes to zero (which would let the relay sign a tipless
-  transaction no BSC validator would mine) nor overshoots the cap it lifts.
-
-**The client's `GasQuoteTooHigh` guard still cannot trip on this.** vela-core
-refuses a quote with `R > 3 × C` (`MAX_QUOTE_VS_CHAIN_MULTIPLE`), where `C` is
-its own measurement, `max(eth_gasPrice, base_fee + tip) ≥ base_fee + tip`. The
-largest `R` is `fast`'s, and its tip is now doubled:
-
-```
-R[fast] = ceil(1.8 × base) + 2 × tip  ≤  1.8 × base + 1 + 2 × tip
-                                      ≤  3 × base + 3 × tip  =  3 × C
-```
-
-for any `base + tip ≥ 1`, since the slack `1.2 × base + tip − 1` is then ≥ 0.
-`R[fast] / C` is a weighted average of the two pure cases — **1.8** when the
-tip vanishes and **2.0** when the base fee does — so its supremum rose from 1.8
-to **2.0**, still a third below the limit of 3. On the Polygon receipt market
-above (base 250.710, tip 30.35 gwei) the ratio is **1.822**; on BSC it is
-exactly 2.0. The guard only bites if the relay reads a market more than `1.5 ×`
-the one the client read moments earlier — a spike between two reads, not a
-property of this pricing. Pinned by
-`the_fast_basis_stays_far_inside_the_clients_three_times_chain_refusal`, over a
-market set that deliberately includes both degenerate shapes (`base = 0` and
-`tip = 0`).
-
-**Where it lives.** `gas_math::{market_tip, quote_market_tip}` (the tip),
-`gas_math::{tier_price, tier_tip, tier_network_fee,
-REIMBURSEMENT_BASIS_BPS}` and `gas_math::tiers`, reported through
-`wire::GasPriceTier` by both shells (`src/app/rpc/handlers/user_operation_gas_price.rs`
-and `vela-relay-cf/src/http.rs`, which share one conversion shape). A generic
-ERC-4337 bundler omits `networkFeePerGas`/`relayerFeePerGas`; this relay never
-does.
-
-## 3. What a CLIENT should pay (and why it must exceed the relay minimum)
-
-A client that pays *exactly* the relay's instantaneous requirement is doomed: the
-base fee at inclusion is almost always higher than at quote time, so the signed
-payment falls short and the op is rejected. **A client must over-pay at quote
-time to absorb the quote→inclusion gas drift.** But it must also protect itself —
-a client that blindly paid whatever the relay quoted could be over-charged by a
-malicious or buggy quote. The vela-wallet client resolves both by keeping the
-relay quote in its proper place: a *floor reference and an audited input*, never
-the unquestioned anchor. All of this lives twice, held identical by
-`fee-policy-parity.test.ts`: `fee_policy.rs` (Rust/WASM, web) and
-`safe-transaction.ts` (TS twin, native).
-
-**Two gas numbers, distinct roles:**
-
-- **`C` — the client's own chain measurement.** `deriveChainGasPrice =
-  max(eth_gasPrice, base_fee + tip)`. Objective, independent of the relay.
-- **`R` — the relay's quoted `networkFeePerGas` for the tier the client
-  named** (§2b): `0.9 / 1.2 / 1.8 × base_fee` plus `1.00 / 1.25 / 2.00 ×` the
-  market tip. It is **per tier in both terms**: a client that asks for `fast`
-  is quoted, and must pay against, a larger `R` than one that asks for `slow`,
-  and that is precisely how a tier comes to cost something — including on a
-  chain with no base fee, where the tip term is the whole of it. A quote with
-  `networkFeePerGas` absent makes `accept_bundler_quote` fall back to
-  `chain_gas_price`, which collapses every tier onto `C` and leaves the tier
-  picker inert — the defect the field exists to close.
-
-The pricing pipeline, in order:
-
-```
-① reject:   if R > 3 × C   →  GasQuoteTooHigh (never signed)   (MAX_QUOTE_VS_CHAIN_MULTIPLE = 3)
-② anchor:   basis = max(C, R)
-③ pay:      payment = max( 3 × gas × basis ,  floor )          (INBAND_MARKUP = 3)
-```
-
-**① Reject an outrageous quote.** Before anything is signed, `R > 3 × C` is
-refused rather than paid. The denominator is the client's *own* measurement `C`,
-so the check cannot be fooled by the very quote it is auditing.
-
-**② Anchor on `max(C, R)`, not on `R` alone.** This never lets the 3× drift buffer
-ride on an unvetted quote, and it stops a relay *under-report* (`R < C`) from
-making the client underpay — the client already measured the true cost `C`. It
-still ignores the relay's `requiredAmount` field entirely and self-computes.
-
-**③ Over-pay 3× for drift.** The flat `3×` on `max(C, R)` (vs the relay's 1.4×
-requirement) is the quote→inclusion buffer. The signed amount is what the confirm
-screen displayed — it is **not** re-priced just before submit (a 30 s quote TTL is
-advisory, not enforced), so the whole buffer must live in that 3×. `max(C, R) = R`
-in the normal case for `standard` and `fast` (`R = 1.2 × base + 1.25 × tip` and
-`1.8 × base + 2 × tip`, both `≥ C`), so the drift math below is unchanged from
-anchoring on `R`; when the relay under-reports, the client simply pays more.
-**`slow` is the one tier where the anchor routinely falls back to `C`** — its
-`R = 0.9 × base + tip` sits just *below* `base + tip`, and its tip is
-unscaled — so a `slow` send costs the client its own chain measurement, not
-less. That is the floor the anchor exists to provide: `slow` buys a lower
-submit cap, never an under-payment, and never a tip below the market's.
-
-**Floors (client self-imposed).** The client harmonizes the native minimum with
-the stablecoin one — both **$0.01 of value**:
-
-- stablecoin payment: at least `$0.01` (unchanged);
-- native payment: at least **`$0.01` worth of native** when the coin is priced,
-  but never below the relay's `0.00001`-coin admission floor (on a coin dearer
-  than ~$1000, `$0.01` buys *less* than 0.00001 of it, and §1's floor must still
-  be met);
-- native payment with **no USD price**: a flat **`0.001`-coin** blind fallback
-  (nothing to value it against).
-
-These are the *client's* minimums; the relay still admits any op meeting its own
-`0.00001`-native / `$0.01`-stable floor (§1), so the client paying more only ever
-helps. All floors bind only on near-zero-gas ops — the normal 3× gas payment sits
-far above them.
-
-### Headroom, worked out
-
-Two bases differ: the client prices against `R` at quote time, the relay settles
-against `m × base' + tip[tier]` at inclusion time. Netting the client's 3×
-against the relay's 1.4×, with the default 1.5×base inclusion floor and
-tip ≈ 0, the tolerance is **per tier** — because a bigger cap bought at quote
-time is a bigger cushion to reprice down through:
-
-| tier | anchor | fully paid up to | repriced up to | above that |
+| tier | `inBandFeePerGas` | paid | the chain charges | the deployed wallet + relay quoted |
 |---|---|---|---|---|
-| `slow` | `C` (its `R = 0.9×base + tip` sits below `C`) | **~1.43×** (+43%) | — (its cap already **is** the inclusion floor, so there is nothing to reprice down to) | **FloorUnfundable**, cleanly rejected |
-| `standard` | `R = 1.2×base + 1.25×tip` | **~1.29×** (+29%) | **~1.71×** (+71%) | **FloorUnfundable**, cleanly rejected |
-| `fast` | `R = 1.8×base + 2×tip` | **~1.29×** (+29%) | **~2.57×** (+157%) | **FloorUnfundable**, cleanly rejected |
+| `slow` | 4.756 gwei | $2.40 | ~$1.04 | $11.80 |
+| `standard` | 5.694 gwei | $2.87 | ~$1.35 | $14.19 |
+| `fast` | 7.335 gwei | $3.70 | ~$1.63 | $21.28 |
 
-These base-fee multiples are exactly what they were before the tip was scaled —
-the tip terms cancel out of the ratio at `tip ≈ 0`. With a real tip the bands
-are **wider** than the table, by `1.14 × tip[tier] / m` on the fully-paid bound
-and `0.76 × tip[tier]` on the reprice bound, so `fast`'s doubled tip buys extra
-drift tolerance as well as priority. `slow` trades the reprice band away for
-the cheapest cap, which is exactly what "slow" should buy. Every larger spike
-fails safe (a rejected send, never an under-charge or a loss to the relay).
+Pinned by `what_an_ethereum_send_costs_at_each_tier`. For every operation class
+and tier, `a_wallet_paying_the_published_price_on_settlement_gas_is_accepted_at_its_tier`
+checks that this payment funds the requirement at the quote's block, is still
+accepted at the whole tier tip after one block of the largest base-fee rise,
+and leaves the relay paid above the most the chain can charge.
 
-**Repricing can never shave the tip.** The reprice floor is
-`1.5 × base' + tip[tier]` — computed from the **tier's** tip, not the market
-one — so a repriced cap still clears `base' + tip[tier]` and the builder is
-paid in full. A reprice that clawed back the priority the client paid for would
-be the §2a defect arriving by a different door. Pinned by
-`a_reprice_can_never_shave_the_tip_the_client_paid_for`.
+**The margins it guarantees.** Against the requirement at the cap the quote
+named, a client following this section pays it exactly (times its estimate's
+slack over the executor's billing: 1.002–1.046 on the replayed operations).
+The base fee may then rise before the submission by:
 
-The exact numbers move with the tip, the client's gas padding (it pads limits
-×1.5), and which tier the client priced against; the shape (direct-accept band
-→ reprice band → clean-reject) is fixed by the rule.
+| tier | the whole tip, the cap repriced | the tip shaved toward `tips.floor` | above that |
+|---|---|---|---|
+| `slow` | +20% (1.5 / 1.25) | — (its tip is the window's floor) | held, then rejected |
+| `standard` | +20%, plus what its tip over the floor buys | down to `tips.floor` | held, then rejected |
+| `fast` | +40% (1.75 / 1.25), plus the same | down to `tips.floor` | held, then rejected |
 
-### Integration caveats worth knowing
-
-- **The two fee bases are not identical, but their ratio is fixed.** The client
-  prices against `R = 0.6 × m × base + tip[tier]`; the relay settles against
-  `m × base' + tip[tier]`. The 0.6 is chosen so the 3× client markup clears the
-  1.4× requirement by 29% at every `m` (§2b), and the shared, unscaled
-  `tip[tier]` on both sides is what makes that hold term by term — a client
-  that lowered its markup toward the relay's 1.4× would lose almost all drift
-  tolerance, at every tier alike.
-- **The client must name on `eth_sendUserOperation` the same tier it priced.**
-  Pricing off `fast` and submitting with no tier named over-pays for a
-  `2 × base` cap at the bare market tip; pricing off `slow` (or off no
-  `networkFeePerGas` at all) and naming `fast` under-funds a `3 × base + 2 ×
-  tip` cap, which is clamped down toward `standard`. Scaling the tip widened
-  that clamp considerably — it now bites whenever `tip < 6 × base`, against
-  `tip < 0.75 × base` before (§2a) — so mis-pricing is more visible than it
-  was. Clamping is always the safe direction; it is never a loss to either
-  side, only a slower send than was asked for.
-- **The client's floors now sit at or above the relay's.** The client's native
-  minimum is `$0.01` of value (or a `0.001`-coin fallback when the coin is
-  unpriced), while the relay admits down to `0.00001` native — so at the dust
-  floor the client *over-*pays rather than pinning exactly at the relay minimum.
-  The old zero-headroom-at-the-floor shortfall (when the floors were equal) is
-  gone; a near-zero-gas op is cushioned there too.
-- **A quote far above the chain rate is rejected, not paid.** If `R > 3 × C` the
-  client fails closed (`GasQuoteTooHigh`) and the user retries with a fresh quote.
-  A genuine, sudden >3× mempool spike between the client's measurement and the
-  relay's quote is therefore a (rare) rejected send, never an over-charge.
-- **No client-side re-price before submit** (confirm-UI flow): the drift budget
-  is entirely the 3× buffer. A user sitting on the confirm screen past the 30 s
-  TTL spends that budget on think-time.
+(at a tip small beside the base fee; a real tip widens every band, since the
+cap a payment funds carries it whole). Every larger move fails safe: a held,
+then rejected send, never an under-charge or a loss to the relay. One block of
+the largest rise is 12.5%, so a quote a block old is accepted at its whole
+tier; two blocks of it (26.6%) is past `slow`'s, which is why a wallet
+refreshes a quote older than a block before signing. The backtest in §2c
+measures the rest.
 
 ## 4. Stablecoin payments
 
@@ -588,8 +730,8 @@ final bundle simulation.
 ## 5. Tempo (pathUSD gas)
 
 Tempo chains have no native gas coin; the relay prices gas directly in pathUSD
-(attodollar-denominated), applies the same 1.4× in-band markup with the same
-`$0.01` floor (`marked_tempo_cost`), and signs the outer transaction with Tempo's
+(attodollar-denominated), applies the same settlement markup (1.1× by default)
+over its outer limit with the same `$0.01` floor (`marked_tempo_cost`), and signs the outer transaction with Tempo's
 `0x76` envelope paying fees in pathUSD. The client mirrors this with a separate
 Tempo model (2× margin plus an explicit gas/split cushion annotated "must match
 vela-relay", added after a real sub-floor deploy rejection). A submission tier
@@ -601,59 +743,50 @@ speed.)
 
 ## 6. Summary
 
-- The relay requires `max(1.4 × gas × (2×base+tip), floor)`, recovers 1.4× its
-  gas, and rounds every step in its own favor with fail-closed overflow.
-- Repricing turns the `2×base` headroom into a live safety valve: a short-but-
-  honest payment is repriced down to a fundable fee rather than rejected, down to
-  the 1.5×base inclusion floor.
-- A client may name a submission speed (`slow`/`standard`/`fast`) as an optional
-  third `eth_sendUserOperation` parameter. **The name selects TWO multipliers,
-  not one**: a base-fee multiplier for the submit cap (1.5/2.0/3.0×) and a tip
-  multiplier for `maxPriorityFeePerGas` (1.00/1.25/2.00×). Naming nothing is
-  byte-for-byte today's behaviour; naming `standard` now differs from it by the
-  tip scale alone. The cap is clamped down to what the bundle's weakest
-  reimbursement funds and up to the inclusion floor; the tip is never clamped.
-- **Only the tip buys speed.** Builders order by
-  `min(maxPriorityFeePerGas, maxFeePerGas − baseFee)`, which a bigger cap does
-  not move. A mined Polygon `fast` receipt (base 250.710, max 775.525, max
-  priority 30.35 gwei) paid the builder exactly what `slow` would have — the
-  defect this design closes. `slow`'s tip is floored at the market tip because
-  the relay has no per-chain minimum-tip knowledge and an under-tip is rejected
-  outright, not merely mined late; `slow` saves on the cap instead.
-- **The market tip is the node's `eth_maxPriorityFeePerGas`**, else
-  `eth_gasPrice −` the latest base fee — one function, `gas_math::market_tip`,
-  for the quote and the executor alike. Until 2026-09-21 the quote used
-  `eth_feeHistory`'s median reward instead, and on Polygon quoted a
-  `standard` tip of 107.7 gwei the relay then signed at 34.72.
-- **A tier is that pair, and its quoted price derives from it.**
-  `pimlico_getUserOperationGasPrice` reports, per tier, `maxFeePerGas` = the cap
-  (`1.5/2.0/3.0 × base + tip[tier]`), `maxPriorityFeePerGas` = `tip[tier]` —
-  the tip the relay will actually sign with — `networkFeePerGas` = `R` =
-  `0.6 ×` the cap's base-fee part plus that same tip whole
-  (`0.9/1.2/1.8 × base + tip[tier]`), and `relayerFeePerGas` = the difference,
-  which is pure base-fee headroom. Sharing `tip[tier]` across cap and basis
-  makes `3R − 1.4 × cap = 0.4·m·base + 1.6·tip[tier] ≥ 0` — every tier funds
-  itself, by construction, with at least `3 × 0.6 / 1.4 = 1.286`. `standard`
-  reproduces the old single price's base-fee term exactly; only its tip term
-  moved.
-- **A zero-base-fee chain (BSC) finally differentiates.** Cap, `R` and tip all
-  collapse onto `tip[tier]` there, so the three tiers are `1.0 / 1.25 / 2.0 ×`
-  the market tip — three prices that at last buy three different blocks. Never
-  validate a pricing or speed change on BSC alone.
-- A client must pay above the relay minimum to survive gas drift; vela-wallet
-  pays a flat 3× on `max(C, R)` — its own chain measurement `C`, floored by the
-  relay quote `R` for the tier it named — giving a **+43% / +71% / +157%**
-  base-fee-spike tolerance at `slow` / `standard` / `fast` before a clean,
-  loss-free rejection.
-- The client protects itself both ways: it rejects a quote `R > 3 × C`
-  (`GasQuoteTooHigh`) instead of paying it, and anchoring on `max(C, R)` stops a
-  relay under-report from making it underpay. Doubling `fast`'s tip raised the
-  supremum of `R[fast]/C` from 1.8 to **2.0** (reached only where the base fee
-  is zero), still a third below the limit of 3, so the refusal cannot trip on
-  this pricing.
-- The client's own minimums are value-consistent — `$0.01` worth of native
-  (`0.001`-coin when unpriced) and `$0.01` stable — sitting at or above the
-  relay's `0.00001`-native / `$0.01`-stable admission floor, so paying them only
-  ever helps.
+- The relay requires `max(markup × settlement_gas × cap, floor)`: a 1.1× markup
+  (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`), the cap the outer transaction
+  is signed with, and the `0.00001`-coin / `$0.01` dust floor. It rounds every
+  step in its own favor with fail-closed overflow.
+- **It bills the gas a bundle uses, not the gas it reserves** (§1a): on
+  Ethereum and the other listed chains, the measured gas plus 15% and 30,000
+  (never past the operations' own limits, the same cap `settlementGas` is
+  promised by); the outer LIMIT stays estimate-based so no bundle runs out of
+  gas. Avalanche is billed at least half the signed limit, which is what it
+  charges; every other chain is billed the limit, as before. A simulation
+  that measured nothing is retried, never billed, where gas is measured. The
+  measured gas plus its buffer is not an upper bound on what a bundle burns:
+  §1b bounds what that can cost (the 2026-10-02 send: at most $0.09, from a
+  payer who paid more) and every receipt is checked against it in the logs.
+  `eth_estimateUserOperationGas` returns the same figure as `settlementGas`
+  before the client signs, and its `verificationGasLimit` is now the measured
+  validation gas.
+- Repricing turns the cap into a live safety valve: a short-but-honest payment
+  is repriced down to a fundable cap, down to the 1.25×base inclusion floor,
+  rather than held. Below it the payment is held: a signed transaction
+  cannot be bumped, and a cap a rising base fee passes wedges its lane.
+- A client may name a speed. **A tier is two levers**: a cap (1.5 / 1.5 / 1.75 ×
+  base) and a tip read from what recent blocks paid — the median over a
+  minute of blocks (at least 20) of each block's 25th / 50th / 70th
+  percentile reward, or, where the blocks are under 30% full, the node's own
+  tip scaled 1.00 / 1.25 / 2.00 (never above those percentiles); the node's
+  tip a floor only where the blocks
+  bear it out. The quote and the executor read the tips by one rule, so what
+  is quoted is what is signed. A payment that cannot fund its tier gives back
+  cap headroom first, then priority down to what the window proves the chain
+  takes, then is held — never signed above what the payment funds. Naming
+  nothing is the relay's
+  own pace, unchanged.
+- `pimlico_getUserOperationGasPrice` reports each tier's cap and tip, its
+  `inBandFeePerGas` (`markup × cap`) where `settlementGas` is returned, and a
+  frozen `networkFeePerGas` for wallets that still price the limits.
+- **A client pays `settlementGas × inBandFeePerGas[tier]`** (or its own
+  reading of the same formula, if higher, and never under the dust floor). At
+  the block the overcharge was measured that is $2.40 / $2.87 / $3.70 for an
+  ETH send the chain charges $1.04–1.63, against $11.80 / $14.19 / $21.28
+  before. Over 10.4 days of Ethereum, a quote ≤ 12 s old was accepted at its
+  whole tier ≥ 99.8% of the time on every tier, `fast` was mined first and
+  `slow` last, and the relay never earned less than +33% over the chain's
+  charge (§2c). A wallet that still prices its padded limits overpays and is
+  accepted at its whole tier.
 - Stablecoin reimbursements are verified against the real on-chain Transfer
   event; a misdirected or wrong-token transfer is never credited.

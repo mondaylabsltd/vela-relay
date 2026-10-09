@@ -15,16 +15,20 @@ use vela_relay_core::{
 };
 
 /// Default in-band reimbursement multiplier: 1.4x the simulated outer transaction cost.
-pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
+pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 =
+    vela_relay_core::settlement::DEFAULT_SETTLEMENT_MARKUP_BPS;
 
 /// Lowest outer fee cap the executor will sign for, as basis points of the latest base fee (the
-/// tip is added on top). The normal cap is 2x base fee — headroom for inclusion, not real cost,
-/// since a transaction only ever pays `base fee + tip`. When a payer's signed reimbursement
-/// cannot fund the 2x cap the executor may reprice down to what they did pay, but never below
-/// this floor: the relay cannot bump a signed transaction (the outbox broadcasts exact bytes), so
-/// an underpriced transaction would wedge its lane's nonce. 1.5x survives three consecutive
-/// blocks of maximum EIP-1559 base-fee growth (1.125^3 ≈ 1.42).
-pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 15_000;
+/// tip is added on top). A tier's cap is headroom for inclusion, not real cost, since a
+/// transaction only ever pays `base fee + tip`. When a payer's signed reimbursement cannot fund
+/// the cap the executor may reprice down to what they did pay, but never below this floor: the
+/// relay cannot bump a signed transaction (the outbox broadcasts exact bytes), so an underpriced
+/// transaction would wedge its lane's nonce. 1.125x is the largest rise EIP-1559 allows into the
+/// next block, so a floored cap is always valid for that block; over 10.4 days of Ethereum
+/// (docs/fees.md §2c) a higher floor left no fewer bundles priced out of later blocks and held or
+/// rejected more slow sends. It was 1.5x (three blocks of maximum growth).
+pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 =
+    vela_relay_core::settlement::DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS;
 
 /// How many times a UserOperation may be held for an unaffordable market before it is rejected.
 /// The delayed inbox doubles 5s → 5min and then holds there (5+10+20+40+80+160, then 300 each), so
@@ -167,6 +171,18 @@ impl SecretString {
 impl Debug for SecretString {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("<redacted>")
+    }
+}
+
+impl ExecutorConfig {
+    /// The executor's billing terms, which the RPC must publish exactly as
+    /// the executor applies them (`settlementGas`, `inBandFeePerGas`).
+    pub fn billing_terms(&self) -> vela_relay_core::cost::BillingTerms {
+        vela_relay_core::cost::BillingTerms {
+            settlement_markup_bps: self.settlement_markup_bps,
+            gas_buffer_bps: self.gas_buffer_bps,
+            fixed_gas_buffer: self.fixed_gas_buffer,
+        }
     }
 }
 
@@ -413,8 +429,14 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
             "VELA_RELAY_EXECUTOR_ATTEMPT_TTL_SECS",
             48 * 60 * 60,
         )?),
-        gas_buffer_bps: u64_value("VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,
-        fixed_gas_buffer: u64_value("VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER", 30_000)?,
+        gas_buffer_bps: u64_value(
+            "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS",
+            vela_relay_core::cost::DEFAULT_GAS_BUFFER_BPS,
+        )?,
+        fixed_gas_buffer: u64_value(
+            "VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER",
+            vela_relay_core::cost::DEFAULT_FIXED_GAS_BUFFER,
+        )?,
         settlement_markup_bps,
         settlement_inclusion_floor_bps,
         settlement_hold_max_attempts,

@@ -214,13 +214,16 @@ publishing setup.
 
 Relay charges no separate fee: each UserOperation declares zero EntryPoint fees
 and embeds a trusted Safe MultiSend transfer reimbursing the settlement recipient
-for the gas the relay spends. The relay requires `max(1.4 × gas × (2×base+tip),
-floor)` (floor = 0.00001 native or $0.01 stablecoin), recovers 1.4× its gas, and
-reprices the outer transaction down toward the inclusion floor rather than
-rejecting an honest-but-short payment. A client must pay ABOVE this minimum to
-survive the gas-price drift between signing and inclusion. The full rule — the
-requirement, the repricing safety valve, the client-side headroom math, and
-stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
+for the gas the relay spends. The relay requires `max(1.1 × settlement gas × cap,
+floor)` (floor = 0.00001 native or $0.01 stablecoin), where the settlement gas is
+the gas the bundle measurably used plus a buffer on Ethereum and the other listed
+chains, and the outer gas limit elsewhere; it reprices the outer transaction down
+toward the inclusion floor rather than rejecting an honest-but-short payment.
+`eth_estimateUserOperationGas` returns that gas as `settlementGas`, and
+`pimlico_getUserOperationGasPrice` the price per unit of it for each speed as
+`inBandFeePerGas`; a client pays their product. The full rule — the requirement,
+the speed tiers and their tips, the backtest that chose the numbers, what a client
+pays, and stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
 
 ## HTTP endpoints
 

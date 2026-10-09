@@ -163,7 +163,7 @@ mod tests {
     use tokio::sync::Barrier;
 
     use super::{CacheRequest, GasPriceCache};
-    use vela_relay_core::gas_math::{NetworkGasPrice, tiers};
+    use vela_relay_core::gas_math::{NetworkGasPrice, TierTips, tiers};
 
     use crate::gas_price::GasPriceQuote;
 
@@ -172,6 +172,7 @@ mod tests {
             tiers: tiers(NetworkGasPrice {
                 base_fee_per_gas: 100,
                 max_priority_fee_per_gas: 10,
+                tier_tips: TierTips::scaled(10).unwrap(),
             })
             .unwrap(),
             rpc_domain: "rpc.example.com".into(),

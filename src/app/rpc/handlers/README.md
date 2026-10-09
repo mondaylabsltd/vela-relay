@@ -38,13 +38,13 @@ Call `POST /{chainId}` with the following request body:
 }
 ```
 
-The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it takes the base fee from `eth_feeHistory` and the tip from `eth_maxPriorityFeePerGas` (then `eth_gasPrice` minus the latest base fee) — the same tip rule the executor signs with, `gas_math::market_tip`. If fee history is unavailable, it falls back to `eth_gasPrice` for legacy-compatible pricing. `docs/fees.md` §2b has the per-tier arithmetic.
+The handler delegates estimation to `GasPriceManager`. On EIP-1559 chains it reads `eth_feeHistory(n, "latest", [25, 50, 70])` over the chain's last minute of blocks (at least 20, `gas_math::tip_window_blocks`) — the next block's base fee, the reward rows each tier's tip is the window median of, and how full the blocks were — beside `eth_maxPriorityFeePerGas` (then `eth_gasPrice` minus the latest base fee), the tip that floors `slow` where the blocks bear it out and that every tier signs, scaled, in a quiet window. The executor reads the same fee history when it signs, by the same rule, so the tip quoted for a tier is the tip it is signed with. If fee history is unavailable, it falls back to `eth_gasPrice` as an all-tip market. `docs/fees.md` §2a–§2c has the per-tier arithmetic and how its numbers were chosen.
 
-The manager returns slow (100%), standard (110%), and fast (120%) tiers. `maxFeePerGas` and `maxPriorityFeePerGas` are scaled independently, while preserving `maxFeePerGas >= maxPriorityFeePerGas`.
+Each tier reports `maxFeePerGas` (the cap the relay submits at: 1.5 / 1.5 / 1.75 × base fee + the tier's tip), `maxPriorityFeePerGas` (the tier's tip), `networkFeePerGas` and `relayerFeePerGas` (the reimbursement basis of wallets that price the gas limits, frozen), and — where `eth_estimateUserOperationGas` returns `settlementGas` — `inBandFeePerGas`, the wei per unit of `settlementGas` a client pays for the tier (the settlement markup × the cap).
 
 Successful gas-price quotes are cached for five seconds. The cache is isolated by `chainId` and caller-provided RPC identity, so callers with different RPC headers never share a quote. Concurrent cache misses for the same key are coalesced into one upstream calculation.
 
-Response:
+Response (Ethereum, block 26,149,237 — `docs/fees.md` §2a):
 
 ```json
 {
@@ -52,16 +52,25 @@ Response:
   "id": 1,
   "result": {
     "slow": {
-      "maxFeePerGas": "0x829b42b5",
-      "maxPriorityFeePerGas": "0x829b42b5"
+      "maxFeePerGas": "0x101bacf62",
+      "maxPriorityFeePerGas": "0x8c7ef3a",
+      "networkFeePerGas": "0x955e867f",
+      "relayerFeePerGas": "0x6c5c48e3",
+      "inBandFeePerGas": "0x11b80b0ec"
     },
     "standard": {
-      "maxFeePerGas": "0x88d36a75",
-      "maxPriorityFeePerGas": "0x88d36a75"
+      "maxFeePerGas": "0x1348daa28",
+      "maxPriorityFeePerGas": "0x3b9aca00",
+      "networkFeePerGas": "0xc728b354",
+      "relayerFeePerGas": "0x6d64f6d4",
+      "inBandFeePerGas": "0x15368a193"
     },
     "fast": {
-      "maxFeePerGas": "0x8f0b9234",
-      "maxPriorityFeePerGas": "0x8f0b9234"
+      "maxFeePerGas": "0x18d6ffe0f",
+      "maxPriorityFeePerGas": "0x6aff4de0",
+      "networkFeePerGas": "0x12abd0cfe",
+      "relayerFeePerGas": "0x62b2f111",
+      "inBandFeePerGas": "0x1b52e6444"
     }
   }
 }
@@ -193,7 +202,7 @@ The relay supports the unpacked EntryPoint v0.7 UserOperation format for the con
 }
 ```
 
-The relay does not forward this bundler-specific method to a normal EVM RPC. It injects the EntryPoint v0.7 simulation code through the standard `eth_call` state-override parameter, then estimates the account execution phase with `eth_estimateGas` using the EntryPoint as `from`.
+The relay does not forward this bundler-specific method to a normal EVM RPC. It injects the EntryPoint v0.7 simulation code through the standard `eth_call` state-override parameter, then estimates the account execution phase with `eth_estimateGas` using the EntryPoint as `from`. For a sender that is not deployed yet (`factory` present) the execution is instead measured with `eth_simulateV1` — the factory called by the EntryPoint's `SenderCreator`, then the `callData` from the EntryPoint, in one block — and `eth_estimateGas` is the fallback when no source performs it.
 
 All supported chains use in-band settlement. `maxFeePerGas` and `maxPriorityFeePerGas` must therefore both be `0x0`; the simulation encodes the same zero values and never substitutes a native EntryPoint fee. The submitted operation is never modified.
 
@@ -203,18 +212,19 @@ by `eth_sendUserOperation`.
 
 An RPC that rejects state overrides, times out, or is rate limited is cooled down and the next configured source is tried. A genuine EVM revert is returned as a UserOperation simulation error without cooling down that RPC. `FailedOp`, `FailedOpWithRevert`, Solidity panic, and nested gateway revert data are decoded into the JSON-RPC error `data` field. Successful responses include the selected simulation source in `x-vela-rpc-domain`.
 
-The response contains the v0.7 gas fields, including zero-valued paymaster limits when no paymaster is present:
+The response contains the v0.7 gas fields, including zero-valued paymaster limits when no paymaster is present, and — on a chain whose executor bills the gas a bundle uses, when the execution was measured — the Vela extension `settlementGas`: the gas the in-band reimbursement is billed against (the predicted gas used plus the executor's buffer, never more than `verificationGasLimit + callGasLimit + preVerificationGas`). `docs/fees.md` §1a has the rule and its calibration.
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "preVerificationGas": "0x0",
-    "verificationGasLimit": "0x0",
-    "callGasLimit": "0x0",
+    "preVerificationGas": "0x18d3c",
+    "verificationGasLimit": "0x186a0",
+    "callGasLimit": "0x1c13c",
     "paymasterVerificationGasLimit": "0x0",
-    "paymasterPostOpGasLimit": "0x0"
+    "paymasterPostOpGasLimit": "0x0",
+    "settlementGas": "0x32cc6"
   }
 }
 ```
