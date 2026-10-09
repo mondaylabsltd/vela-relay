@@ -57,10 +57,17 @@ pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 11_000;
 /// The executor's default inclusion floor
 /// (`VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS`): the lowest cap,
 /// as a multiple of the latest base fee plus the signed tip, a repricing may
-/// sign. 1.125× — the largest rise EIP-1559 allows into the next block, so a
-/// floored cap is always valid for the very next block — chosen by the
-/// backtest in `docs/fees.md` §2c (it was 1.5×).
-pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 11_250;
+/// sign. 1.25× — two blocks of the largest rise EIP-1559 allows, not one.
+/// A signed transaction cannot be bumped (the outbox rebroadcasts exact
+/// bytes), so a cap a rising base fee passes waits, and its lane with it,
+/// until the base fee falls back. Over 10.4 days of mainnet (`docs/fees.md`
+/// §2c) a 1.125× floor let 30 s-old `slow` quotes sign caps that were priced
+/// out 5× as often and wedged their lane for up to 9 hours; at 1.25× those
+/// quotes are held instead (0.19% of them rejected after the hold budget,
+/// against 0.01%). A fresh quote is all but unaffected: a block old, it
+/// always funds more than 1.33× the base fee plus its tip. It was 1.5× before the backtest, 1.125× in
+/// the backtest's first choice.
+pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 12_500;
 
 pub const MIN_NATIVE_FRACTION_DECIMALS: u32 = 5;
 pub const MIN_STABLE_FRACTION_DECIMALS: u32 = 2;
@@ -1872,7 +1879,7 @@ mod tests {
                 "{tier}"
             );
         }
-        assert_eq!(FLOOR, 11_250);
+        assert_eq!(FLOOR, 12_500);
     }
 
     #[test]
@@ -1911,7 +1918,7 @@ mod tests {
     fn a_tier_the_reimbursement_cannot_fund_is_capped_not_signed_at_a_loss() {
         // 300 paid funds a 214 cap, not the 255 `fast` asks for (cost 214 ×
         // 1.4 = 299.6 ≤ 300), and 214 still clears the floor with the whole
-        // 80 tip (1.125 × 100 + 80 = 192). The cap gives way; the tip does not.
+        // 80 tip (1.25 × 100 + 80 = 205). The cap gives way; the tip does not.
         let outer = fees_for(
             300,
             &fees_at(UNTIERED_CAP, BASE, MARKET_TIP, FLOOR, SubmissionTier::Fast),
@@ -1932,8 +1939,8 @@ mod tests {
     #[test]
     fn a_payment_short_of_its_tier_at_the_floor_gives_back_priority_not_inclusion() {
         // 260 paid funds a 185 cap: under the floor with `fast`'s whole tip
-        // (1.125 × 100 + 80 = 192), above it with `slow`'s (152). The floor's
-        // base-fee headroom is kept and the tip shaved to what is left — 73,
+        // (1.25 × 100 + 80 = 205), above it with `slow`'s (165). The floor's
+        // base-fee headroom is kept and the tip shaved to what is left — 60,
         // between slow's 40 and fast's 80. A slower send, not a held or
         // rejected one, and still never at a loss.
         let outer = fees_for(
@@ -1942,7 +1949,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outer.max_fee_per_gas, 185);
-        assert_eq!(outer.max_priority_fee_per_gas, 73);
+        assert_eq!(outer.max_priority_fee_per_gas, 60);
         assert!(outer.delivers_full_tip_at(BASE));
         assert_eq!(
             Some(outer.max_fee_per_gas),
@@ -2033,7 +2040,7 @@ mod tests {
         assert_eq!(outer.max_fee_per_gas, FAST_CAP);
         assert_eq!(outer.max_priority_fee_per_gas, 80);
         // Required at 255 is 357; 300 paid reprices to 255 × 8403 bps = 214,
-        // above the 192 floor.
+        // above the 205 floor.
         let repriced = match settle_one(300, outer, FLOOR, SubmissionTier::Fast) {
             SettlementDecision::Reprice { fee_per_gas, .. } => fee_per_gas,
             other => panic!("expected Reprice, got {other:?}"),
@@ -2045,7 +2052,7 @@ mod tests {
         };
         assert!(signed.delivers_full_tip_at(BASE));
         let floor = inclusion_floor_fee_per_gas(BASE, 80, FLOOR).unwrap();
-        assert_eq!(floor, 192);
+        assert_eq!(floor, 205);
         assert!(floor >= BASE + 80);
     }
 

@@ -1,10 +1,11 @@
 """The in-band fee backtest of docs/fees.md §2c: replay Ethereum mainnet eth_feeHistory through the
-relay's tier, repricing and hold rules and measure acceptance, inclusion, the person's price and the
-relay's profit. READ-ONLY against public RPCs.
+relay's tier, repricing and hold rules and measure acceptance, inclusion, lane wedges, the person's
+price and the relay's profit. READ-ONLY against public RPCs.
 
     python3 docs/fees-backtest.py fetch history.jsonl 72      # ~10 days: 72 calls of 1024 blocks
     python3 docs/fees-backtest.py run history.jsonl '{"M":1.1,"D":1.0,"caps":[1.5,1.5,1.75],
-        "f":1.125,"W":20,"pt":[25,50,70],"eps":1000000,"H":12,"gas_err":0.0,"P_INCL":25}'
+        "f":1.25,"W":20,"pt":[25,50,70],"eps":1000000,"H":12,"gas_err":0.0,"P_INCL":25,"L":3000}'
+    python3 docs/fees-backtest.py table history.jsonl '<the same parameters>'   # the §2c tables
 
 The model, as coded in vela-relay-core (docs/fees.md §2, §2a, §2b, §3):
   quote at block q    B = base[q+1] (the fee history's last entry); tier tips from the window ending at q
@@ -12,10 +13,19 @@ The model, as coded in vela-relay-core (docs/fees.md §2, §2a, §2b, §3):
   submission at s=q+a the executor reads base[s] and the window ending at s; with A = F / (M × billed gas):
                         A ≥ cap_bps × b + tip          → the whole tier
                         A ≥ f × b + tip                → the cap repriced to A, the whole tip
-                        A ≥ f × b + tip[slow]          → the cap A, the tip shaved to A − f × b
-                        otherwise                      → held, retried on the delayed-inbox ladder (H attempts)
+                        A ≥ f × b + tips.floor         → the cap A, the tip shaved to A − f × b
+                        otherwise                      → held, retried on the delayed-inbox ladder (H attempts),
+                                                         then rejected
+  tier tips           busy window: slow = max(median p25, eps), standard = max(median p50, slow),
+                      fast = max(median p70, standard); tips.floor = slow, or eps where the window's mean
+                      gasUsedRatio is under 40%. Ethereum's window never reads quiet (under 30%), and its
+                      node tip (0 or ~10,000 wei) is below every floor, so neither moves a tip here.
   inclusion proxy     the first later block whose base fee the cap covers and whose P_INCL-th percentile
-                      reward the effective tip meets
+                      reward the effective tip meets, looked for over L blocks. A signed transaction cannot
+                      be bumped (the outbox rebroadcasts exact bytes), so a bundle whose cap a rising base
+                      fee passes waits — and its lane with it — until the base fee falls back: a WEDGE.
+                      A bundle not mined within L blocks is kept in every statistic (as unmined, its delay
+                      censored at L), never dropped.
   the chain charges   gas used × (base + effective tip); profit = F − that
   baseline            gas used × (B + the window's median 50th-percentile reward)
 """
@@ -27,6 +37,10 @@ import time
 
 PCTS = [1, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 95, 99]
 RPCS = ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org', 'https://eth-mainnet.public.blastapi.io']
+OPERATIONS = {'eth_send': 146_824, 'erc20_send': 163_719, 'swap': 291_357, 'undeployed_first': 504_609}
+AGES = (('12s', 1), ('30s', 3), ('60s', 5))
+TIERS = ('slow', 'standard', 'fast')
+NEAR_QUIET = 0.4
 
 
 def rpc(method, params):
@@ -75,34 +89,43 @@ def run(path, params):
     meta = json.load(open(path + '.meta.json'))
     seconds = (meta['ts_hi'] - meta['ts_lo']) / (meta['hi'] - meta['lo'])
     base = np.array([r[1] for r in rows], dtype=float)
+    ratio = np.array([r[2] for r in rows], dtype=float)
     reward = np.array([r[3] for r in rows], dtype=float)
     column = {p: i for i, p in enumerate(meta['pcts'])}
     n = len(rows)
     M, D, caps, f, W, pt, eps, H, gas_err = (params[k] for k in ('M', 'D', 'caps', 'f', 'W', 'pt', 'eps', 'H', 'gas_err'))
     p_incl = params.get('P_INCL', 25)
+    lookahead = params.get('L', 3000)
+
+    def windowed(values):
+        out = np.full(n, np.nan)
+        out[W - 1:] = values
+        return out
 
     def median(col):
-        out = np.full(n, np.nan)
-        out[W - 1:] = np.median(sliding_window_view(reward[:, column[col]], W), axis=1)
-        return out
+        return windowed(np.median(sliding_window_view(reward[:, column[col]], W), axis=1))
 
     paid_any = np.full(n, False)
     paid_any[W - 1:] = sliding_window_view(reward[:, column[99]] > 0, W).any(axis=1)
-    slow = np.maximum(median(pt[0]), np.where(paid_any, eps, 0.0))
+    mean_ratio = windowed(sliding_window_view(ratio, W).mean(axis=1))
+    least = np.where(paid_any, eps, 0.0)
+    slow = np.maximum(median(pt[0]), least)
     tips = [slow, np.maximum(median(pt[1]), slow)]
     tips.append(np.maximum(median(pt[2]), tips[1]))
+    floor = np.where(mean_ratio < NEAR_QUIET, np.minimum(slow, least), slow)
     median50 = median(50)
     ladder, t = [], 0
     for delay in ([5, 10, 20, 40, 80, 160] + [300] * 30)[:H]:
         t += delay
         ladder.append(max(1, round(t / seconds)))
-    operations = {'eth_send': 146_752, 'erc20_send': 163_719, 'swap': 291_357, 'undeployed_first': 504_609}
-    lookahead = 400
-    result = {}
-    for age, a in (('12s', 1), ('30s', 3), ('60s', 5)):
+    minutes = seconds / 60
+    result = {'_meta': {'blocks': n, 'seconds_per_block': seconds, 'lookahead_blocks': lookahead,
+                        'quiet_windows': float(np.nanmean(mean_ratio < 0.3)),
+                        'near_quiet_windows': float(np.nanmean(mean_ratio < NEAR_QUIET))}}
+    for age, a in AGES:
         q = np.arange(W, n - a - 1 - lookahead - ladder[-1])
         quoted_base = base[q + 1]
-        for ti, tier in enumerate(('slow', 'standard', 'fast')):
+        for ti, tier in enumerate(TIERS):
             m = caps[ti]
             price = M * D * (m * quoted_base + tips[ti][q])
             funded = D * (m * quoted_base + tips[ti][q]) / (1 + gas_err)
@@ -111,10 +134,10 @@ def run(path, params):
             first = None
             for j, offset in enumerate([0] + ladder):
                 s = q + a + offset
-                b, tier_tip, slowest = base[s], tips[ti][s], tips[0][s]
+                b, tier_tip, lowest = base[s], tips[ti][s], np.minimum(floor[s], tips[ti][s])
                 whole = funded >= m * b + tier_tip
                 repriced = ~whole & (funded >= f * b + tier_tip)
-                shaved = ~whole & ~repriced & (funded >= f * b + slowest)
+                shaved = ~whole & ~repriced & (funded >= f * b + lowest)
                 ok = whole | repriced | shaved
                 new = ok & ~decided
                 cap[new] = np.where(whole, m * b + tier_tip, funded)[new]
@@ -123,36 +146,84 @@ def run(path, params):
                 signed_at[new] = s[new]
                 decided |= ok
                 if j == 0:
-                    first = (ok.mean(), (whole | repriced).mean())
+                    first = (ok.mean(), (whole | repriced).mean(), whole.mean())
             included = np.full(len(q), -1)
+            priced_out = np.zeros(len(q), bool)
             for d in range(1, lookahead):
                 block = signed_at + d
                 waiting = decided & (included < 0)
                 if not waiting.any():
                     break
+                includable = cap >= base[block]
+                priced_out |= waiting & ~includable
                 effective = np.minimum(tip, cap - base[block])
-                hit = waiting & (cap >= base[block]) & (effective >= reward[block, column[p_incl]])
+                hit = waiting & includable & (effective >= reward[block, column[p_incl]])
                 included[hit] = block[hit]
             got = included >= 0
-            delay = np.where(got, included - (q + a), np.nan)
-            row = dict(accept_first=first[0], full_tier_first=first[1], rejected=1 - decided.mean(),
-                       shaved=(kind == 2).mean(), delay_mean=np.nanmean(delay), delay_p90=np.nanpercentile(delay, 90),
-                       delay_p99=np.nanpercentile(delay, 99))
+            unmined = decided & ~got
+            # Blocks from the first submission attempt to inclusion, holds included; an unmined bundle
+            # counts as `lookahead` blocks, so it stays in every percentile instead of vanishing.
+            delay = np.where(got, included - (q + a), lookahead + (signed_at - (q + a)))[decided]
+            stuck = np.where(got, included - signed_at, lookahead)[decided]
+            row = dict(accept_first=first[0], full_tip_first=first[1], whole_tier_first=first[2],
+                       rejected=1 - decided.mean(), repriced=(kind == 1).mean(), shaved=(kind == 2).mean(),
+                       delay_mean=float(np.mean(np.minimum(delay, lookahead))),
+                       delay_p50=float(np.percentile(delay, 50)), delay_p90=float(np.percentile(delay, 90)),
+                       delay_p99=float(np.percentile(delay, 99)), delay_p999=float(np.percentile(delay, 99.9)),
+                       priced_out=float(priced_out[decided].mean()),
+                       wedged_5min=float(np.mean(stuck * minutes >= 5)),
+                       wedged_30min=float(np.mean(stuck * minutes >= 30)),
+                       unmined=float(unmined.sum() / max(decided.sum(), 1)),
+                       longest_wedge_min=float(stuck.max() * minutes))
             at = np.where(got, included, 0)
-            for name, used in operations.items():
+            for name, used in OPERATIONS.items():
                 billed = used + -(-used * 1500 // 10_000) + 30_000
                 paid = billed * price
                 charge = used * (base[at] + np.minimum(tip, cap - base[at]))
                 with np.errstate(divide='ignore', invalid='ignore'):
                     margin = np.where(got, (paid - charge) / charge, np.nan)
-                row[name] = dict(paid_over_baseline=float(np.median(paid / (used * (quoted_base + median50[q])))),
-                                 profit_min=float(np.nanmin(margin)), profit_median=float(np.nanmedian(margin)))
+                    over = paid / (used * (quoted_base + median50[q]))
+                row[name] = dict(paid_over_baseline=float(np.median(over)), paid_over_baseline_p90=float(np.percentile(over, 90)),
+                                 profit_min=float(np.nanmin(margin)), profit_p1=float(np.nanpercentile(margin, 1)),
+                                 profit_median=float(np.nanmedian(margin)))
+            row['price_over_slow'] = float(np.median(price / (M * D * (caps[0] * quoted_base + tips[0][q]))))
             result[f'{age}|{tier}'] = {k: (float(v) if not isinstance(v, dict) else v) for k, v in row.items()}
     return result
+
+
+def table(path, params):
+    result = run(path, params)
+    pct = lambda x: f'{100 * x:.2f}%'
+    print('| tier | quote age | accepted at the first pass | of which the whole tip | rejected after the hold budget '
+          '| blocks to inclusion, mean / p90 / p99 / p99.9 | priced out after signing | wedged ≥ 5 min / ≥ 30 min '
+          '| longest wedge |')
+    print('|---|---|---|---|---|---|---|---|---|')
+    for tier in TIERS:
+        for age, _ in AGES:
+            r = result[f'{age}|{tier}']
+            print(f"| `{tier}` | {age} | {pct(r['accept_first'])} | {pct(r['full_tip_first'])} | {100 * r['rejected']:.3f}% "
+                  f"| {r['delay_mean']:.2f} / {r['delay_p90']:.0f} / {r['delay_p99']:.0f} / {r['delay_p999']:.0f} "
+                  f"| {100 * r['priced_out']:.3f}% | {100 * r['wedged_5min']:.3f}% / {100 * r['wedged_30min']:.4f}% "
+                  f"| {r['longest_wedge_min']:.0f} min |")
+    print()
+    print('| tier | price ÷ `slow`\'s, median | ETH send: paid ÷ baseline, median (p90) | swap: ditto '
+          '| relay profit ÷ chain charge, ETH send: min / 1st pct / median | undeployed first op: ditto |')
+    print('|---|---|---|---|---|---|')
+    for tier in TIERS:
+        r = result[f'12s|{tier}']
+        e, s, u = r['eth_send'], r['swap'], r['undeployed_first']
+        print(f"| `{tier}` | {r['price_over_slow']:.2f} | {e['paid_over_baseline']:.2f} ({e['paid_over_baseline_p90']:.2f}) "
+              f"| {s['paid_over_baseline']:.2f} ({s['paid_over_baseline_p90']:.2f}) "
+              f"| {100 * e['profit_min']:+.0f}% / {100 * e['profit_p1']:+.0f}% / {100 * e['profit_median']:+.0f}% "
+              f"| {100 * u['profit_min']:+.0f}% / {100 * u['profit_p1']:+.0f}% / {100 * u['profit_median']:+.0f}% |")
+    print()
+    print(json.dumps(result['_meta']))
 
 
 if __name__ == '__main__':
     if sys.argv[1] == 'fetch':
         fetch(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 72)
+    elif sys.argv[1] == 'table':
+        table(sys.argv[2], json.loads(sys.argv[3]))
     else:
         print(json.dumps(run(sys.argv[2], json.loads(sys.argv[3])), indent=1))

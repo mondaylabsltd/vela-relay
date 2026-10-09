@@ -152,7 +152,7 @@ pub const MIN_POSITIVE_TIP: u128 = 1_000_000;
 /// 1.0×, chosen by the backtest (`docs/fees.md` §2c). The quote already prices
 /// the NEXT block's base fee, and a submission whose market moved since is
 /// repriced from the tier's cap (1.5× base or more) down to the inclusion
-/// floor (1.125×) with its whole tip, so a quote's drift is paid for by the
+/// floor (1.25×) with its whole tip, so a quote's drift is paid for by the
 /// cap the client already buys; a larger allowance only bought acceptance the
 /// backtest did not need. Kept in the formula so the contract states it.
 pub const IN_BAND_DRIFT_BPS: u64 = 10_000;

@@ -174,7 +174,7 @@ payment CAN cover, because the cap was headroom, not cost
    fee** the weakest payer funds: `affordable = quoted_fee × (paid / required)`.
 3. If `affordable` is at least the **inclusion floor**
    (`inclusion_floor_bps × base_fee + the tip the transaction is signed with`,
-   default **1.125×base + tip**, `VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS`)
+   default **1.25×base + tip**, `VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS`)
    and below the quoted fee → **Reprice** to `affordable` and submit. Repricing
    preserves the full markup (reimbursement still covers `markup × gas ×
    new_fee`, and the chain can never charge more than `new_fee`). Because the
@@ -186,13 +186,24 @@ payment CAN cover, because the cap was headroom, not cost
    then rejected. Never a loss — the relay never signs an outer transaction it
    would lose money on.
 
-The floor was 1.5× (three blocks of the largest EIP-1559 rise). The backtest in
-§2c chose 1.125×: the largest rise EIP-1559 allows into the next block, so a
-floored cap is always valid for the very next block. A signed transaction
-cannot be bumped (the outbox broadcasts exact bytes), so a bundle priced out
-of later blocks would wedge its lane — but over 10.4 days a higher floor left
-no fewer bundles priced out (they are the ones whose slow tip waits; ~0.03% of
-slow sends at either floor) and held or rejected more slow sends.
+The floor is 1.25× — two blocks of the largest EIP-1559 rise. A signed
+transaction cannot be bumped (the outbox broadcasts exact bytes), so a cap
+that a rising base fee passes leaves the bundle unminable, and its lane's
+later nonces with it, until the base fee falls back: a **wedge**. The floor
+decides only which payments are signed at the low end of their cap rather
+than held: a repriced cap is whatever the payment funds, at any floor. A
+quote a block old always funds more than 1.33× the base fee, so for a fresh
+quote the floor changes next to nothing. For an older one it trades wedges for
+holds: over 10.4 days (§2c, lenient inclusion) a 1.125× floor — the
+backtest's first choice — let 30 s-old `slow` quotes sign caps that were
+priced out 5× as often as at 1.25× (0.035% against 0.007%), the longest
+wedging its lane 8.7 hours against 1.9, while 1.25× holds them instead and
+rejects 0.19% of them after the hold budget (0.01% at 1.125×). It was 1.5×
+before the backtest; at 1.5× a fifth of fresh `slow` sends are held. No
+floor prevents the longest wedges of all: a `slow` bundle signed at its
+whole 1.5× cap just before a sustained spike (2026-09-29 10:58 UTC, base
+fee 0.34 gwei rising to 7.05 and not back under 0.51 for 8.7 hours) waits out
+the spike at any floor — only a fee-bump path would end that.
 
 Because the floor uses `max(cost, dust_floor)` on the stablecoin path, a payment
 below the *dust* floor can never be repriced into acceptance (the requirement is
@@ -425,23 +436,40 @@ The cap multiples, the tip percentiles and window, the drift allowance, the
 inclusion floor and the markup were chosen by replaying 10.4 days of Ethereum
 mainnet: `eth_feeHistory` for blocks 26,076,210–26,150,961 (2026-09-28 to
 2026-10-08, 74,752 blocks; base fee median 0.178 gwei, 90th percentile 1.43,
-peak 10.65) with reward percentiles 1–99. `docs/fees-backtest.py` fetches the
-history and runs the replay.
+99.9th 10.65, peak 13.09) with reward percentiles 1–99. `docs/fees-backtest.py`
+fetches the history, runs the replay and prints the tables below
+(`… table history.jsonl '<parameters>'`).
 
 **The model.** A wallet quotes at block `q` (base fee `B = base[q+1]`, tips from
 the window ending at `q`) and pays `F = settlementGas × inBandFeePerGas[tier]`.
 The executor submits `a` blocks later — 1, 3 or 5 for a quote 12, 30 or 60 s
 old — reading `base[s]` and the window ending at `s`, and applies §2a and §2
-exactly as coded (the full tier, a repriced cap, a shaved tip, or a hold
-retried on the delayed-inbox ladder: 5, 10, 20, 40, 80, 160 s then every
-300 s, 12 attempts, then rejected). A signed bundle is counted included in the
-first later block whose base fee its cap covers and whose 25th-percentile
-reward its effective tip meets (the "lenient" column uses the 10th). The chain
-charges `gas used × (base + effective tip)`; the person's baseline is a
-Uniswap-like `gas used × (B + the window's median tip)`. Operation sizes are the
+exactly as coded (the full tier, a repriced cap, a tip shaved to `tips.floor`,
+or a hold retried on the delayed-inbox ladder: 5, 10, 20, 40, 80, 160 s then
+every 300 s, 12 attempts, then rejected). Ethereum's 20-block window never
+reads quiet (its mean `gasUsedRatio` was never under 0.338) and its node tip
+(0 or ~10,000 wei) sits under every floor, so the tips are the window's
+percentiles throughout; in the 0.25% of windows under 40% a short payment may
+be shaved to 0.001 gwei. A signed bundle is counted included in the first
+later block whose base fee its cap covers and whose 25th-percentile reward its
+effective tip meets (the "lenient" proxy uses the 10th), looked for over the
+next 3,000 blocks (10 hours). A bundle not mined within them stays in every
+statistic, unmined, its delay counted as 3,000 blocks. The chain charges `gas
+used × (base + effective tip)`; the person's baseline is a Uniswap-like `gas
+used × (B + the window's median tip)`. Operation sizes are the
 investigation's: an ETH send uses 146,824 gas, an ERC-20 send 163,719, a swap
 291,357, a first operation from an undeployed Safe 504,609, each billed
 `buffered_gas` of it.
+
+**Wedges.** A signed transaction cannot be bumped: the outbox rebroadcasts its
+exact bytes. A bundle whose cap a later base fee passes before it is mined is
+*priced out* — unminable, and its lane's later nonces with it, until the base
+fee falls back — and one whose tip no block will take waits the same way. The
+replay reports both as *wedged*: signed and still unmined 5 and 30 minutes
+later, and the longest such wait. Its first version looked only 400 blocks
+ahead and dropped the bundles it did not find mined there, and so reported
+that "a higher floor left no fewer bundles priced out"; the wedges were in
+what it dropped (review, 2026-10-09).
 
 **The targets** (the owner's, 2026-10-09): `standard` and `fast` accepted at the
 first pass ≥ 99% for a quote ≤ 12 s old and ≥ 97% at 30 s; `slow` may wait,
@@ -457,46 +485,81 @@ tip percentiles (10…30, 40…50, 60…90); windows of 10 and 20 blocks. What
 failed: `fast` dearer than twice `slow` (every `fast` tip at the 75th
 percentile or above, and a `fast` cap of 2.0 or more); slow sends rejected
 after the whole hold budget (every set whose inclusion floor was `slow`'s own
-cap — a 1.5× floor under a 1.5× cap — and a 1.25× floor without a drift
-allowance); `standard` and `fast` acceptance at 30 s for the sets with the
-narrowest gap between cap and floor.
+cap — a 1.5× floor under a 1.5× cap); `standard` and `fast` acceptance at 30 s
+for the sets with the narrowest gap between cap and floor. The first choice
+was the cheapest survivor: caps 1.5 / 1.5 / 1.75, tips at the 25th / 50th /
+70th percentile over 20 blocks, drift allowance 1.0, inclusion floor 1.125,
+markup 1.1.
 
-**The choice — the cheapest set meeting every target, with `standard` at the
-median:** caps 1.5 / 1.5 / 1.75, tips at the 25th / 50th / 70th percentile over
-20 blocks, drift allowance 1.0, inclusion floor 1.125, markup 1.1. Over the
-10.4 days:
+**The inclusion floor, revisited.** The floor never changes what a signed
+cap is — a repriced cap is whatever the payment funds — only which payments
+are signed at the bottom of their cap and which are held. A quote a block old
+funds more than 1.33× the base fee plus its tip, so at 12 s the floors up to
+1.33× differ only where the window's tip itself jumped within the block (4 in
+100,000 `slow` quotes). Older quotes:
 
-| tier | quote age | accepted at the first pass | of which the whole tier | rejected after the hold budget | blocks to inclusion, mean / p90 / p99 | ditto, lenient | tip's place in the next block |
+| floor | tier, quote age | accepted at the first pass | rejected after the hold budget | priced out after signing | wedged ≥ 30 min | longest wedge | lenient: priced out / wedged ≥ 30 min / longest |
 |---|---|---|---|---|---|---|---|
-| `slow` | 12 s | 100.00% | 100.00% | 0.000% | 2.28 / 4 / 12 | 1.08 / 1 / 2 | p25 |
-| `slow` | 30 s | 99.95% | 99.95% | 0.012% | 2.36 / 4 / 12 | 1.09 / 1 / 2 | p25 |
-| `slow` | 60 s | 99.41% | 99.41% | 0.163% | 2.54 / 4 / 14 | 1.28 / 1 / 2 | p25 |
-| `standard` | 12 s | 100.00% | 99.94% | 0.000% | 1.06 / 1 / 2 | 1.02 / 1 / 1 | p50 |
-| `standard` | 30 s | 100.00% | 99.67% | 0.000% | 1.07 / 1 / 2 | 1.03 / 1 / 1 | p50 |
-| `standard` | 60 s | 99.96% | 98.82% | 0.011% | 1.13 / 1 / 2 | 1.06 / 1 / 1 | p50 |
-| `fast` | 12 s | 100.00% | 99.80% | 0.000% | 1.01 / 1 / 1 | 1.00 / 1 / 1 | p70 |
-| `fast` | 30 s | 100.00% | 99.12% | 0.000% | 1.01 / 1 / 1 | 1.00 / 1 / 1 | p70 |
-| `fast` | 60 s | 100.00% | 98.16% | 0.000% | 1.02 / 1 / 1 | 1.00 / 1 / 1 | p70 |
+| 1.125× | `slow`, 12s | 100.00% | 0.000% | 0.238% | 0.082% | 522 min | 0.028% / 0.018% / 522 min |
+| 1.125× | `slow`, 30s | 99.95% | 0.013% | 0.337% | 0.110% | 522 min | 0.035% / 0.021% / 522 min |
+| 1.125× | `slow`, 60s | 99.40% | 0.159% | 0.340% | 0.102% | 522 min | 0.017% / 0.010% / 325 min |
+| 1.125× | `standard`, 30s | 100.00% | 0.000% | 0.034% | 0.018% | 52 min | 0.015% / 0.014% / 52 min |
+| 1.125× | `standard`, 60s | 99.96% | 0.011% | 0.060% | 0.028% | 66 min | 0.021% / 0.020% / 66 min |
+| 1.25× | `slow`, 12s | 99.99% | 0.000% | 0.238% | 0.082% | 522 min | 0.028% / 0.018% / 522 min |
+| 1.25× | `slow`, 30s | 99.04% | 0.193% | 0.256% | 0.074% | 522 min | 0.007% / 0.004% / 113 min |
+| 1.25× | `slow`, 60s | 97.10% | 0.514% | 0.230% | 0.076% | 522 min | 0.008% / 0.006% / 113 min |
+| 1.25× | `standard`, 30s | 99.96% | 0.006% | 0.039% | 0.020% | 52 min | 0.015% / 0.014% / 52 min |
+| 1.25× | `standard`, 60s | 99.72% | 0.066% | 0.055% | 0.024% | 72 min | 0.021% / 0.017% / 66 min |
+| 1.5× | `slow`, 12s | 80.40% | 1.610% | 0.169% | 0.055% | 522 min | 0.011% / 0.009% / 113 min |
+| 1.5× | `slow`, 30s | 53.02% | 6.622% | 0.100% | 0.036% | 522 min | 0.006% / 0.004% / 113 min |
+| 1.5× | `slow`, 60s | 53.51% | 7.740% | 0.095% | 0.039% | 522 min | 0.009% / 0.006% / 113 min |
+| 1.5× | `standard`, 30s | 96.48% | 0.414% | 0.049% | 0.021% | 73 min | 0.020% / 0.014% / 52 min |
+| 1.5× | `standard`, 60s | 95.10% | 0.650% | 0.044% | 0.020% | 75 min | 0.010% / 0.010% / 66 min |
 
-("Accepted" counts the full tier, a repriced cap and a shaved tip; "the whole
-tier" excludes the shaved tip. Blocks are counted from the first submission
-attempt, holds included.)
+On the lenient proxy 1.25× cuts the priced-out `slow` bundles of 30 s-old
+quotes to a fifth (0.035% → 0.007%; 60 s: 0.017% → 0.008%) and their longest
+wedge from 8.7 hours to 1.9, at the price of holding — and after 35 minutes
+rejecting — 0.19% of 30 s-old `slow` quotes (0.51% at 60 s) that 1.125×
+signed. A wallet that refreshes its quote before signing (§3) sits in the
+12 s rows, where nothing changes. 1.5× holds a fifth of fresh `slow` sends.
+The floor is 1.25×. (A drift allowance of 1.0625 on top — 6% dearer for every
+tier — brings the 30 s `slow` rejections back to 0.043%; it is left at 1.0.)
+No floor touches the longest wedge of all: a `slow` bundle signed at its
+whole 1.5× cap at 10:58 UTC on 2026-09-29, when the base fee rose from 0.34
+gwei to 7.05 and stayed above that cap for 522 minutes. Only a fee-bump path
+would end that one.
+
+**The choice:** caps 1.5 / 1.5 / 1.75, tips at the 25th / 50th / 70th
+percentile over 20 blocks, drift allowance 1.0, inclusion floor 1.25, markup
+1.1. Over the 10.4 days:
+
+| tier | quote age | accepted at the first pass | of which the whole tip | rejected after the hold budget | blocks to inclusion, mean / p90 / p99 / p99.9 | priced out after signing | wedged ≥ 5 min / ≥ 30 min | longest wedge |
+|---|---|---|---|---|---|---|---|---|
+| `slow` | 12s | 99.99% | 99.99% | 0.000% | 2.48 / 4 / 12 / 109 | 0.238% | 0.266% / 0.0825% | 522 min |
+| `slow` | 30s | 99.04% | 99.04% | 0.193% | 2.79 / 4 / 14 / 156 | 0.256% | 0.266% / 0.0742% | 522 min |
+| `slow` | 60s | 97.10% | 97.10% | 0.514% | 3.39 / 4 / 52 / 177 | 0.230% | 0.235% / 0.0759% | 522 min |
+| `standard` | 12s | 100.00% | 99.88% | 0.000% | 1.06 / 1 / 2 / 4 | 0.021% | 0.017% / 0.0126% | 50 min |
+| `standard` | 30s | 99.96% | 98.33% | 0.006% | 1.10 / 1 / 2 / 7 | 0.039% | 0.034% / 0.0196% | 52 min |
+| `standard` | 60s | 99.72% | 95.79% | 0.066% | 1.23 / 1 / 2 / 77 | 0.055% | 0.049% / 0.0238% | 72 min |
+| `fast` | 12s | 100.00% | 99.65% | 0.000% | 1.01 / 1 / 1 / 2 | 0.003% | 0.001% / 0.0014% | 37 min |
+| `fast` | 30s | 100.00% | 98.47% | 0.000% | 1.01 / 1 / 1 / 2 | 0.007% | 0.006% / 0.0056% | 47 min |
+| `fast` | 60s | 99.99% | 96.77% | 0.000% | 1.03 / 1 / 1 / 2 | 0.013% | 0.010% / 0.0098% | 47 min |
+
+("Accepted" counts the full tier, a repriced cap and a shaved tip; "of which
+the whole tip" excludes the shaved tip. Blocks are counted from the first
+submission attempt, holds included; an unmined bundle counts as 3,000. No
+bundle in any row stayed unmined for the 10 hours.)
 
 | tier | price ÷ `slow`'s, median | ETH send: paid ÷ baseline, median (p90) | swap: ditto | relay profit ÷ chain charge, ETH send: min / 1st pct / median | undeployed first op: ditto |
 |---|---|---|---|---|---|
-| `slow` | 1.00 | 1.56 (1.97) | 1.45 (1.82) | +49% / +80% / +120% | +33% / +61% / +96% |
-| `standard` | 1.27 | 1.99 (2.13) | 1.84 (1.97) | +49% / +70% / +98% | +33% / +52% / +77% |
-| `fast` | 1.87 | 2.93 (3.62) | 2.71 (3.35) | +49% / +64% / +100% | +33% / +47% / +79% |
+| `slow` | 1.00 | 1.56 (1.97) | 1.44 (1.82) | +49% / +80% / +120% | +33% / +60% / +96% |
+| `standard` | 1.28 | 1.99 (2.13) | 1.84 (1.97) | +49% / +70% / +98% | +33% / +52% / +77% |
+| `fast` | 1.88 | 2.94 (3.63) | 2.72 (3.36) | +49% / +64% / +100% | +33% / +47% / +79% |
 
-The relay's profit is never negative by construction — it is paid at least
-`markup × billed gas × the signed cap` and charged at most `gas used × that
-cap` — and over the replay it was never under +33% of the chain's charge.
-With a gas estimate 3% short of what the executor bills, `standard` and `fast`
-are still accepted whole ≥ 99.67% at 12 s and ≥ 98.66% at 30 s. A drift
-allowance of 1.0625 with a 1.25× floor — 6% dearer — accepts `standard` whole
-99.96% / 99.68% at 12 / 30 s and rejects 0.046% of slow sends at 30 s instead
-of 0.012%: the gap between a tier's cap and the floor already pays for a
-quote's drift, so the allowance bought nothing the targets asked for.
+The prices do not depend on the floor: they are the first choice's. With a
+gas estimate 3% short of what the executor bills, `standard` and `fast` are
+still accepted with their whole tip ≥ 99.29% at 12 s and ≥ 96.25% at 30 s,
+and 0.35% of 30 s-old `slow` quotes are rejected.
 
 **The markup.** It decides price and guaranteed margin only — acceptance is the
 same at every markup, because the published price scales with it. Over the
@@ -513,8 +576,17 @@ with the executor's own configured markup.
 
 The parameters were fitted to Ethereum, the chain where gas is a person's real
 cost. Elsewhere the same tables apply; on the cheap chains the `$0.01` floor is
-the price anyway (§1), and the reward-percentile tips carry each chain's own
-market.
+the price anyway (§1), and the tips carry each chain's own market (§2a: a
+minute of its blocks, the node's tip in quiet ones). Replayed over one to four
+hours of each chain's fee history (2026-10-09) for an ETH-send-sized operation
+quoted 12 s before its submission: BNB Smart Chain signs 0.05 / 0.05 / 0.057
+gwei, holds nothing — every send was held when the executor's node answered 1
+gwei before the node's tip stopped being an unconditional floor — and shaves
+4% of `fast` tips where the 20-block window shaved 19%; Polygon signs 30 /
+37.5 / 60 gwei where it signed the percentiles (82–126 gwei in that history),
+holds 0.4% of `slow` sends where it held 1.2%, and charges the `$0.01` floor
+93% of the time; Avalanche signs 0.001–0.002 gwei tips where it signed
+0.9–1.5 and holds none; Gnosis is the floor throughout.
 
 ## 3. What a CLIENT should pay
 
@@ -582,17 +654,19 @@ named, a client following this section pays it exactly (times its estimate's
 slack over the executor's billing: 1.002–1.046 on the replayed operations).
 The base fee may then rise before the submission by:
 
-| tier | the whole tip, the cap repriced | the tip shaved toward `slow`'s | above that |
+| tier | the whole tip, the cap repriced | the tip shaved toward `tips.floor` | above that |
 |---|---|---|---|
-| `slow` | +33% (1.5 / 1.125) | — (its tip is the floor's) | held, then rejected |
-| `standard` | +33%, plus what its tip over `slow`'s buys | down to `slow`'s tip | held, then rejected |
-| `fast` | +56% (1.75 / 1.125), plus the same | down to `slow`'s tip | held, then rejected |
+| `slow` | +20% (1.5 / 1.25) | — (its tip is the window's floor) | held, then rejected |
+| `standard` | +20%, plus what its tip over the floor buys | down to `tips.floor` | held, then rejected |
+| `fast` | +40% (1.75 / 1.25), plus the same | down to `tips.floor` | held, then rejected |
 
 (at a tip small beside the base fee; a real tip widens every band, since the
 cap a payment funds carries it whole). Every larger move fails safe: a held,
 then rejected send, never an under-charge or a loss to the relay. One block of
 the largest rise is 12.5%, so a quote a block old is accepted at its whole
-tier; the backtest in §2c measures the rest.
+tier; two blocks of it (26.6%) is past `slow`'s, which is why a wallet
+refreshes a quote older than a block before signing. The backtest in §2c
+measures the rest.
 
 ## 4. Stablecoin payments
 
@@ -638,8 +712,9 @@ speed.)
   before the client signs, and its `verificationGasLimit` is now the measured
   validation gas.
 - Repricing turns the cap into a live safety valve: a short-but-honest payment
-  is repriced down to a fundable cap, down to the 1.125×base inclusion floor,
-  rather than held.
+  is repriced down to a fundable cap, down to the 1.25×base inclusion floor,
+  rather than held. Below it the payment is held: a signed transaction
+  cannot be bumped, and a cap a rising base fee passes wedges its lane.
 - A client may name a speed. **A tier is two levers**: a cap (1.5 / 1.5 / 1.75 ×
   base) and a tip read from what recent blocks paid — the median over a
   minute of blocks (at least 20) of each block's 25th / 50th / 70th
