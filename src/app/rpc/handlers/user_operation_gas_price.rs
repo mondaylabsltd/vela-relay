@@ -81,6 +81,7 @@ mod tests {
                 slow: 40,
                 standard: 50,
                 fast: 80,
+                floor: 40,
             },
         })
         .unwrap();

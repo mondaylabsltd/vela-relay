@@ -29,6 +29,7 @@ const TIPS: TierTips = TierTips {
     slow: 147_320_634,
     standard: 1_000_000_000,
     fast: 1_795_116_512,
+    floor: 147_320_634,
 };
 const TIERS: [SubmissionTier; 3] = [
     SubmissionTier::Slow,
@@ -146,15 +147,28 @@ fn native_payment(amount: u128) -> Vec<u8> {
 /// `base`: `decide_submission_fees` then `decide_settlement`, as
 /// `execution::run_batch` composes them. `None` when it is held.
 fn submit(paid: u128, settlement_gas: u128, tier: SubmissionTier, base: u128) -> Option<OuterFee> {
+    submit_reading(paid, settlement_gas, tier, base, 0, TIPS)
+}
+
+/// [`submit`], with the market the executor reads: the node's tip and the
+/// tier tips its fee-history window resolves to.
+fn submit_reading(
+    paid: u128,
+    settlement_gas: u128,
+    tier: SubmissionTier,
+    base: u128,
+    market_tip: u128,
+    tips: TierTips,
+) -> Option<OuterFee> {
     let call_data = native_payment(paid);
     let allocations = [U256::from(settlement_gas)];
     let mut fees = FeeContext {
-        quoted_fee_per_gas: crate::gas_math::quoted_outer_fee(base, 0).unwrap(),
+        quoted_fee_per_gas: crate::gas_math::quoted_outer_fee(base, market_tip).unwrap(),
         base_fee_per_gas: base,
-        max_priority_fee_per_gas: 0,
+        max_priority_fee_per_gas: market_tip,
         inclusion_floor_bps: DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS,
         requested_tier: Some(tier),
-        tier_tips: TIPS,
+        tier_tips: tips,
     };
     let outer = decide_submission_fees(
         TREASURY,
@@ -375,5 +389,107 @@ fn the_dust_floor_is_the_requirement_when_the_gas_costs_less() {
         .unwrap();
         assert_eq!(evaluation.operations[0].required_amount, floor);
         assert_eq!(evaluation.all_accepted(), accepted, "paid {paid}");
+    }
+}
+
+/// What a contract-following wallet pays for `tier` when the quote read
+/// `tips` at next-block base fee `base`: `settlementGas × inBandFeePerGas`.
+fn published_payment(
+    settlement_gas: u128,
+    tier: SubmissionTier,
+    base: u128,
+    tips: &TierTips,
+) -> u128 {
+    let cap = tier_outer_fee(tier, base, tips).unwrap().max_fee_per_gas;
+    settlement_gas
+        * in_band_fee_per_gas(cap, BillingTerms::default().settlement_markup_bps).unwrap()
+}
+
+/// Review F1, end to end: the quote and the executor ask different nodes for
+/// `eth_maxPriorityFeePerGas`. On BNB Smart Chain (no base fee; blocks paying
+/// a median p25 / p50 / p70 of 0.05 / 0.050000001 / 0.057 gwei, 2026-10-09) a
+/// quote read from a node answering 0.05 gwei and a submission read from one
+/// answering 1 gwei (48.club, sentio) used to disagree on every tier's tip —
+/// the executor's `slow` was 1 gwei, so every send was held, then rejected.
+/// Now both read the blocks, and each is accepted at the tip it was quoted.
+#[test]
+fn a_quote_from_one_node_is_accepted_by_an_executor_that_asks_another() {
+    use crate::gas_math::TipWindow;
+    let bsc = TipWindow {
+        rewards: vec![vec![50_000_000, 50_000_001, 57_000_000]; 134],
+        gas_used_ratio_bps: Some(3_200),
+    };
+    let quoted = TierTips::from_window(&bsc, 50_000_000).unwrap();
+    for executor_node in [100_000_000, 1_000_000_000, 3_000_000_000] {
+        let read = TierTips::from_window(&bsc, executor_node).unwrap();
+        for operation in operations() {
+            let billed = buffered(operation.gas_used);
+            for tier in TIERS {
+                let paid = published_payment(operation.settlement_gas, tier, 0, &quoted);
+                let signed = submit_reading(paid, billed, tier, 0, executor_node, read)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} {tier}: held by a node answering {executor_node}",
+                            operation.name
+                        )
+                    });
+                assert_eq!(signed.max_priority_fee_per_gas, quoted.of(tier));
+            }
+        }
+    }
+}
+
+/// Review F5's flip: a Polygon quote read in a quiet window (the node's 30
+/// gwei, scaled) and a submission whose window turned busy a few blocks later
+/// (the 25th percentile at 265.7 gwei) — the payment cannot fund the busy
+/// `slow` tip. Inside the near-quiet band it is shaved to the quiet tip and
+/// sent, not held: a slower send, never a stuck one.
+#[test]
+fn a_quote_read_in_a_quiet_window_is_not_held_when_the_next_one_is_busy() {
+    use crate::gas_math::TipWindow;
+    const GWEI: u128 = 1_000_000_000;
+    let polygon = |ratio| TipWindow {
+        rewards: vec![vec![265_700_000_000, 286_600_000_000, 288_700_000_000]; 30],
+        gas_used_ratio_bps: Some(ratio),
+    };
+    let base = 246_800_000_000;
+    let quoted = TierTips::from_window(&polygon(1_900), 30 * GWEI).unwrap();
+    let read = TierTips::from_window(&polygon(3_500), 30 * GWEI).unwrap();
+    assert_eq!(read.slow, 265_700_000_000);
+    let send = &operations()[0];
+    for tier in TIERS {
+        let paid = published_payment(send.settlement_gas, tier, base, &quoted);
+        let signed = submit_reading(paid, buffered(send.gas_used), tier, base, 30 * GWEI, read)
+            .unwrap_or_else(|| panic!("{tier}: held after the window turned busy"));
+        assert!(signed.max_priority_fee_per_gas >= 30 * GWEI, "{tier}");
+        assert!(signed.delivers_full_tip_at(base));
+        assert!(paid >= requirement(buffered(send.gas_used), signed.max_fee_per_gas));
+    }
+}
+
+/// Review F6: where the `$0.01` floor is the price, what the payment funds is
+/// read at the tier's own cap. A Gnosis `fast` send (base fee 8 wei, the
+/// node's tip 1 wei, a busy window paying 1.5 gwei at the 70th percentile)
+/// pays the floor — 0.01 xDAI, thousands of times its gas — and is signed at
+/// the 1.5 gwei it was quoted. Measured at the executor's untiered `2 × base +
+/// tip` (17 wei) the same payment read as funding 17,000 wei of cap, and the
+/// send went out at the slow tier's 0.001 gwei.
+#[test]
+fn a_payment_the_dust_floor_dominates_funds_the_tier_it_named() {
+    let gnosis = TierTips {
+        slow: 1_000_000,
+        standard: 1_000_000,
+        fast: 1_500_000_000,
+        floor: 1_000_000,
+    };
+    let cent_of_xdai = 10_000_000_000_000_000;
+    let send = &operations()[0];
+    for tier in TIERS {
+        assert!(published_payment(send.settlement_gas, tier, 8, &gnosis) < cent_of_xdai);
+        let signed = submit_reading(cent_of_xdai, buffered(send.gas_used), tier, 8, 1, gnosis)
+            .unwrap_or_else(|| panic!("{tier}: held"));
+        assert_eq!(signed.max_priority_fee_per_gas, gnosis.of(tier), "{tier}");
+        assert!(signed.delivers_full_tip_at(8));
+        assert!(cent_of_xdai >= requirement(buffered(send.gas_used), signed.max_fee_per_gas));
     }
 }

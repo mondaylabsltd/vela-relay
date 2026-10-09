@@ -2104,7 +2104,7 @@ async fn transaction_context(
         // The tier tips, read by the rule the quote reads them with.
         RpcBatchCall {
             method: "eth_feeHistory",
-            params: vela_relay_core::gas_math::tip_history_params(),
+            params: vela_relay_core::gas_math::tip_history_params(chain_id),
         },
     ];
     let responses = trusted
@@ -2145,10 +2145,10 @@ async fn transaction_context(
     let relayer_balance = response_quantity(&responses, 4, "eth_getBalance")?;
     // A failed or unreadable fee history is not fatal: the tiers then scale
     // the market tip, as the quote does without one.
-    let tip_rewards = responses
+    let tip_window = responses
         .get(5)
         .and_then(|response| response.as_ref().ok())
-        .and_then(vela_relay_core::gas_math::tip_rewards);
+        .and_then(vela_relay_core::gas_math::tip_window);
 
     Ok(core_execution::TransactionContext {
         estimated_gas,
@@ -2157,7 +2157,7 @@ async fn transaction_context(
         max_priority_fee_per_gas: tip,
         nonce,
         relayer_balance,
-        tip_rewards,
+        tip_window,
     })
 }
 

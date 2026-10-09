@@ -109,7 +109,7 @@ async fn network_gas_price(
             chain_id,
             user_rpc_url,
             "eth_feeHistory",
-            vela_relay_core::gas_math::tip_history_params(),
+            vela_relay_core::gas_math::tip_history_params(chain_id),
         ),
         quantity(
             config,

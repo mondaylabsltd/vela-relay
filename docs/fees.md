@@ -205,16 +205,24 @@ for byte (`2 × base_fee + market tip`, the market tip signed).
 | `fast` | **1.75×** base_fee | **70th** percentile | outbids seven tenths of a block's gas |
 
 ```
-tip[tier] = the median over the last 20 blocks of each block's p-th percentile reward   (TierTips)
-            slow ≥ max(0.001 gwei if those blocks paid any tip, the node's eth_maxPriorityFeePerGas)
-            standard ≥ slow,  fast ≥ standard
+window    = eth_feeHistory over the chain's last minute of blocks, at least 20   (tip_window_blocks)
+least     = 0.001 gwei if the window paid any tip, else 0
+node      = eth_maxPriorityFeePerGas, unless the window paid tips and it is above their median p50
+rewarded  = max( the window's median p25 , least )
+
+busy window  (mean gasUsedRatio ≥ 30%):   tip[slow] = max(rewarded, node),  tip[standard] = max(median p50, slow),
+                                          tip[fast] = max(median p70, standard)
+quiet window (mean gasUsedRatio < 30%):   tip[slow] = max(node, least) (rewarded without a node),
+                                          tip[standard] = 1.25 × slow,  tip[fast] = 2 × slow
+tips.floor = rewarded (the node's tip where the window paid none); below a 40% mean, the lower of
+             that and the quiet tip[slow]                                                     (TierTips)
 
 absent  ⇒ cap = 2 × base_fee + market_tip,  signed tip = market_tip           (unchanged)
-present ⇒ funded = what the reimbursements fund;   floor = inclusion_floor × base_fee
-          funded ≥ floor + tip[tier]   →  cap = min( max(base_fee_bps[tier] × base_fee, floor) + tip[tier] , funded ),
-                                          tip = tip[tier]
-          funded ≥ floor + tip[slow]   →  cap = funded,  tip = funded − floor       (the tip shaved, never below slow's)
-          otherwise                    →  cap = floor + tip[slow],  tip = tip[slow]  (held, §2)
+present ⇒ funded = the cap the reimbursements fund, measured at the tier's own cap;   floor = inclusion_floor × base_fee
+          funded ≥ floor + tip[tier]     →  cap = min( max(base_fee_bps[tier] × base_fee, floor) + tip[tier] , funded ),
+                                            tip = tip[tier]
+          funded ≥ floor + tips.floor    →  cap = funded,  tip = funded − floor    (the tip shaved, never below tips.floor)
+          otherwise                      →  cap = floor + tips.floor,  tip = tips.floor  (held, §2)
 ```
 
 **The cap buys spike resilience. Only the tip buys priority.** They are
@@ -226,18 +234,47 @@ cap, and a mined Polygon `fast` receipt (base 250.710, max 775.525, max
 priority 30.35 gwei) paid the builder exactly what `slow` would have. Every tier
 now signs its own tip.
 
-**The tips are read from what blocks actually paid.** `eth_feeHistory(20,
+**The tips are read from what blocks actually paid.** `eth_feeHistory(n,
 "latest", [25, 50, 70])` reports, per block, the effective tip at the 25th, 50th
-and 70th percentile of its gas. A tier's tip is the median of its column over
-the 20 blocks, so one odd block moves nothing. `slow` is never below the node's
-own `eth_maxPriorityFeePerGas` — that answer carries a chain's enforced minimum
-(bor on Polygon), and a tip under it is rejected outright rather than mined
-late — nor below 0.001 gwei once the window paid any tip at all, because a
-block's low percentiles are often a single wei on Ethereum. A chain whose blocks
-pay no tip (Arbitrum) keeps zero. Without a readable reward column (a legacy
-chain, a failed call) every tier falls back to the market tip scaled `1.00 /
-1.25 / 2.00` — the rule before rewards were read — on the quote and the
-executor alike (`TierTips::resolve`).
+and 70th percentile of its gas, and how full the block was. A tier's tip is the
+median of its column over the window, so one odd block moves nothing. `slow` is
+never below 0.001 gwei once the window paid any tip at all, because a block's
+low percentiles are often a single wei on Ethereum. A chain whose blocks pay no
+tip (Arbitrum) keeps zero. Without a readable reward column (a legacy chain, a
+failed call) every tier falls back to the market tip scaled `1.00 / 1.25 /
+2.00` — the rule before rewards were read — on the quote and the executor
+alike (`TierTips::resolve`).
+
+- **The window is a minute of blocks, never fewer than 20**
+  (`gas_math::tip_window_blocks`, from `pace::block_interval_ms`): Ethereum
+  and Gnosis read 20, Polygon, OP Mainnet and Base 30, Avalanche and Unichain
+  60, BNB Smart Chain 134, Arbitrum 240 (at most 256; every endpoint probed
+  serves that many). Twenty BSC blocks are nine seconds, less than a quote's
+  own age: the executor's window held none of the quote's blocks, and 38% of
+  BSC `standard` and `fast` sends had their tip shaved below the one quoted.
+- **The node's tip is a floor only where the blocks do not contradict it.**
+  `eth_maxPriorityFeePerGas` carries a chain's enforced minimum (bor on
+  Polygon), which a tip must clear or be refused outright — and an enforced
+  minimum is never above what the median block paid, since every included
+  transaction cleared it. Nodes disagree, and the quote and the executor ask
+  different ones: on BNB Smart Chain the directory's endpoints answered 0.05,
+  0.1, 1 and 3 gwei over blocks whose median paid 0.05 (2026-10-09), and an
+  executor reading 1 gwei signed `slow` at 1 gwei — holding, then rejecting,
+  every send quoted at 0.05. An answer above the window's median p50 is that
+  node's opinion and is left out. A window that paid no tip at all (Stable,
+  XRPL EVM) contradicts nothing, and the node is believed.
+- **A quiet window signs the node's tip.** Where the window's blocks used less
+  than 30% of their gas limit on average, every transaction paying the
+  chain's minimum fits in the next block, and the percentiles are what a few
+  bots bid: Polygon's 25th percentile read 166–265 gwei against the node's 30,
+  Avalanche's 2.5–6.2 gwei on blocks 3% full, Gnosis's 70th 1.5 gwei over an
+  8-wei base fee. There each tier signs the node's tip scaled `1.00 / 1.25 /
+  2.00` — what every tier signed before rewards were read, mined on Polygon at
+  30 gwei — and `fast` still bids twice `slow`. The line is 30%, not one half,
+  because Ethereum's base fee targets half-full blocks: its 20-block average is
+  below 0.5 in 49% of windows and was never below 0.338 over the 10.4 days of
+  §2c, so it always reads busy; BNB Smart Chain's minute reads quiet 92% of
+  the time, Polygon's 93%, Avalanche's always.
 
 On Ethereum the node's tip is no guide: on 2026-10-08 `eth_maxPriorityFeePerGas`
 answered 0 while blocks paid a median of 1 gwei, so the relay signed every tier
@@ -251,13 +288,21 @@ Pinned by `the_ethereum_tiers_at_the_block_the_overcharge_was_measured`.
 - *The cap gives way first.* A payment short of the full tier is repriced down
   toward the inclusion floor, keeping the whole tip — the cap above `base +
   tip` only ever bought resilience.
-- *Then the tip, never below `slow`'s.* A payment that cannot fund the floor
-  with its tier's whole tip — a quote several blocks old in a rising market, or
-  a wallet that priced a cheaper tier than it named — keeps the floor's base-fee
-  headroom and gives back priority, down to the slow tier's tip: a slower send,
-  never a stuck or a rejected one. (Until the tips were read from rewards the
-  tip was never shaved; the backtest in §2c measures how rarely this runs for a
-  fresh quote: 0.06% of `standard` sends and 0.2% of `fast` ones at 12 s.)
+- *Then the tip, never below what the window proves the chain takes.* A
+  payment that cannot fund the floor with its tier's whole tip — a quote
+  several blocks old in a rising market, a quote whose node answered a lower
+  tip, a quote read in a quiet window and submitted in a busy one, or a wallet
+  that priced a cheaper tier than it named — keeps the floor's base-fee
+  headroom and gives back priority, down to `tips.floor`: the window's own
+  25th-percentile reward, and within reach of the quiet line (a mean below
+  40%) the quiet `slow` tip if lower. A slower send, never a stuck or a
+  rejected one. (Until the tips were read from rewards the tip was never
+  shaved; the backtest in §2c measures how rarely this runs for a fresh quote.)
+- *What a payment funds is measured at the tier's own cap.* Where the `$0.01`
+  floor is the price, the payment funds far more than the gas costs. Measured
+  at the executor's untiered `2 × base + tip` — 17 wei on Gnosis — it read as
+  funding that and no more, and a Gnosis `fast` send quoted at a 1.5 gwei tip
+  was signed at the slow tier's 0.001 gwei.
 - *The weakest payer sets the cap.* A bundle is one transaction at one price; a
   `fast` neighbour can never price a slower operation out of its own bundle.
   A bundle takes the fastest speed any member named, and a member that named
@@ -299,15 +344,19 @@ block later is the same number.
 
 **What is quoted is what is signed.** The quote and the executor read the tier
 tips by one rule (`gas_math::TierTips::resolve`) from the same
-`eth_feeHistory(20, "latest", [25, 50, 70])` (`gas_math::tip_history_params`):
-the quote through the request's failover chain, the executor in its
-transaction-context batch at submit time. Fed the same answers they produce the
-same tip and the same cap, to the wei (pinned by
+`eth_feeHistory(tip_window_blocks(chain), "latest", [25, 50, 70])`
+(`gas_math::tip_history_params`): the quote through the request's failover
+chain, the executor in its transaction-context batch at submit time. Fed the
+same answers they produce the same tip and the same cap, to the wei (pinned by
 `the_tip_reported_for_a_tier_is_the_tip_the_executor_signs_given_the_same_rpc_answers`,
-over Polygon, Arbitrum, Base, Optimism, Ethereum, BSC and a rising base fee).
-The reading is a 20-block median, so a quote a block old and the submission
-that follows it read the same tip almost always; where they do not, the
-clamps of §2a decide.
+over Polygon busy and quiet, Arbitrum, Base, Optimism, Ethereum, BSC and a
+rising base fee). They are not always fed the same answers — they ask
+different nodes, a little apart in time — so the reading is built to agree
+anyway: a median over at least a minute of blocks, which a quote and its
+submission mostly share; a node's tip only where the blocks bear it out
+(pinned by `a_quote_from_one_node_is_accepted_by_an_executor_that_asks_another`);
+and where they still differ, the clamps of §2a decide, shaving rather than
+holding (`a_quote_read_in_a_quiet_window_is_not_held_when_the_next_one_is_busy`).
 
 **`inBandFeePerGas`** — `settlement markup × IN_BAND_DRIFT × cap`
 (`gas_math::in_band_fee_per_gas`), with the operator's configured markup and
@@ -336,7 +385,8 @@ deployed relay's `R` at block 26,149,237 — 2,505,999,999 / 3,341,333,332 /
 **The market tip is one reading, resolved one way** (`gas_math::market_tip`):
 the node's `eth_maxPriorityFeePerGas`, zero included; only when that call gave
 no quantity, `eth_gasPrice −` the latest block's base fee. It is the untiered
-pace's tip, the floor under `slow`, and `R`'s tip term. When neither yields a
+pace's tip, the floor under `slow` where the blocks bear it out, every tier's
+tip (scaled) in a quiet window, and `R`'s tip term. When neither yields a
 tip, the executor refuses to submit and only the quote falls back, to
 `base_fee / 200` (`gas_math::quote_market_tip`).
 
@@ -460,9 +510,11 @@ F = max( settlementGas × inBandFeePerGas[tier] ,  settlementGas × own_check(ti
   it: `markup × drift × (base_fee_bps[tier] × base_fee + tip[tier])`, with the
   markup the relay applies (1.1× by default), the drift allowance (1.0), the
   tables of §2a, and the client's own `base_fee` and tier tips — read, for an
-  exact match, as the relay reads them (`eth_feeHistory(20, "latest", [25, 50, 70])`, the median of
-  each column, `slow` floored at `max(0.001 gwei, eth_maxPriorityFeePerGas)`,
-  each faster tier at least the slower one).
+  exact match, as the relay reads them (§2a: `eth_feeHistory` over the
+  chain's tip window, the median of each column — or the node's tip scaled in
+  a quiet window — `slow` at least 0.001 gwei once the window paid any tip and
+  at least the node's tip where the blocks bear it out, each faster tier at
+  least the slower one).
 - **The dust floor**: at least `$0.01` of the native coin (and never below the
   relay's `0.00001`-coin floor), or `$0.01` of a stablecoin.
 - **A fresh quote.** The acceptance table in §2c is for quotes 12, 30 and 60 s
@@ -566,12 +618,15 @@ speed.)
   is repriced down to a fundable cap, down to the 1.125×base inclusion floor,
   rather than held.
 - A client may name a speed. **A tier is two levers**: a cap (1.5 / 1.5 / 1.75 ×
-  base) and a tip read from what recent blocks paid — the median over 20 blocks
-  of each block's 25th / 50th / 70th percentile reward, `slow` never below the
-  node's own tip. The quote and the executor read the tips by one rule, so
-  what is quoted is what is signed. A payment that cannot fund its tier gives
-  back cap headroom first, then priority down to `slow`'s tip, then is held —
-  never signed at a loss. Naming nothing is the relay's own pace, unchanged.
+  base) and a tip read from what recent blocks paid — the median over a
+  minute of blocks (at least 20) of each block's 25th / 50th / 70th
+  percentile reward, or, where the blocks are under 30% full, the node's own
+  tip scaled 1.00 / 1.25 / 2.00; the node's tip a floor only where the blocks
+  bear it out. The quote and the executor read the tips by one rule, so what
+  is quoted is what is signed. A payment that cannot fund its tier gives back
+  cap headroom first, then priority down to what the window proves the chain
+  takes, then is held — never signed at a loss. Naming nothing is the relay's
+  own pace, unchanged.
 - `pimlico_getUserOperationGasPrice` reports each tier's cap and tip, its
   `inBandFeePerGas` (`markup × cap`) where `settlementGas` is returned, and a
   frozen `networkFeePerGas` for wallets that still price the limits.

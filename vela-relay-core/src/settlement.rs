@@ -872,25 +872,29 @@ impl std::error::Error for SettlementDecisionError {}
 /// giving up headroom before priority and priority before inclusion:
 ///
 /// ```text
-/// funded = what the reimbursements fund;  floor = inclusion_floor_bps × base
+/// funded = the cap the reimbursements fund, measured at the tier's own cap;  floor = inclusion_floor_bps × base
 ///
-/// funded ≥ floor + tip[tier]   →  cap = min( max(base_fee_bps[tier] × base, floor) + tip[tier] , funded ),  tip = tip[tier]
-/// funded ≥ floor + tip[slow]   →  cap = funded,  tip = funded − floor          (the tip shaved, never below slow's)
-/// otherwise                    →  cap = floor + tip[slow],  tip = tip[slow]     (refused below: held, then rejected)
+/// funded ≥ floor + tip[tier]    →  cap = min( max(base_fee_bps[tier] × base, floor) + tip[tier] , funded ),  tip = tip[tier]
+/// funded ≥ floor + tips.floor   →  cap = funded,  tip = funded − floor       (the tip shaved, never below the window's floor)
+/// otherwise                     →  cap = floor + tips.floor,  tip = tips.floor  (refused below: held, then rejected)
 /// ```
 ///
 /// - **The cap gives way first.** A cap above `base + tip` buys only
 ///   resilience to a rise, so a payment short of the full tier is first
 ///   repriced down toward the inclusion floor, keeping the whole tip.
-/// - **Then the tip, but never below `slow`'s.** A payment that cannot fund
-///   the floor with its tier's whole tip — a quote a few blocks old in a rising
-///   market, or a wallet that priced a cheaper tier than it named — keeps the
-///   floor's base-fee headroom and gives back priority down to the slow tier's
-///   tip: a slower send, never a stuck or rejected one. The slow tier's tip is
-///   at least the node's own `eth_maxPriorityFeePerGas`, the chain's enforced
-///   minimum ([`TierTips`]). (Until the tips became real reward percentiles
-///   the tip was never shaved; the backtest in `docs/fees.md` §2c measures
-///   how rarely this branch runs for a fresh quote.)
+/// - **Then the tip, but never below what the window proves the chain
+///   takes.** A payment that cannot fund the floor with its tier's whole tip
+///   — a quote a few blocks old in a rising market, a quote whose node
+///   answered a lower tip than this one's, or a wallet that priced a cheaper
+///   tier than it named — keeps the floor's base-fee headroom and gives back
+///   priority down to [`TierTips::floor`], the window's own 25th-percentile
+///   reward: a slower send, never a stuck or rejected one. (Until the tips
+///   became real reward percentiles the tip was never shaved; the backtest in
+///   `docs/fees.md` §2c measures how rarely this branch runs for a fresh
+///   quote.)
+/// - **What a payment funds is measured at the tier's cap.** A payment the
+///   `$0.01` floor dominates funds far more than the gas costs; measured at
+///   the shell's untiered quote it read as funding that quote and no more.
 /// - **Never at a loss.** The cap is never above what the reimbursements fund,
 ///   and a payment that cannot fund even the floor with the slowest tip
 ///   reaches [`decide_settlement`]'s `FloorUnfundable` and the ordinary hold.
@@ -920,14 +924,28 @@ pub fn decide_submission_fees(
         return Ok(None);
     };
 
-    // What the signed reimbursements fund, read once at the fee the shell
-    // quoted. The requirement is linear in the cap, so a single evaluation at
-    // a known fee scales to any other.
+    let tip = requested.max_priority_fee_per_gas;
+    // `floor × base`, the base-fee headroom every signed cap keeps.
+    let Some(headroom) = inclusion_floor_fee_per_gas(base, 0, fees.inclusion_floor_bps) else {
+        // The floor itself overflowed; there is nothing to fit the tier to.
+        return Ok(Some(requested));
+    };
+    let floor_with_tip = headroom.saturating_add(tip);
+
+    // What the signed reimbursements fund, read once at the cap the tier
+    // asks for. The requirement is linear in the cap above the dust floor, so
+    // a single evaluation scales to any other cap — but only one taken where
+    // the markup, not the floor, sets the requirement says how far. Read at
+    // the shell's untiered quote (`2 × base + market tip`, 17 wei on Gnosis)
+    // a payment of the `$0.01` floor funded exactly that quote and no more,
+    // and a Gnosis `fast` send quoted at a 1.5 gwei tip was signed at the
+    // slow tier's 0.001. At the tier's own cap a payment the floor dominates
+    // reads as funding all of it, which it does.
+    let reference = requested.max_fee_per_gas.max(floor_with_tip);
     let costs = allocations
         .iter()
         .map(|gas| {
-            crate::cost::native_cost(*gas, fees.quoted_fee_per_gas)
-                .ok_or(SettlementDecisionError::CostOverflow)
+            crate::cost::native_cost(*gas, reference).ok_or(SettlementDecisionError::CostOverflow)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let inputs = call_datas
@@ -941,17 +959,12 @@ pub fn decide_submission_fees(
     let evaluation = evaluate_batch(recipient, chain_assets, &inputs, native_usd_price)
         .map_err(SettlementDecisionError::Evaluation)?;
 
-    let tip = requested.max_priority_fee_per_gas;
     // An empty bundle funds nothing and asks for nothing.
-    let fundable = fundable_fee_per_gas(fees.quoted_fee_per_gas, &evaluation.operations)
+    let fundable = fundable_fee_per_gas(reference, &evaluation.operations)
         .unwrap_or(requested.max_fee_per_gas);
-    // `floor × base`, the base-fee headroom every signed cap keeps.
-    let Some(headroom) = inclusion_floor_fee_per_gas(base, 0, fees.inclusion_floor_bps) else {
-        // The floor itself overflowed; there is nothing to fit the tier to.
-        return Ok(Some(requested));
-    };
-    let floor_with_tip = headroom.saturating_add(tip);
-    let slowest = fees.tier_tips.slow.min(tip);
+    // The least tip a short payment may be shaved to: what the window proves
+    // the chain takes (`TierTips::floor`), never above the tier's own.
+    let slowest = fees.tier_tips.floor.min(tip);
     let outer = if fundable >= floor_with_tip {
         // The tier's cap — lifted to the floor where an operator's floor sits
         // above it — down to what the reimbursements fund, never below the

@@ -212,12 +212,13 @@ pub struct TransactionContext {
     pub max_priority_fee_per_gas: u128,
     pub nonce: u64,
     pub relayer_balance: U256,
-    /// The reward rows of `eth_feeHistory(TIP_WINDOW_BLOCKS, "latest",
-    /// TIP_REWARD_PERCENTILES)` read beside the rest — the tier tips are
-    /// resolved from them exactly as the quote resolves them
-    /// ([`crate::gas_math::TierTips`]). `None` when the call failed or the
-    /// answer carried no readable rewards: the tiers then scale the market tip.
-    pub tip_rewards: Option<Vec<Vec<u128>>>,
+    /// The tip window of `eth_feeHistory` over the chain's tip window
+    /// ([`crate::gas_math::tip_history_params`]), read beside the rest — the
+    /// tier tips are resolved from it exactly as the quote resolves them
+    /// ([`crate::gas_math::TierTips::from_window`]). `None` when the call
+    /// failed or the answer carried no readable rewards: the tiers then scale
+    /// the market tip.
+    pub tip_window: Option<crate::gas_math::TipWindow>,
 }
 
 /// The signed outer transaction as produced by the shell's keystore.
@@ -1638,7 +1639,7 @@ async fn execute_with_lane_lease(
         // The tier tips the quote showed, from the same rule over the blocks
         // just before this submission.
         tier_tips: crate::gas_math::TierTips::resolve(
-            context.tip_rewards.as_deref(),
+            context.tip_window.as_ref(),
             context.max_priority_fee_per_gas,
         )
         .unwrap_or_default(),
@@ -3608,7 +3609,7 @@ mod tests {
             max_priority_fee_per_gas: 0,
             nonce: 7,
             relayer_balance: U256::from(10_000u64),
-            tip_rewards: None,
+            tip_window: None,
         }
     }
 
@@ -4407,7 +4408,10 @@ mod tests {
                     max_fee_per_gas: 2_000_000_000,
                     max_priority_fee_per_gas: 0,
                     relayer_balance: U256::from(1_000_000_000_000u64),
-                    tip_rewards: Some(vec![vec![200_000_000, 1_000_000_000, 1_500_000_000]; 20]),
+                    tip_window: Some(crate::gas_math::TipWindow {
+                        rewards: vec![vec![200_000_000, 1_000_000_000, 1_500_000_000]; 20],
+                        gas_used_ratio_bps: None,
+                    }),
                     ..context()
                 },
             },
@@ -4596,7 +4600,7 @@ mod tests {
                     max_priority_fee_per_gas: 40,
                     nonce: 7,
                     relayer_balance: U256::from(1_000_000u64),
-                    tip_rewards: None,
+                    tip_window: None,
                 },
             },
         );

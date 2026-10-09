@@ -76,9 +76,66 @@ pub struct NetworkGasPrice {
     pub tier_tips: TierTips,
 }
 
-/// How many recent blocks a tier's tip is read over (`eth_feeHistory`'s block
-/// count, ending at `latest`). Chosen by the backtest in `docs/fees.md` §2c.
+/// The fewest recent blocks a tier's tip is read over (`eth_feeHistory`'s
+/// block count, ending at `latest`): 20, chosen by the backtest in
+/// `docs/fees.md` §2c on Ethereum, where it is four minutes.
 pub const TIP_WINDOW_BLOCKS: u64 = 20;
+
+/// The least time a tip window covers: a minute ([`tip_window_blocks`]).
+///
+/// Twenty blocks is nine seconds on BNB Smart Chain — less than a quote's own
+/// age — so the executor read its tips from blocks the quote had never seen,
+/// and 38% of BSC `standard` and `fast` sends had their tip shaved below the
+/// one they were quoted (review, 2026-10-09). Over a minute the window the
+/// executor reads still holds most of the quote's blocks, and a median of
+/// mostly the same blocks is mostly the same tip.
+pub const TIP_WINDOW_MS: u64 = 60_000;
+
+/// The most blocks a tip window spans: Arbitrum's quarter-second blocks make a
+/// minute 240. Every endpoint probed on BSC, Polygon, Avalanche, Arbitrum,
+/// Base, Monad, Arc, Plume, Tempo and Robinhood Chain answered
+/// `eth_feeHistory` over 256 blocks with its reward percentiles (2026-10-09).
+pub const TIP_WINDOW_MAX_BLOCKS: u64 = 256;
+
+/// How many blocks a chain's tip window spans: a minute of its blocks
+/// ([`crate::pace::block_interval_ms`], 2 s for a chain not listed there),
+/// never fewer than [`TIP_WINDOW_BLOCKS`] nor more than
+/// [`TIP_WINDOW_MAX_BLOCKS`]. Ethereum and Gnosis keep 20; BNB Smart Chain
+/// reads 134, Polygon, OP Mainnet and Base 30, Avalanche and Unichain 60,
+/// Arbitrum 240. The quote and the executor ask for the same count
+/// ([`tip_history_params`]).
+pub fn tip_window_blocks(chain_id: u64) -> u64 {
+    let interval = crate::pace::block_interval_ms(chain_id)
+        .unwrap_or(crate::pace::DEFAULT_BLOCK_INTERVAL_MS)
+        .max(1);
+    TIP_WINDOW_MS
+        .div_ceil(interval)
+        .clamp(TIP_WINDOW_BLOCKS, TIP_WINDOW_MAX_BLOCKS)
+}
+
+/// A window whose blocks used less than this share of their gas limit, on
+/// average, had room for every transaction paying the chain's minimum tip:
+/// 30%, in basis points. There the reward percentiles are what a few bots
+/// bid, not the price of a place in the next block — Polygon's 25th
+/// percentile read 166–265 gwei against the node's 30, Avalanche's 2.5–6.2
+/// gwei on blocks 3% full, Gnosis's 70th 1.5 gwei over an 8-wei base fee
+/// (2026-10-09) — so the tiers sign the node's tip instead, scaled `1.00 /
+/// 1.25 / 2.00` as before rewards were read ([`TierTips::from_window`]).
+///
+/// Not one half: Ethereum's base fee targets half-full blocks, so its
+/// 20-block average sits below 0.5 in 49% of windows (74,752 mainnet blocks,
+/// `docs/fees.md` §2c) — at 0.5 its tiers would drop to the node's zero tip
+/// every other minute. Its lowest 20-block average over those 10.4 days was
+/// 0.338; BNB Smart Chain's minute is under 0.3 in 92% of windows, Polygon's
+/// 93%, Avalanche's always.
+pub const UNCONGESTED_GAS_USED_RATIO_BPS: u32 = 3_000;
+
+/// Below this average a window may have been quiet when the quote was read a
+/// few blocks earlier: 40%. The tip a payment may be shaved to before it is
+/// held ([`TierTips::floor`]) is then the lower of the two readings' `slow`
+/// tips, so a quote read in a quiet window is not held by an executor that
+/// reads the next one busy (Polygon: 30 gwei quoted, 166 read).
+pub const NEAR_UNCONGESTED_GAS_USED_RATIO_BPS: u32 = 4_000;
 
 /// The `eth_feeHistory` reward percentiles requested, in [`SubmissionTier`]
 /// order: `slow`, `standard`, `fast` read the 25th, 50th and 70th percentile
@@ -105,22 +162,14 @@ pub const IN_BAND_DRIFT_BPS: u64 = 10_000;
 /// (`settlement::decide_submission_fees`), so what a wallet is quoted is what
 /// the relay signs.
 ///
-/// Read from `eth_feeHistory(TIP_WINDOW_BLOCKS, "latest",
-/// TIP_REWARD_PERCENTILES)`: each tier's tip is the median, over the window,
-/// of each block's own percentile reward (the effective tips its gas paid),
-/// so one odd block moves nothing:
-///
-/// ```text
-/// slow     = max( median p25 , MIN_POSITIVE_TIP if the window paid any tip , market tip )
-/// standard = max( median p50 , slow )
-/// fast     = max( median p70 , standard )
-/// ```
-///
-/// `slow` is never below the node's own `eth_maxPriorityFeePerGas`
-/// ([`market_tip`]): that answer carries a chain's enforced minimum (bor on
-/// Polygon), and a tip under it is rejected outright rather than mined late.
-/// Each faster tier is at least the slower one's, so a faster tier can never
-/// bid less.
+/// Read from `eth_feeHistory(tip_window_blocks(chain), "latest",
+/// TIP_REWARD_PERCENTILES)` ([`tip_history_params`]) — at least 20 blocks and
+/// a minute — by [`TierTips::from_window`]: in a busy window, each tier's tip
+/// is the median over the window of each block's own percentile reward (the
+/// effective tips its gas paid), so one odd block moves nothing; in a quiet
+/// one ([`UNCONGESTED_GAS_USED_RATIO_BPS`]), the node's own tip scaled as
+/// before rewards were read. Each faster tier is at least the slower one's,
+/// so a faster tier can never bid less.
 ///
 /// Without a usable reward column (a chain whose `eth_feeHistory` omits it, a
 /// legacy chain, a failed call) the tiers fall back to the market tip scaled
@@ -131,6 +180,18 @@ pub struct TierTips {
     pub slow: u128,
     pub standard: u128,
     pub fast: u128,
+    /// The least tip a payment that cannot fund its tier's own may be shaved
+    /// to before the executor holds it (`settlement::decide_submission_fees`):
+    /// the window's own 25th-percentile reward — what a quarter of its gas
+    /// really paid, which no node's opinion moves (the node's tip where the
+    /// window paid none, since empty blocks prove nothing) — and, in a window that may
+    /// have been quiet when the quote was read
+    /// ([`NEAR_UNCONGESTED_GAS_USED_RATIO_BPS`]), the quiet reading's `slow`
+    /// tip if that is lower. Never above `slow`. A quote read from another
+    /// node, or from blocks a little quieter, is shaved to a slower send
+    /// rather than held (review F1, 2026-10-09).
+    #[serde(default)]
+    pub floor: u128,
 }
 
 impl TierTips {
@@ -143,11 +204,62 @@ impl TierTips {
     }
 
     /// The tips from a fee history's reward rows (`[p25, p50, p70]` per
-    /// block) and the market tip. A row of another width (some nodes answer
-    /// `[]` for an empty block) is left out; `None` when no complete row is
-    /// left.
+    /// block) and the market tip, with the window's congestion unknown — the
+    /// busy reading of [`TierTips::from_window`]. `None` when no complete row
+    /// is left.
     pub fn from_rewards(rewards: &[Vec<u128>], market_tip: u128) -> Option<Self> {
-        let rewards = rewards
+        Self::from_window(
+            &TipWindow {
+                rewards: rewards.to_vec(),
+                gas_used_ratio_bps: None,
+            },
+            market_tip,
+        )
+    }
+
+    /// The tips from one fee-history window and the node's own tip answer
+    /// ([`market_tip`]):
+    ///
+    /// ```text
+    /// least     = MIN_POSITIVE_TIP if the window paid any tip, else 0
+    /// node      = the market tip, where the window paid no tip or it is ≤ the median p50;
+    ///             otherwise no floor at all
+    /// rewarded  = max( median p25 , least )                     the window's own slow price
+    ///
+    /// busy  (mean gasUsedRatio ≥ 30%, or unknown):
+    ///   slow = max( rewarded , node ),  standard = max( median p50 , slow ),  fast = max( median p70 , standard )
+    /// quiet (mean gasUsedRatio < 30%):
+    ///   slow = max( node , least ) — or `rewarded` when the node's answer was discarded —
+    ///   standard = 1.25 × slow,  fast = 2 × slow                (rounded up)
+    /// floor = rewarded — the node's tip where the window paid none — or the
+    ///         lower of that and the quiet slow below a 40% mean
+    /// ```
+    ///
+    /// **The node's tip is a floor only where the blocks do not contradict
+    /// it.** It carries a chain's enforced minimum (bor's on Polygon), which a
+    /// tip must clear or be refused outright — and an enforced minimum is
+    /// never above what the median block paid, since every included
+    /// transaction cleared it. Nodes disagree: on BNB Smart Chain the
+    /// directory's endpoints answered 0.05, 0.1, 1 and 3 gwei while every
+    /// block's median paid 0.05 (2026-10-09). The quote and the executor ask
+    /// different nodes, so an executor reading 1 gwei held — then rejected —
+    /// sends quoted at 0.05; above the median the answer is that node's
+    /// opinion, and it is left out. A window that paid no tip at all (Stable,
+    /// XRPL EVM: every reward zero) says nothing either way, and the node is
+    /// believed as before.
+    ///
+    /// **A quiet window signs the node's tip.** Where blocks have room for
+    /// every transaction paying the minimum, the percentiles price a few bots'
+    /// bids, not a place in the next block ([`UNCONGESTED_GAS_USED_RATIO_BPS`]),
+    /// so each tier signs the node's tip scaled `1.00 / 1.25 / 2.00` — what
+    /// every tier signed before rewards were read, mined on Polygon at 30 gwei
+    /// tips. `fast` still bids twice `slow`.
+    ///
+    /// A row of another width (some nodes answer `[]` for an empty block) is
+    /// left out; `None` when no complete row is left, or on overflow.
+    pub fn from_window(window: &TipWindow, market_tip: u128) -> Option<Self> {
+        let rewards = window
+            .rewards
             .iter()
             .filter(|row| row.len() == TIP_REWARD_PERCENTILES.len())
             .collect::<Vec<_>>();
@@ -169,52 +281,88 @@ impl TierTips {
         let paid_any = rewards
             .iter()
             .any(|row| row.iter().any(|reward| *reward > 0));
-        let slow = median(0)
-            .max(if paid_any { MIN_POSITIVE_TIP } else { 0 })
-            .max(market_tip);
+        let least = if paid_any { MIN_POSITIVE_TIP } else { 0 };
+        let node = (!paid_any || market_tip <= median(1)).then_some(market_tip);
+        let rewarded = median(0).max(least);
+        let quiet_slow = node.map_or(rewarded, |tip| tip.max(least));
+        // The least tip the window proves the chain takes: a quarter of its
+        // gas paid `rewarded` or less. A window that paid no tip proves
+        // nothing (its blocks may simply be empty), and the node's answer
+        // stands.
+        let proven = if paid_any { rewarded } else { quiet_slow };
+        let ratio = window.gas_used_ratio_bps;
+        if ratio.is_some_and(|ratio| ratio < UNCONGESTED_GAS_USED_RATIO_BPS) {
+            return Some(Self {
+                slow: quiet_slow,
+                standard: scaled_market_tip(SubmissionTier::Standard, quiet_slow)?,
+                fast: scaled_market_tip(SubmissionTier::Fast, quiet_slow)?,
+                floor: quiet_slow.min(proven),
+            });
+        }
+        let slow = rewarded.max(node.unwrap_or(0));
         let standard = median(1).max(slow);
         let fast = median(2).max(standard);
+        let floor = if ratio.is_some_and(|ratio| ratio < NEAR_UNCONGESTED_GAS_USED_RATIO_BPS) {
+            proven.min(quiet_slow)
+        } else {
+            proven
+        };
         Some(Self {
             slow,
             standard,
             fast,
+            floor,
         })
     }
 
-    /// The fallback: the market tip scaled `1.00 / 1.25 / 2.00`. `None` on
-    /// overflow.
+    /// The fallback: the market tip scaled `1.00 / 1.25 / 2.00`, the floor
+    /// the market tip itself. `None` on overflow.
     pub fn scaled(market_tip: u128) -> Option<Self> {
         Some(Self {
             slow: scaled_market_tip(SubmissionTier::Slow, market_tip)?,
             standard: scaled_market_tip(SubmissionTier::Standard, market_tip)?,
             fast: scaled_market_tip(SubmissionTier::Fast, market_tip)?,
+            floor: market_tip,
         })
     }
 
-    /// Rewards when there are usable ones, else the scaled market tip.
-    pub fn resolve(rewards: Option<&[Vec<u128>]>, market_tip: u128) -> Option<Self> {
-        rewards
-            .and_then(|rewards| Self::from_rewards(rewards, market_tip))
+    /// The window's reading when it has usable rewards, else the scaled market
+    /// tip.
+    pub fn resolve(window: Option<&TipWindow>, market_tip: u128) -> Option<Self> {
+        window
+            .and_then(|window| Self::from_window(window, market_tip))
             .or_else(|| Self::scaled(market_tip))
     }
 }
 
+/// What one `eth_feeHistory` answer to [`tip_history_params`] says about
+/// tips: each block's `[p25, p50, p70]` reward, and how full the blocks were.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TipWindow {
+    pub rewards: Vec<Vec<u128>>,
+    /// The blocks' mean `gasUsedRatio`, in basis points. `None` when the
+    /// answer carried none the relay could read: the tips are then read as
+    /// for a busy window, the reading before congestion was considered.
+    pub gas_used_ratio_bps: Option<u32>,
+}
+
 /// The `eth_feeHistory` params the tier tips are read from — by the quote and
-/// by the executor's transaction context alike.
-pub fn tip_history_params() -> Value {
+/// by the executor's transaction context alike: [`tip_window_blocks`] of the
+/// chain's latest blocks, at [`TIP_REWARD_PERCENTILES`].
+pub fn tip_history_params(chain_id: u64) -> Value {
     serde_json::json!([
-        format!("0x{TIP_WINDOW_BLOCKS:x}"),
+        format!("0x{:x}", tip_window_blocks(chain_id)),
         "latest",
         TIP_REWARD_PERCENTILES
     ])
 }
 
-/// The reward rows of an `eth_feeHistory` answer to [`tip_history_params`],
-/// `None` when it carries none the relay can read whole.
-pub fn tip_rewards(fee_history: &Value) -> Option<Vec<Vec<u128>>> {
+/// The tip window of an `eth_feeHistory` answer to [`tip_history_params`],
+/// `None` when it carries no reward rows the relay can read whole.
+pub fn tip_window(fee_history: &Value) -> Option<TipWindow> {
     serde_json::from_value::<FeeHistory>(fee_history.clone())
         .ok()?
-        .rewards()
+        .window()
 }
 
 /// `inBandFeePerGas`: the wei per unit of `settlementGas` a client pays for a
@@ -272,16 +420,49 @@ impl Display for GasPriceError {
 impl Error for GasPriceError {}
 
 /// The part of an `eth_feeHistory` answer the relay reads: the base fees,
-/// and the reward rows the tier tips come from ([`TierTips`]).
+/// the reward rows the tier tips come from ([`TierTips`]), and how full the
+/// blocks were.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeHistory {
     pub base_fee_per_gas: Vec<String>,
     #[serde(default)]
     pub reward: Option<Vec<Vec<String>>>,
+    /// Kept as raw JSON and read leniently ([`FeeHistory::mean_gas_used_ratio_bps`]):
+    /// an answer whose ratios the relay cannot read is still a fee history.
+    #[serde(default)]
+    pub gas_used_ratio: Option<Vec<Value>>,
 }
 
 impl FeeHistory {
+    /// The blocks' mean `gasUsedRatio`, in basis points, rounded to the
+    /// nearest. `None` when the answer carries no ratio, or any entry is not a
+    /// number between 0 and 1 — a column the relay cannot read whole is not
+    /// read at all.
+    pub fn mean_gas_used_ratio_bps(&self) -> Option<u32> {
+        let ratios = self
+            .gas_used_ratio
+            .as_ref()?
+            .iter()
+            .map(|ratio| ratio.as_f64().filter(|ratio| (0.0..=1.0).contains(ratio)))
+            .collect::<Option<Vec<_>>>()?;
+        if ratios.is_empty() {
+            return None;
+        }
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        // Within 0..=10_000 by the filter above.
+        Some((mean * 10_000.0).round() as u32)
+    }
+
+    /// The tip window this answer describes: its reward rows and its blocks'
+    /// mean fullness. `None` without a readable reward column.
+    pub fn window(&self) -> Option<TipWindow> {
+        Some(TipWindow {
+            rewards: self.rewards()?,
+            gas_used_ratio_bps: self.mean_gas_used_ratio_bps(),
+        })
+    }
+
     /// The reward rows as numbers. `None` when the answer carries none, or
     /// any entry is not a quantity — a column the relay cannot read whole is
     /// not read at all.
@@ -337,7 +518,7 @@ pub fn price_from_fee_history(
     Ok(NetworkGasPrice {
         base_fee_per_gas: fee_history.next_block_base_fee()?,
         max_priority_fee_per_gas: priority_fee,
-        tier_tips: TierTips::resolve(fee_history.rewards().as_deref(), priority_fee)
+        tier_tips: TierTips::resolve(fee_history.window().as_ref(), priority_fee)
             .ok_or(GasPriceError::ArithmeticOverflow)?,
     })
 }
@@ -760,10 +941,12 @@ mod tests {
 
     use super::{
         FeeHistory, GasPricePolicy, IN_BAND_DRIFT_BPS, MIN_POSITIVE_TIP, NetworkGasPrice, OuterFee,
-        SubmissionTier, TIP_REWARD_PERCENTILES, TIP_WINDOW_BLOCKS, TierTips, fallback_priority_fee,
+        SubmissionTier, TIP_REWARD_PERCENTILES, TIP_WINDOW_BLOCKS, TIP_WINDOW_MAX_BLOCKS,
+        TIP_WINDOW_MS, TierTips, TipWindow, UNCONGESTED_GAS_USED_RATIO_BPS, fallback_priority_fee,
         in_band_fee_per_gas, legacy_price_from_result, market_tip, parse_quantity,
         price_from_fee_history, quote_market_tip, quoted_outer_fee, scaled_market_tip,
-        tier_network_fee, tier_outer_fee, tier_price, tiers, tip_history_params, tip_rewards,
+        tier_network_fee, tier_outer_fee, tier_price, tiers, tip_history_params, tip_window,
+        tip_window_blocks,
     };
 
     const TIERS: [SubmissionTier; 3] = [
@@ -901,10 +1084,7 @@ mod tests {
                 .map(U256::from),
             U256::from(latest_block_base_fee),
         )?;
-        let tips = TierTips::resolve(
-            tip_rewards(history).as_deref(),
-            u128::try_from(tip).unwrap(),
-        )?;
+        let tips = TierTips::resolve(tip_window(history).as_ref(), u128::try_from(tip).unwrap())?;
         let outer = tier_outer_fee(tier, base_at_submission, &tips).unwrap();
         Some((outer.max_priority_fee_per_gas, outer.max_fee_per_gas))
     }
@@ -915,7 +1095,7 @@ mod tests {
         assert_eq!(TIP_WINDOW_BLOCKS, 20);
         assert_eq!(TIP_REWARD_PERCENTILES, [25, 50, 70]);
         assert_eq!(
-            tip_history_params(),
+            tip_history_params(1),
             json!(["0x14", "latest", [25, 50, 70]])
         );
         for (tier, percentile) in TIERS.into_iter().zip([25, 50, 70]) {
@@ -936,6 +1116,7 @@ mod tests {
                 slow: 20_000_000,
                 standard: 200_000_000,
                 fast: 2_000_000_000,
+                floor: 20_000_000,
             })
         );
         // Even window: the mean of the two middle values, rounded up.
@@ -949,8 +1130,7 @@ mod tests {
             MIN_POSITIVE_TIP
         );
 
-        // `slow` never under the node's own answer (a chain's enforced
-        // minimum), nor under MIN_POSITIVE_TIP once the window paid any tip;
+        // `slow` never under MIN_POSITIVE_TIP once the window paid any tip;
         // each faster tier never under the slower one.
         let low = [vec![0, 0, 5], vec![0, 0, 5], vec![0, 0, 5]];
         assert_eq!(
@@ -959,37 +1139,51 @@ mod tests {
                 slow: MIN_POSITIVE_TIP,
                 standard: MIN_POSITIVE_TIP,
                 fast: MIN_POSITIVE_TIP,
+                floor: MIN_POSITIVE_TIP,
             })
         );
-        let polygon = [vec![30, 31, 40], vec![30, 32, 41], vec![1, 35, 45]].map(|row| {
-            row.into_iter()
-                .map(|gwei: u128| gwei * 1_000_000_000)
-                .collect::<Vec<_>>()
-        });
+        let gwei =
+            |rows: [[u128; 3]; 3]| rows.map(|row| row.map(|gwei| gwei * 1_000_000_000).to_vec());
+        let polygon = gwei([[30, 31, 40], [30, 32, 41], [1, 35, 45]]);
         assert_eq!(
             TierTips::from_rewards(&polygon, POLYGON_TIP).unwrap(),
             TierTips {
                 slow: 30_000_000_000,
                 standard: 32_000_000_000,
                 fast: 41_000_000_000,
+                floor: 30_000_000_000,
             }
         );
-        let below_minimum = polygon.clone().map(|row| {
-            row.into_iter()
-                .map(|reward| reward / 10)
-                .collect::<Vec<_>>()
-        });
+        // `slow` never under the node's own answer where the blocks do not
+        // contradict it — at or below the median block's tip it can be a
+        // chain's enforced minimum (bor's on Polygon) — while the floor a
+        // short payment may be shaved to is what a quarter of the gas paid.
+        let under_the_node = gwei([[20, 31, 40], [26, 32, 41], [1, 35, 45]]);
         assert_eq!(
-            TierTips::from_rewards(&below_minimum, POLYGON_TIP)
-                .unwrap()
-                .slow,
-            POLYGON_TIP
+            TierTips::from_rewards(&under_the_node, POLYGON_TIP).unwrap(),
+            TierTips {
+                slow: POLYGON_TIP,
+                standard: 32_000_000_000,
+                fast: 41_000_000_000,
+                floor: 20_000_000_000,
+            }
         );
 
-        // A chain whose blocks paid no tip at all keeps zero (Arbitrum).
+        // A chain whose blocks paid no tip at all keeps zero (Arbitrum)...
         assert_eq!(
             TierTips::from_rewards(&[vec![0, 0, 0], vec![0, 0, 0]], 0),
             Some(TierTips::default())
+        );
+        // ...or the node's own tip, which nothing in its blocks contradicts
+        // (Stable: every reward zero, the node 0.125 gwei).
+        assert_eq!(
+            TierTips::from_rewards(&[vec![0, 0, 0], vec![0, 0, 0]], 125_000_000),
+            Some(TierTips {
+                slow: 125_000_000,
+                standard: 125_000_000,
+                fast: 125_000_000,
+                floor: 125_000_000,
+            })
         );
         // No complete row is no reading: the scaled market tip instead. A
         // row of another width (an empty block's `[]`) is left out.
@@ -1008,6 +1202,7 @@ mod tests {
                 slow: 40,
                 standard: 50,
                 fast: 80,
+                floor: 40,
             })
         );
         assert_eq!(TierTips::scaled(u128::MAX), None);
@@ -1020,15 +1215,16 @@ mod tests {
     #[test]
     fn the_ethereum_tiers_at_the_block_the_overcharge_was_measured() {
         let history = ethereum_fee_history();
-        let rewards = tip_rewards(&history).unwrap();
-        assert_eq!(rewards.len(), 20);
-        let tips = TierTips::resolve(Some(&rewards), 0).unwrap();
+        let window = tip_window(&history).unwrap();
+        assert_eq!(window.rewards.len(), 20);
+        let tips = TierTips::resolve(Some(&window), 0).unwrap();
         assert_eq!(
             tips,
             TierTips {
                 slow: 147_320_634,       // 0.147 gwei
                 standard: 1_000_000_000, // 1 gwei
                 fast: 1_795_116_512,     // 1.795 gwei
+                floor: 147_320_634,
             }
         );
         let parsed: FeeHistory = serde_json::from_value(history.clone()).unwrap();
@@ -1142,6 +1338,36 @@ mod tests {
             }
         }
 
+        // A quiet window (Polygon, blocks 19% full): both read the node's
+        // own tip, scaled, from the same answers.
+        let mut quiet = fee_history(
+            POLYGON_LATEST_BASE,
+            POLYGON_BASE,
+            Some(vec![
+                [265_700_000_000, 286_600_000_000, 288_700_000_000];
+                30
+            ]),
+        );
+        quiet["gasUsedRatio"] = json!(vec![0.19; 30]);
+        for tier in TIERS {
+            assert_eq!(
+                Some(quoted(tier, &quiet, Some(POLYGON_TIP), None)),
+                signed(
+                    tier,
+                    &quiet,
+                    POLYGON_BASE,
+                    POLYGON_LATEST_BASE,
+                    Some(POLYGON_TIP),
+                    None
+                ),
+                "quiet polygon/{tier}"
+            );
+        }
+        assert_eq!(
+            quoted(SubmissionTier::Fast, &quiet, Some(POLYGON_TIP), None).0,
+            2 * POLYGON_TIP
+        );
+
         // The one documented difference: no tip answer and no usable gas
         // price. The executor refuses to submit; only the quote falls back,
         // to `base / 200` on the next block's base fee.
@@ -1165,6 +1391,221 @@ mod tests {
                 Ok(fallback_priority_fee(POLYGON_BASE, 200))
             );
         }
+    }
+
+    /// A window of `blocks` identical rows `[p25, p50, p70]`, with the given
+    /// mean `gasUsedRatio` in basis points.
+    fn window(rows: &[[u128; 3]], gas_used_ratio_bps: Option<u32>) -> TipWindow {
+        TipWindow {
+            rewards: rows.iter().map(|row| row.to_vec()).collect(),
+            gas_used_ratio_bps,
+        }
+    }
+
+    const GWEI: u128 = 1_000_000_000;
+
+    #[test]
+    fn the_tip_window_is_a_minute_of_blocks_and_never_fewer_than_twenty() {
+        assert_eq!(TIP_WINDOW_MS, 60_000);
+        for (chain_id, blocks) in [
+            (1, 20),       // Ethereum: 20 blocks are four minutes
+            (100, 20),     // Gnosis: 5 s blocks
+            (56, 134),     // BNB Smart Chain: 0.45 s blocks — 20 were 9 s
+            (137, 30),     // Polygon
+            (8_453, 30),   // Base
+            (43_114, 60),  // Avalanche
+            (130, 60),     // Unichain
+            (42_161, 240), // Arbitrum's quarter-second blocks
+            (999_999, 30), // a chain nobody listed: 2 s blocks
+        ] {
+            assert_eq!(tip_window_blocks(chain_id), blocks, "chain {chain_id}");
+            assert!(tip_window_blocks(chain_id) <= TIP_WINDOW_MAX_BLOCKS);
+        }
+        assert_eq!(
+            tip_history_params(56),
+            json!(["0x86", "latest", [25, 50, 70]])
+        );
+    }
+
+    /// Review F7: a quote 20 BNB Smart Chain blocks (9 s) older than the
+    /// submission read a window the executor no longer sees at all. A burst
+    /// of priority bids in the quote's first 20 blocks moved its median and
+    /// not the executor's; over a minute of blocks both medians are the same.
+    #[test]
+    fn a_quote_and_its_submission_read_mostly_the_same_blocks_on_a_fast_chain() {
+        let burst = [70_000_000u128, 90_000_000, 120_000_000];
+        let calm = [50_000_000u128, 50_000_001, 57_000_000];
+        let history = (0..154)
+            .map(|block| if block < 20 { burst } else { calm })
+            .collect::<Vec<_>>();
+        let tips = |blocks: &[[u128; 3]]| {
+            TierTips::from_window(&window(blocks, Some(5_000)), 50_000_000).unwrap()
+        };
+        // Twenty blocks: the quote saw only the burst, the executor only calm.
+        assert_ne!(tips(&history[0..20]), tips(&history[20..40]));
+        // A minute (134 blocks): the quote's window and the executor's share
+        // 114 blocks, and their medians agree.
+        let blocks = usize::try_from(tip_window_blocks(56)).unwrap();
+        assert_eq!(tips(&history[0..blocks]), tips(&history[20..20 + blocks]));
+    }
+
+    /// Review F1: the quote and the executor ask different nodes for
+    /// `eth_maxPriorityFeePerGas`, and on BNB Smart Chain the directory's
+    /// endpoints answered 0.05 (most), 0.1 (zan, blockrazor), 1 (48.club,
+    /// sentio) and 3 gwei (swiftnodes) while the blocks' median p25 / p50 /
+    /// p70 read 0.05 / 0.050000001 / 0.057 gwei (2026-10-09). With the node's
+    /// answer as an unconditional floor an executor reading 1 gwei signed
+    /// `slow` at 1 gwei — and held every send quoted at 0.05. Above the median
+    /// block's tip an answer is that node's opinion; every node now reads the
+    /// same tiers. On Ethereum the nodes answered 0 or 10,890 wei over blocks
+    /// paying 0.0011 / 0.05 / 0.1 gwei: both below the median, both moot.
+    #[test]
+    fn a_node_tip_above_what_the_median_block_paid_is_no_floor() {
+        let bsc = [[50_000_000, 50_000_001, 57_000_000]; 134];
+        for ratio in [None, Some(1_900), Some(5_000)] {
+            let reading = |node: u128| TierTips::from_window(&window(&bsc, ratio), node).unwrap();
+            let honest = reading(50_000_000);
+            for node in [100_000_000, GWEI, 3 * GWEI] {
+                assert_eq!(
+                    reading(node),
+                    honest,
+                    "BSC node {node} wei, ratio {ratio:?}"
+                );
+            }
+            assert_eq!(honest.slow, 50_000_000);
+            assert_eq!(honest.floor, 50_000_000);
+        }
+        let ethereum = [[1_100_000, 50_000_000, 100_000_000]; 20];
+        let reading = |node: u128| TierTips::from_window(&window(&ethereum, None), node).unwrap();
+        assert_eq!(reading(0), reading(10_890));
+        assert_eq!(
+            reading(0),
+            TierTips {
+                slow: 1_100_000,
+                standard: 50_000_000,
+                fast: 100_000_000,
+                floor: 1_100_000,
+            }
+        );
+        // An answer at or below the median is still a floor: a chain's
+        // enforced minimum is never above what the median block paid.
+        let polygon = [[25 * GWEI, 40 * GWEI, 60 * GWEI]; 30];
+        assert_eq!(
+            TierTips::from_window(&window(&polygon, None), 30 * GWEI)
+                .unwrap()
+                .slow,
+            30 * GWEI
+        );
+    }
+
+    /// Review F5: where blocks have room for every transaction paying the
+    /// chain's minimum, the reward percentiles are a few bots' bids. Measured
+    /// 2026-10-09: Polygon's blocks paid 265.7 / 286.6 / 288.7 gwei at the
+    /// tier percentiles against the node's 30 on blocks ~19% full; Gnosis's
+    /// 70th percentile paid 1.5 gwei over an 8-wei base fee; Avalanche's
+    /// 2.497 / 2.639 / 6.241 gwei on blocks 3% full. A quiet window signs the
+    /// node's tip scaled 1.00 / 1.25 / 2.00 — bor's 30 gwei minimum kept on
+    /// Polygon — and `fast` still bids twice `slow`. Ethereum, whose base
+    /// fee targets half-full blocks, never reads as quiet: its lowest 20-block
+    /// average over 10.4 days was 0.338.
+    #[test]
+    fn a_quiet_window_signs_the_nodes_tip_and_a_busy_one_the_percentiles() {
+        let polygon = [[265_700_000_000, 286_600_000_000, 288_700_000_000]; 30];
+        let quiet = TierTips::from_window(&window(&polygon, Some(1_900)), 30 * GWEI).unwrap();
+        assert_eq!(
+            quiet,
+            TierTips {
+                slow: 30 * GWEI,
+                standard: 37_500_000_000,
+                fast: 60 * GWEI,
+                floor: 30 * GWEI,
+            }
+        );
+        let busy = TierTips::from_window(&window(&polygon, Some(4_500)), 30 * GWEI).unwrap();
+        assert_eq!(
+            busy,
+            TierTips {
+                slow: 265_700_000_000,
+                standard: 286_600_000_000,
+                fast: 288_700_000_000,
+                floor: 265_700_000_000,
+            }
+        );
+        // Just above the quiet line, a payment quoted in the quiet window a
+        // few blocks earlier may be shaved to the quiet `slow` rather than
+        // held.
+        let near = TierTips::from_window(&window(&polygon, Some(3_500)), 30 * GWEI).unwrap();
+        assert_eq!(near.slow, 265_700_000_000);
+        assert_eq!(near.floor, 30 * GWEI);
+
+        // Gnosis: the node's 1 wei, lifted to the 0.001 gwei least tip of a
+        // window that paid any; `fast` no longer 1.5 gwei.
+        let gnosis = [[1, 2, 1_500_000_000]; 20];
+        assert_eq!(
+            TierTips::from_window(&window(&gnosis, Some(1_800)), 1).unwrap(),
+            TierTips {
+                slow: MIN_POSITIVE_TIP,
+                standard: 1_250_000,
+                fast: 2 * MIN_POSITIVE_TIP,
+                floor: MIN_POSITIVE_TIP,
+            }
+        );
+        // Avalanche: the node's 150 wei, likewise.
+        let avalanche = [[2_497_000_000, 2_639_000_000, 6_241_000_000]; 60];
+        assert_eq!(
+            TierTips::from_window(&window(&avalanche, Some(330)), 150).unwrap(),
+            TierTips {
+                slow: MIN_POSITIVE_TIP,
+                standard: 1_250_000,
+                fast: 2 * MIN_POSITIVE_TIP,
+                floor: MIN_POSITIVE_TIP,
+            }
+        );
+        // Each faster tier still bids more, and a node answer the blocks
+        // contradict is not believed in a quiet window either (BSC's 1 gwei).
+        let bsc = [[50_000_000, 50_000_001, 57_000_000]; 134];
+        let bsc_quiet = TierTips::from_window(&window(&bsc, Some(1_900)), GWEI).unwrap();
+        assert_eq!(bsc_quiet.slow, 50_000_000);
+        assert!(bsc_quiet.slow < bsc_quiet.standard && bsc_quiet.standard < bsc_quiet.fast);
+        // Ethereum's quietest minute is busy: the same tips. (Inside the
+        // near-quiet band only the floor a short payment may be shaved to
+        // drops, to the quiet `slow`.)
+        let ethereum = [[1_100_000, 50_000_000, 100_000_000]; 20];
+        let quietest = TierTips::from_window(&window(&ethereum, Some(3_380)), 0).unwrap();
+        let busy = TierTips::from_window(&window(&ethereum, None), 0).unwrap();
+        assert_eq!(
+            (quietest.slow, quietest.standard, quietest.fast),
+            (busy.slow, busy.standard, busy.fast)
+        );
+        assert_eq!(quietest.floor, MIN_POSITIVE_TIP);
+        assert_eq!(UNCONGESTED_GAS_USED_RATIO_BPS, 3_000);
+    }
+
+    #[test]
+    fn the_window_reads_its_blocks_fullness_and_ignores_a_column_it_cannot_read() {
+        let history = |ratios: serde_json::Value| -> FeeHistory {
+            serde_json::from_value(json!({
+                "baseFeePerGas": ["0x1", "0x1"],
+                "gasUsedRatio": ratios,
+                "reward": [["0x1", "0x2", "0x3"]],
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            history(json!([0.1, 0.2, 0.30001])).mean_gas_used_ratio_bps(),
+            Some(2_000)
+        );
+        assert_eq!(history(json!([])).mean_gas_used_ratio_bps(), None);
+        assert_eq!(history(json!([0.1, "0.2"])).mean_gas_used_ratio_bps(), None);
+        assert_eq!(history(json!([0.1, 1.5])).mean_gas_used_ratio_bps(), None);
+        // A column of strings is no ratio, not a broken fee history.
+        let window = history(json!(["x"])).window().unwrap();
+        assert_eq!(window.gas_used_ratio_bps, None);
+        assert_eq!(window.rewards, vec![vec![1, 2, 3]]);
+        assert_eq!(
+            tip_window(&json!({ "baseFeePerGas": ["0x1"], "gasUsedRatio": [0.5] })),
+            None
+        );
     }
 
     #[test]
@@ -1230,6 +1671,7 @@ mod tests {
                 slow: 40,
                 standard: 50,
                 fast: 80,
+                floor: 40,
             },
         })
         .unwrap();
@@ -1297,6 +1739,7 @@ mod tests {
                 slow: 10_000_000,
                 standard: 100_000_000,
                 fast: 1_800_000_000,
+                floor: 10_000_000,
             },
         };
         let rows = tiers(calm).unwrap();
@@ -1341,6 +1784,7 @@ mod tests {
                     slow: 147_320_634,
                     standard: 1_000_000_000,
                     fast: 1_795_116_512,
+                    floor: 147_320_634,
                 },
             ),
             (0, TierTips::scaled(50_000_000).unwrap()),
@@ -1361,6 +1805,7 @@ mod tests {
                     slow: tip,
                     standard: tip + 1,
                     fast: tip + 2,
+                    floor: tip,
                 };
                 for tier in TIERS {
                     let fee = tier_outer_fee(tier, base, &tips).unwrap();
@@ -1420,6 +1865,7 @@ mod tests {
                     slow: 147_320_634,
                     standard: 1_000_000_000,
                     fast: 1_795_116_512,
+                    floor: 147_320_634,
                 },
                 0,
             ),
@@ -1513,6 +1959,7 @@ mod tests {
                     slow: 100,
                     standard: 125,
                     fast: 200,
+                    floor: 100,
                 },
             }
         );

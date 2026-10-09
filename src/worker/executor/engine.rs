@@ -99,7 +99,7 @@ struct TransactionContext {
     max_priority_fee_per_gas: u128,
     nonce: u64,
     relayer_balance: U256,
-    tip_rewards: Option<Vec<Vec<u128>>>,
+    tip_window: Option<vela_relay_core::gas_math::TipWindow>,
 }
 
 #[derive(Clone, Debug)]
@@ -731,7 +731,7 @@ impl ExecutorEngine {
             // The tier tips, read by the rule the quote reads them with.
             RpcBatchCall {
                 method: "eth_feeHistory",
-                params: vela_relay_core::gas_math::tip_history_params(),
+                params: vela_relay_core::gas_math::tip_history_params(chain_id),
             },
         ];
         let responses = self
@@ -782,10 +782,10 @@ impl ExecutorEngine {
         let relayer_balance = response_quantity(&responses, 4, "eth_getBalance")?;
         // A failed or unreadable fee history is not fatal: the tiers then
         // scale the market tip, as the quote does without one.
-        let tip_rewards = responses
+        let tip_window = responses
             .get(5)
             .and_then(|response| response.as_ref().ok())
-            .and_then(vela_relay_core::gas_math::tip_rewards);
+            .and_then(vela_relay_core::gas_math::tip_window);
 
         Ok(TransactionContext {
             estimated_gas,
@@ -794,7 +794,7 @@ impl ExecutorEngine {
             max_priority_fee_per_gas: tip,
             nonce,
             relayer_balance,
-            tip_rewards,
+            tip_window,
         })
     }
 
@@ -2065,7 +2065,7 @@ impl BatchShell<'_> {
                             max_priority_fee_per_gas: context.max_priority_fee_per_gas,
                             nonce: context.nonce,
                             relayer_balance: context.relayer_balance,
-                            tip_rewards: context.tip_rewards,
+                            tip_window: context.tip_window,
                         },
                     },
                     Err(error) => Out::Failed {
