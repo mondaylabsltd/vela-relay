@@ -81,6 +81,13 @@ before falling back, twice a pass, and an AVAX send took about a minute
   treated the same way for 10 minutes. Endpoints that timed out or answered with
   an HTTP error are no evidence either way. One endpoint that serves the method
   ends it at once.
+- **Except a chain billed on measured gas** (Ethereum, Gnosis, Polygon, BNB
+  Smart Chain and their testnets; `docs/fees.md` §1a), which always asks for
+  `eth_simulateV1` first. There it is the simulation that measures the gas an
+  operation is billed for, and a gateway policy or rate limit worded as "method
+  not allowed" would otherwise demote it for ten minutes of sends. A bundle on
+  such a chain that only the Pimlico tier could simulate measured no gas, and
+  is deferred and retried rather than billed its limit.
 
 "Last" means after the other two tiers, and only for the operations they could
 not decide. The method is never skipped, so a wrong belief costs one slow walk,

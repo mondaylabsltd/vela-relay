@@ -85,8 +85,13 @@ Which chains settle on measured gas is a list, never an assumption
 | `OuterLimit` | every other chain: Arbitrum (its L1 data cost rides inside gas units its simulation need not show), the OP stack (its L1 fee is charged beside gas), anything unlisted | the limit allocation, as before |
 
 A simulation that measured nothing — the Pimlico `eth_call` stand-in, whose
-bundle figure is an `eth_estimateGas` — bills the limit allocation on every
-chain.
+bundle figure is an `eth_estimateGas` limit — is never billed on a `Measured`
+chain: billed the limit, a wallet that paid for its `settlementGas` would be
+short by half, held and rejected. The bundle is deferred and retried, as when
+no simulation answered at all (`execution::UNMEASURED_SIMULATION`), and on
+those chains `eth_simulateV1` is always asked first, whatever a recent walk
+seemed to prove (`simulation::simulate_v1_turn`, `docs/rpc.md`). Elsewhere it
+bills the limit allocation, which is what those chains bill anyway.
 
 **`settlementGas` — the same figure, promised before signing.**
 `eth_estimateUserOperationGas` returns an optional `settlementGas` (hex) on a

@@ -1102,6 +1102,11 @@ pub const FUNDING_WAIT_FINISH: &str = "UserOperation is waiting for its relayer'
 const TOP_UP_SIGNED_AGAIN: &str = "it will be signed again";
 const NO_OUTCOME_FINISH: &str = "no durable executor outcome";
 
+/// The deferral of a bundle on a measured-gas chain whose simulation measured
+/// no gas ([`crate::cost::SettlementGasRule::Measured`]).
+pub const UNMEASURED_SIMULATION: &str =
+    "final handleOps simulation measured no gas on a chain billed on measured gas";
+
 /// The whole lane-batch program. Sequential: at most one operation is ever in
 /// flight (the Driver tests assert this invariant).
 async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
@@ -1536,6 +1541,18 @@ async fn execute_with_lane_lease(
         }
         BundleSimVerdict::Transient { reason } => return Err(reason),
     };
+    // Where the relay bills the gas a bundle measurably uses, a simulation
+    // that measured nothing — the Pimlico `eth_call` stand-in, whose bundle
+    // figure is an `eth_estimateGas` limit with no logs — is no basis to bill
+    // on: billed the outer limit, a wallet that paid for `settlementGas` is
+    // short by half and held, then rejected. It is a simulation that did not
+    // happen yet, and is retried like one (review F2).
+    if !bundle_simulation.full_execution
+        && crate::cost::settlement_gas_rule(start.operations[0].chain_id)
+            == crate::cost::SettlementGasRule::Measured
+    {
+        return Err(UNMEASURED_SIMULATION.to_owned());
+    }
     ensure_lane_lease(ctx).await?;
 
     if policy.is_tempo {
@@ -4171,6 +4188,106 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: super::DEFERRED_FINISH.into(),
+        }]);
+    }
+
+    /// Review F2: on Ethereum the relay bills the gas a bundle measurably
+    /// uses. When `eth_simulateV1` is unavailable for a pass, the Pimlico
+    /// `eth_call` decides membership and its bundle stand-in answers an
+    /// `eth_estimateGas` limit — a simulation that measured nothing. Billed
+    /// the outer limit, a wallet that paid for its `settlementGas` was short
+    /// by half and held, then rejected; now the bundle is deferred and
+    /// retried, as when no simulation ran, and nothing is fetched or signed.
+    #[test]
+    fn an_ethereum_bundle_whose_simulation_measured_nothing_is_retried_not_billed_the_limit() {
+        let fixture = fixture_on(556_775, "0x0", SENDER, 1);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = Driver::start(StartBatch {
+            operations: vec![fixture.routed.clone()],
+            policy: policy(),
+            lease_token: "lane-token-1".into(),
+        });
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(BundleSimulationData {
+                    gas_used: U256::from(322_126u64),
+                    operation_gas_used: vec![U256::ZERO],
+                    logs: Vec::new(),
+                    full_execution: false,
+                }),
+            },
+        );
+        for (operation, outcome) in [
+            (
+                ExecutionOperation::RecordDeferred {
+                    hash: fixture.hash_string.clone(),
+                    stage: "execution",
+                    reason: super::UNMEASURED_SIMULATION.into(),
+                },
+                ExecutionOutcome::Done,
+            ),
+            (
+                ExecutionOperation::NotifyIssue {
+                    hash: fixture.hash_string.clone(),
+                    stage: "execution",
+                    reason: super::UNMEASURED_SIMULATION.into(),
+                },
+                ExecutionOutcome::Done,
+            ),
+            (
+                ExecutionOperation::EmitDiagnostic {
+                    diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                        reason: super::UNMEASURED_SIMULATION.into(),
+                    },
+                },
+                ExecutionOutcome::Done,
+            ),
+        ] {
+            driver.step(operation, outcome);
+        }
         driver.assert_settled(&[ItemResolution::Failed {
             reason: super::DEFERRED_FINISH.into(),
         }]);

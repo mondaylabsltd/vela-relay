@@ -40,7 +40,21 @@ pub enum SimulateV1Turn {
 /// `remembered_missing`: whether a walk within
 /// [`crate::rpc_walk::MISSING_METHOD_MEMORY_MS`] proved the chain's endpoints
 /// lack the method (the shell's [`crate::rpc_walk::MissingMethods`]).
+///
+/// **Never demoted where the relay bills measured gas**
+/// ([`crate::cost::SettlementGasRule::Measured`]: Ethereum, Gnosis, Polygon,
+/// BNB Smart Chain and their testnets). There `eth_simulateV1` is what
+/// measures the gas an operation is billed for; the Pimlico `eth_call` asked
+/// before it once demoted measures nothing, and its bundle stand-in answers a
+/// limit. A walk "proves" the method missing whenever every endpoint that
+/// answered said so — a gateway policy or a rate limit worded as "method not
+/// allowed" — and on these chains that memory would turn ten minutes of
+/// sends into unmeasured ones (review F2, 2026-10-09). Publicnode and the
+/// other directory endpoints serve the method on all four (2026-10-08).
 pub fn simulate_v1_turn(chain_id: u64, remembered_missing: bool) -> SimulateV1Turn {
+    if crate::cost::settlement_gas_rule(chain_id) == crate::cost::SettlementGasRule::Measured {
+        return SimulateV1Turn::First;
+    }
     if remembered_missing || chain_lacks_simulate_v1(chain_id) {
         SimulateV1Turn::Last
     } else {
@@ -538,10 +552,36 @@ mod tests {
         use super::{SimulateV1Turn, simulate_v1_turn};
         assert_eq!(simulate_v1_turn(43_114, false), SimulateV1Turn::Last);
         assert_eq!(simulate_v1_turn(43_113, false), SimulateV1Turn::Last);
-        // Polygon, Base, Arbitrum: publicnode serves it (measured 2026-10-08).
-        for chain_id in [137, 8_453, 42_161] {
+        // Base, Arbitrum: publicnode serves it (measured 2026-10-08).
+        for chain_id in [8_453, 42_161] {
             assert_eq!(simulate_v1_turn(chain_id, false), SimulateV1Turn::First);
             assert_eq!(simulate_v1_turn(chain_id, true), SimulateV1Turn::Last);
+        }
+    }
+
+    /// Review F2: where the relay bills the gas a bundle measurably uses, the
+    /// one method that measures it is asked first whatever a recent walk
+    /// seemed to prove.
+    #[test]
+    fn a_chain_billed_on_measured_gas_always_asks_for_simulate_v1_first() {
+        use super::{SimulateV1Turn, simulate_v1_turn};
+        for chain_id in [
+            1, 11_155_111, 17_000, 560_048, 100, 10_200, 137, 80_002, 56, 97,
+        ] {
+            assert_eq!(
+                crate::cost::settlement_gas_rule(chain_id),
+                crate::cost::SettlementGasRule::Measured
+            );
+            assert_eq!(
+                simulate_v1_turn(chain_id, true),
+                SimulateV1Turn::First,
+                "{chain_id}"
+            );
+            assert_eq!(
+                simulate_v1_turn(chain_id, false),
+                SimulateV1Turn::First,
+                "{chain_id}"
+            );
         }
     }
 
