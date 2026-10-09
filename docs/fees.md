@@ -232,7 +232,8 @@ rewarded  = max( the window's median p25 , least )
 busy window  (mean gasUsedRatio ≥ 30%):   tip[slow] = max(rewarded, node),  tip[standard] = max(median p50, slow),
                                           tip[fast] = max(median p70, standard)
 quiet window (mean gasUsedRatio < 30%):   tip[slow] = max(node, least) (rewarded without a node),
-                                          tip[standard] = 1.25 × slow,  tip[fast] = 2 × slow
+                                          tip[standard] = max(min(1.25 × slow, median p50), slow),
+                                          tip[fast] = max(min(2 × slow, median p70), standard)
 tips.floor = rewarded (the node's tip where the window paid none); below a 40% mean, the lower of
              that and the quiet tip[slow]                                                     (TierTips)
 
@@ -289,7 +290,10 @@ alike (`TierTips::resolve`).
   Avalanche's 2.5–6.2 gwei on blocks 3% full, Gnosis's 70th 1.5 gwei over an
   8-wei base fee. There each tier signs the node's tip scaled `1.00 / 1.25 /
   2.00` — what every tier signed before rewards were read, mined on Polygon at
-  30 gwei — and `fast` still bids twice `slow`. The line is 30%, not one half,
+  30 gwei — but a faster tier never more than the window's blocks paid at its
+  own percentile: BNB Smart Chain's blocks pay 0.05 / 0.05 / 0.057 gwei, and
+  twice the node's 0.05 would have made `fast` 40% dearer for nothing. `fast`
+  bids twice `slow` wherever its blocks paid that much. The line is 30%, not one half,
   because Ethereum's base fee targets half-full blocks: its 20-block average is
   below 0.5 in 49% of windows and was never below 0.338 over the 10.4 days of
   §2c, so it always reads busy; BNB Smart Chain's minute reads quiet 92% of
@@ -640,7 +644,8 @@ speed.)
   base) and a tip read from what recent blocks paid — the median over a
   minute of blocks (at least 20) of each block's 25th / 50th / 70th
   percentile reward, or, where the blocks are under 30% full, the node's own
-  tip scaled 1.00 / 1.25 / 2.00; the node's tip a floor only where the blocks
+  tip scaled 1.00 / 1.25 / 2.00 (never above those percentiles); the node's
+  tip a floor only where the blocks
   bear it out. The quote and the executor read the tips by one rule, so what
   is quoted is what is signed. A payment that cannot fund its tier gives back
   cap headroom first, then priority down to what the window proves the chain

@@ -230,7 +230,7 @@ impl TierTips {
     ///   slow = max( rewarded , node ),  standard = max( median p50 , slow ),  fast = max( median p70 , standard )
     /// quiet (mean gasUsedRatio < 30%):
     ///   slow = max( node , least ) — or `rewarded` when the node's answer was discarded —
-    ///   standard = 1.25 × slow,  fast = 2 × slow                (rounded up)
+    ///   standard = max( min( 1.25 × slow , median p50 ) , slow ),  fast = max( min( 2 × slow , median p70 ) , standard )
     /// floor = rewarded — the node's tip where the window paid none — or the
     ///         lower of that and the quiet slow below a 40% mean
     /// ```
@@ -253,7 +253,10 @@ impl TierTips {
     /// bids, not a place in the next block ([`UNCONGESTED_GAS_USED_RATIO_BPS`]),
     /// so each tier signs the node's tip scaled `1.00 / 1.25 / 2.00` — what
     /// every tier signed before rewards were read, mined on Polygon at 30 gwei
-    /// tips. `fast` still bids twice `slow`.
+    /// tips — but a faster tier never more than the window's blocks paid at
+    /// its own percentile: on BNB Smart Chain, whose blocks pay 0.05 / 0.05 /
+    /// 0.057 gwei, twice the node's 0.05 would have made `fast` 40% dearer for
+    /// nothing. `fast` bids twice `slow` wherever its blocks paid that much.
     ///
     /// A row of another width (some nodes answer `[]` for an empty block) is
     /// left out; `None` when no complete row is left, or on overflow.
@@ -292,10 +295,16 @@ impl TierTips {
         let proven = if paid_any { rewarded } else { quiet_slow };
         let ratio = window.gas_used_ratio_bps;
         if ratio.is_some_and(|ratio| ratio < UNCONGESTED_GAS_USED_RATIO_BPS) {
+            let standard = scaled_market_tip(SubmissionTier::Standard, quiet_slow)?
+                .min(median(1))
+                .max(quiet_slow);
+            let fast = scaled_market_tip(SubmissionTier::Fast, quiet_slow)?
+                .min(median(2))
+                .max(standard);
             return Some(Self {
                 slow: quiet_slow,
-                standard: scaled_market_tip(SubmissionTier::Standard, quiet_slow)?,
-                fast: scaled_market_tip(SubmissionTier::Fast, quiet_slow)?,
+                standard,
+                fast,
                 floor: quiet_slow.min(proven),
             });
         }
@@ -1539,13 +1548,14 @@ mod tests {
         assert_eq!(near.floor, 30 * GWEI);
 
         // Gnosis: the node's 1 wei, lifted to the 0.001 gwei least tip of a
-        // window that paid any; `fast` no longer 1.5 gwei.
+        // window that paid any; `fast` no longer 1.5 gwei, and `standard` no
+        // more than `slow` where the median block paid 2 wei.
         let gnosis = [[1, 2, 1_500_000_000]; 20];
         assert_eq!(
             TierTips::from_window(&window(&gnosis, Some(1_800)), 1).unwrap(),
             TierTips {
                 slow: MIN_POSITIVE_TIP,
-                standard: 1_250_000,
+                standard: MIN_POSITIVE_TIP,
                 fast: 2 * MIN_POSITIVE_TIP,
                 floor: MIN_POSITIVE_TIP,
             }
@@ -1567,6 +1577,18 @@ mod tests {
         let bsc_quiet = TierTips::from_window(&window(&bsc, Some(1_900)), GWEI).unwrap();
         assert_eq!(bsc_quiet.slow, 50_000_000);
         assert!(bsc_quiet.slow < bsc_quiet.standard && bsc_quiet.standard < bsc_quiet.fast);
+        // ...and a faster tier never bids more than its blocks paid at its
+        // percentile: the node's 0.05 gwei scaled would be 0.0625 / 0.1 gwei,
+        // and BSC's blocks pay 0.05 / 0.057 there.
+        assert_eq!(
+            TierTips::from_window(&window(&bsc, Some(1_900)), 50_000_000).unwrap(),
+            TierTips {
+                slow: 50_000_000,
+                standard: 50_000_001,
+                fast: 57_000_000,
+                floor: 50_000_000,
+            }
+        );
         // Ethereum's quietest minute is busy: the same tips. (Inside the
         // near-quiet band only the floor a short payment may be shaved to
         // drops, to the quiet `slow`.)
