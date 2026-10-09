@@ -554,6 +554,11 @@ pub struct InBandGasQuote {
     pub balance: Quantity,
     pub usd_price: Option<String>,
     pub usd_balance: Option<String>,
+    /// The least in-band fee, in this row's base units (hex), that the relay
+    /// takes in this asset (`docs/fees.md` §1): `$0.01` of the native coin at
+    /// `usd_price`, never under `0.000001` of it, and `0.000001` of it when
+    /// there is no price; `0.01` of a stablecoin.
+    pub minimum_amount: Quantity,
 }
 
 #[derive(Debug, Serialize)]
@@ -883,12 +888,12 @@ mod tests {
             json!(6),
             RpcError::user_operation_rejected(
                 "in-band UserOperation must reimburse the settlement recipient with at least \
-                 0.00001 native coin or 0.01 of an allowlisted stablecoin",
+                 0.000001 native coin or 0.01 of an allowlisted stablecoin",
             ),
         );
         assert_eq!(
             bytes(&rejected),
-            r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32500,"message":"UserOperation simulation failed","data":"in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin"}}"#
+            r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32500,"message":"UserOperation simulation failed","data":"in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin"}}"#
         );
     }
 

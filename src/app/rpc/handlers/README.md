@@ -129,8 +129,17 @@ Call `POST /{chainId}` with one `safeAddress` parameter:
 ```
 
 Each quote identifies the configured settlement recipient, the asset, the user's current balance,
-and its USD valuation. `eth_sendUserOperation` still enforces a minimum in-band reimbursement of
-`0.00001` native coin or `0.01` USD stablecoin.
+its USD valuation, and `minimumAmount`: the least in-band fee the relay takes in that asset, in
+its base units (hex). The minimum is `$0.01` (`docs/fees.md` §1c):
+
+- native coin with a `usdPrice`: `$0.01` of it at that price, rounded up, never under
+  `0.000001` of the coin;
+- native coin without a `usdPrice`: `0.000001` of the coin (the safety floor);
+- a stablecoin, or Tempo's pathUSD: `0.01` of it.
+
+`eth_sendUserOperation` admits a native payment of at least `0.000001` of the coin or `0.01` of an
+allowlisted stablecoin; the executor then requires the minimum at its own price, accepting down to
+90% of `$0.01` so a payment of the published minimum survives the coin moving a little in between.
 
 ```json
 {
@@ -144,7 +153,8 @@ and its USD valuation. `eth_sendUserOperation` still enforces a minimum in-band 
     "symbol": "ETH",
     "balance": "0x0",
     "usdPrice": "3000.12",
-    "usdBalance": "0"
+    "usdBalance": "0",
+    "minimumAmount": "0x3081233c8d6"
   }]
 }
 ```
@@ -271,7 +281,7 @@ Admission is intentionally small and deterministic:
 
 - `maxFeePerGas` and `maxPriorityFeePerGas` must both be exactly `0x0`.
 - The Safe calldata must be `executeUserOp` delegating to the canonical Safe MultiSend contract.
-- The batch must transfer to the configured settlement recipient either at least `0.00001` native coin or at least `0.01` of one stablecoin listed in that chain's `stables` metadata.
+- The batch must transfer to the configured settlement recipient either at least `0.000001` native coin or at least `0.01` of one stablecoin listed in that chain's `stables` metadata. (The executor then requires the `$0.01` minimum, `docs/fees.md` §1c.)
 - Stablecoin amounts are converted to smallest units using the token's on-chain `decimals()` result. Transfers in unlisted tokens are ignored.
 - The operation must have valid v0.7 structural fields and a non-empty signature. EIP-7702 authorization is not enabled yet.
 

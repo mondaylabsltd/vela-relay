@@ -419,7 +419,7 @@ async fn validate_in_band_submission(
     }
 
     Err(AdmissionOutcome::Rejected {
-        message: "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin".into(),
+        message: "in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin".into(),
     })
 }
 
@@ -1326,7 +1326,7 @@ mod tests {
             },
         );
         driver.assert_settled(AdmissionOutcome::Rejected {
-            message: "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin".into(),
+            message: "in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin".into(),
         });
     }
 

@@ -1641,18 +1641,26 @@ async fn execute_with_lane_lease(
         .collect::<Vec<&[u8]>>();
     let treasury = start_treasury(start);
     let chain_id = start.operations[0].chain_id;
-    let native_usd_price = if has_stablecoin_payment(treasury, &chain_assets.assets, &call_datas) {
-        // xDAI is USD-pegged: Gnosis settlement never consults the market.
-        match crate::settlement::pegged_native_usd_price(chain_id) {
-            Some(price) => Some(price),
-            None => match request(ctx, ExecutionOperation::FetchMarketPrice).await? {
-                ExecutionOutcome::Price { price } => Some(price),
-                ExecutionOutcome::Failed { message } => return Err(message),
-                _ => return Err("unexpected shell response".to_owned()),
-            },
+    // One price read per attempt, shared by the `$0.01` minimum, the
+    // stablecoin conversion and the top-up cap below. A dollar coin (xDAI,
+    // Arc's USDC, Stable's USDT0) never consults the market.
+    let market_price = match crate::settlement::pegged_native_usd_price(chain_id) {
+        Some(price) => Ok(price),
+        None => match request(ctx, ExecutionOperation::FetchMarketPrice).await? {
+            ExecutionOutcome::Price { price } => Ok(price),
+            ExecutionOutcome::Failed { message } => Err(message),
+            _ => Err("unexpected shell response".to_owned()),
+        },
+    };
+    let native_usd_price = match &market_price {
+        Ok(price) => Some(*price),
+        // A stablecoin payment cannot be valued without the price: retry.
+        Err(message) if has_stablecoin_payment(treasury, &chain_assets.assets, &call_datas) => {
+            return Err(message.clone());
         }
-    } else {
-        None
+        // A native payment can: the cost term needs no price, and the
+        // minimum falls back to the safety floor (`docs/fees.md` §1).
+        Err(_) => None,
     };
     let mut fees = FeeContext {
         quoted_fee_per_gas: context.max_fee_per_gas,
@@ -1870,14 +1878,9 @@ async fn execute_with_lane_lease(
         .ok_or_else(|| "bundle prefund overflow".to_owned())?;
 
     // Per-transfer top-up cap: USD-denominated when a price exists (pegged on
-    // Gnosis, otherwise from the market), failing open to the static wei cap.
-    let top_up_price = match crate::settlement::pegged_native_usd_price(chain_id) {
-        Some(price) => Some(price),
-        None => match request(ctx, ExecutionOperation::FetchMarketPrice).await? {
-            ExecutionOutcome::Price { price } => Some(price),
-            _ => None,
-        },
-    };
+    // Gnosis, otherwise from the market read above), failing open to the
+    // static wei cap.
+    let top_up_price = market_price.ok();
     let top_up_max = match top_up_price {
         // No usable market price: silently keep the operator's static cap.
         None => U256::from(policy.top_up_max_wei),
@@ -3474,7 +3477,9 @@ mod tests {
     fn assets() -> ResolvedChainAssets {
         ResolvedChainAssets {
             assets: ChainAssetConfig {
-                native_decimals: 5,
+                // The safety floor is 10^(decimals − 6): one base unit here,
+                // so it never binds on these fixtures' payments.
+                native_decimals: 6,
                 settlement_markup_bps: 14_000,
                 stablecoins: BTreeMap::new(),
             },
@@ -4553,6 +4558,14 @@ mod tests {
                 },
             },
         );
+        // One price read per attempt, before the settlement gate. It failed:
+        // a native payment's minimum is the safety floor.
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
         // The one line an operator can read the decision off: the speed asked
         // for, the cap the relay would have used, and what it resolved to.
         driver.step(
@@ -4567,12 +4580,6 @@ mod tests {
                 },
             },
             ExecutionOutcome::Done,
-        );
-        driver.step(
-            ExecutionOperation::FetchMarketPrice,
-            ExecutionOutcome::Failed {
-                message: "Binance native USD price request failed".into(),
-            },
         );
         driver.step(
             ExecutionOperation::EnsureLaneLease,
@@ -4743,6 +4750,14 @@ mod tests {
                 },
             },
         );
+        // One price read per attempt, before the settlement gate. It failed:
+        // a native payment's minimum is the safety floor.
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
         // The operator's one line: the tip actually signed beside the market
         // tip it was scaled from. `tip == market_tip` on anything but `slow`
         // would mean the scaling was lost again.
@@ -4758,12 +4773,6 @@ mod tests {
                 },
             },
             ExecutionOutcome::Done,
-        );
-        driver.step(
-            ExecutionOperation::FetchMarketPrice,
-            ExecutionOutcome::Failed {
-                message: "Binance native USD price request failed".into(),
-            },
         );
         driver.step(
             ExecutionOperation::EnsureLaneLease,
@@ -5058,6 +5067,14 @@ mod tests {
             },
             ExecutionOutcome::Context { context: context() },
         );
+        // One price read per attempt, before the settlement gate. It failed:
+        // a native payment's minimum is the safety floor.
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
         driver.step(
             ExecutionOperation::DeferOperation {
                 index: 0,
@@ -5186,6 +5203,14 @@ mod tests {
             },
             ExecutionOutcome::Context { context: context() },
         );
+        // One price read per attempt, before the settlement gate. It failed:
+        // a native payment's minimum is the safety floor.
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
         driver.step(
             ExecutionOperation::DeferOperation {
                 index: 0,
@@ -5221,6 +5246,108 @@ mod tests {
                     payment_asset: None,
                     paid: U256::from(1u64),
                     required: U256::from(280u64),
+                    stable_logs_valid: true,
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "in_band_settlement",
+                reason: reason.into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    /// With a fresh price the minimum is `$0.01` of the coin (accepted down to
+    /// 90% of it). A payment over the gas cost but under that minimum is held
+    /// like any shortfall, and once the budget is spent it is rejected.
+    #[test]
+    fn a_payment_under_the_priced_minimum_is_rejected_as_below_the_minimum() {
+        // Six decimals, the coin at $10: 90% of $0.01 is 900 units. The gas
+        // costs 280 at the cap (see the test above); the payment is 500.
+        let fixture = fixture(500);
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                calldata,
+            },
+            ExecutionOutcome::Context { context: context() },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Price {
+                price: U256::from(10u64 * crate::settlement::USD_PRICE_SCALE),
+            },
+        );
+        driver.step(
+            ExecutionOperation::DeferOperation {
+                index: 0,
+                cause: DeferCause::AffordableMarketHold,
+            },
+            ExecutionOutcome::Deferred { attempt: 13 },
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::HoldBudgetExhausted {
+                    hash: fixture.hash_string.clone(),
+                    attempt: 13,
+                    paid: U256::from(500u64),
+                    required: U256::from(900u64),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        let reason = "in-band reimbursement is below the required amount: \
+                      paid=500, required=900, shortfall=400";
+        driver.step(
+            ExecutionOperation::MarkRejectedWithReason {
+                hash: fixture.hash_string.clone(),
+                stage: "in_band_settlement",
+                reason: reason.into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::SettlementRejected {
+                    hash: fixture.hash_string.clone(),
+                    payment_asset: None,
+                    paid: U256::from(500u64),
+                    required: U256::from(900u64),
                     stable_logs_valid: true,
                 },
             },

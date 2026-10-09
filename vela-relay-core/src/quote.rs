@@ -92,6 +92,15 @@ pub fn quotes_from_multicall(
     minimum_native_amount(native_decimals).ok_or(())?;
     let native_usd_balance =
         usd_balance_from_values(&native, native_decimals, native_price.as_deref());
+    // `$0.01` of the coin at the price this quote reports, which is the price
+    // a wallet reads its own minimum from; the safety floor without one.
+    let native_minimum = crate::settlement::published_native_minimum(
+        native_decimals,
+        native_price
+            .as_deref()
+            .and_then(crate::settlement::parse_market_usd_price),
+    )
+    .map_err(|_| ())?;
     let mut quotes = vec![InBandGasQuote {
         recipient: recipient.into(),
         asset: InBandGasQuoteAsset::Native,
@@ -101,6 +110,7 @@ pub fn quotes_from_multicall(
         balance: native,
         usd_price: native_price.clone(),
         usd_balance: native_usd_balance,
+        minimum_amount: format!("0x{native_minimum:x}"),
     }];
 
     for (index, stablecoin) in stablecoins.iter().enumerate() {
@@ -118,9 +128,9 @@ pub fn quotes_from_multicall(
         else {
             continue;
         };
-        if minimum_stablecoin_amount(decimals).is_none() {
+        let Some(stable_minimum) = minimum_stablecoin_amount(decimals) else {
             continue;
-        }
+        };
         let usd_balance = usd_balance_from_values(&balance, decimals, Some("1"));
 
         quotes.push(InBandGasQuote {
@@ -132,6 +142,7 @@ pub fn quotes_from_multicall(
             balance,
             usd_price: Some("1".into()),
             usd_balance,
+            minimum_amount: format!("0x{stable_minimum:x}"),
         });
     }
 
@@ -151,6 +162,11 @@ pub fn tempo_quote(recipient: String, balance: String) -> InBandGasQuote {
         balance,
         usd_price: Some("1".into()),
         usd_balance,
+        // The `$0.01` admission and settlement both require of pathUSD.
+        minimum_amount: format!(
+            "0x{:x}",
+            10u128.pow(crate::tempo::PATH_USD_DECIMALS - MIN_STABLE_FRACTION_DECIMALS)
+        ),
     }
 }
 
@@ -454,8 +470,9 @@ mod tests {
     use crate::wire::{InBandGasQuote, InBandGasQuoteAsset};
 
     use super::{
-        MulticallCall, bytes32_quantity, compare_usd_balance_descending, decode_aggregate3,
-        encode_aggregate3, is_usd_stablecoin, normalize_usd_price, usd_balance_from_values,
+        MulticallCall, MulticallResult, QuoteStable, bytes32_quantity,
+        compare_usd_balance_descending, decode_aggregate3, encode_aggregate3, is_usd_stablecoin,
+        normalize_usd_price, quotes_from_multicall, tempo_quote, usd_balance_from_values,
     };
 
     #[test]
@@ -513,7 +530,7 @@ mod tests {
 
     #[test]
     fn calculates_minimum_amounts_in_smallest_units() {
-        assert_eq!(super::minimum_native_amount(18), Some(10_000_000_000_000));
+        assert_eq!(super::minimum_native_amount(18), Some(1_000_000_000_000));
         assert_eq!(super::minimum_stablecoin_amount(6), Some(10_000));
         assert_eq!(
             super::minimum_stablecoin_amount(18),
@@ -536,6 +553,123 @@ mod tests {
             balance: balance.into(),
             usd_price: usd_price.map(String::from),
             usd_balance: usd_balance_from_values(balance, decimals, usd_price),
+            minimum_amount: "0x0".into(),
         }
+    }
+
+    fn word(value: u128) -> Vec<u8> {
+        let mut word = vec![0u8; 16];
+        word.extend(value.to_be_bytes());
+        word
+    }
+
+    fn result(value: u128) -> MulticallResult {
+        MulticallResult {
+            success: true,
+            return_data: word(value),
+        }
+    }
+
+    fn minimum_of(quotes: &[InBandGasQuote], symbol: &str) -> u128 {
+        let quote = quotes.iter().find(|quote| quote.symbol == symbol).unwrap();
+        u128::from_str_radix(quote.minimum_amount.trim_start_matches("0x"), 16).unwrap()
+    }
+
+    /// Every row says the least fee the relay takes in it: `$0.01` of the
+    /// native coin at the price the row reports, `0.01` of a stablecoin.
+    #[test]
+    fn every_row_publishes_the_minimum_fee_in_its_own_units() {
+        let stables = [QuoteStable {
+            symbol: "USDC".into(),
+            contract: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".into(),
+        }];
+        let values = || vec![result(1), result(6), result(5_000_000)];
+
+        // ETH at $2,494: $0.01 is 0.000004009623… ETH, rounded up to the wei.
+        let quotes = quotes_from_multicall(
+            18,
+            "ETH",
+            "0x0000000000000000000000000000000000000001",
+            Some("2494".into()),
+            &stables,
+            values(),
+        )
+        .unwrap();
+        assert_eq!(minimum_of(&quotes, "ETH"), 4_009_623_095_430);
+        assert_eq!(minimum_of(&quotes, "USDC"), 10_000);
+        // What the old 0.00001-coin floor charged: two and a half cents.
+        assert!(minimum_of(&quotes, "ETH") < 10_000_000_000_000 / 2);
+
+        // A dollar coin (Gnosis xDAI, Arc USDC, Stable USDT0): 0.01 of it.
+        let pegged = quotes_from_multicall(
+            18,
+            "xDAI",
+            "0x0000000000000000000000000000000000000001",
+            Some("1".into()),
+            &[],
+            vec![result(1)],
+        )
+        .unwrap();
+        assert_eq!(minimum_of(&pegged, "xDAI"), 10_000_000_000_000_000);
+
+        // No price: the safety floor, 0.000001 of the coin.
+        let unpriced = quotes_from_multicall(
+            18,
+            "MNT",
+            "0x0000000000000000000000000000000000000001",
+            None,
+            &[],
+            vec![result(1)],
+        )
+        .unwrap();
+        assert_eq!(minimum_of(&unpriced, "MNT"), 1_000_000_000_000);
+
+        // A coin dearer than $10,000 would floor at the safety floor, above
+        // `$0.01`; none of the built-in networks has one.
+        let dear = quotes_from_multicall(
+            18,
+            "BTC",
+            "0x0000000000000000000000000000000000000001",
+            Some("82551".into()),
+            &[],
+            vec![result(1)],
+        )
+        .unwrap();
+        assert_eq!(minimum_of(&dear, "BTC"), 1_000_000_000_000);
+
+        // Tempo's pathUSD.
+        let tempo = tempo_quote(
+            "0x0000000000000000000000000000000000000001".into(),
+            "0x0".into(),
+        );
+        assert_eq!(tempo.minimum_amount, "0x2710");
+
+        // The field is on the wire, beside the ones every wallet already reads.
+        let json = serde_json::to_value(&quotes[0]).unwrap();
+        assert!(json.get("minimumAmount").is_some(), "{json}");
+        assert!(json.get("usdPrice").is_some());
+    }
+
+    /// The published minimum is accepted by the executor at the same price,
+    /// and still after the coin falls 10%, but not 11%.
+    #[test]
+    fn the_published_minimum_is_accepted_at_settlement_within_the_allowance() {
+        use crate::settlement::{
+            enforced_native_minimum, parse_market_usd_price, published_native_minimum,
+        };
+        use alloy::primitives::U256;
+        let quoted = parse_market_usd_price("2494").unwrap();
+        let paid = published_native_minimum(18, Some(quoted)).unwrap();
+        for (settled, accepted) in [("2494", true), ("2244.6", true), ("2219.66", false)] {
+            let floor = enforced_native_minimum(18, parse_market_usd_price(settled)).unwrap();
+            assert_eq!(paid >= floor, accepted, "settled at {settled}");
+        }
+        // No price at settlement: the safety floor, which the published
+        // minimum always meets.
+        assert!(paid >= enforced_native_minimum(18, None).unwrap());
+        assert_eq!(
+            enforced_native_minimum(18, None).unwrap(),
+            U256::from(10u64.pow(12))
+        );
     }
 }
