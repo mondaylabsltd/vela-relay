@@ -30,12 +30,17 @@
 //!   ambiguous/rejected broadcasts.
 //! - [`funding`] — relayer float targets, top-up caps, and treasury
 //!   affordability.
+//! - [`pace`] — how fast a chain makes blocks, and the waits measured in
+//!   blocks (a lane's own top-up, a submitted bundle's receipt).
 //! - [`tempo`] — Tempo chain constants and pathUSD calldata builders.
 //! - [`alchemy`] — the static Alchemy network registry.
 //! - [`chain_directory`] — the chain-metadata directory address, the
 //!   per-chain metadata URL, and what an answer from it means.
 //! - [`rpc_host`] — which RPC endpoints the relay will call (the SSRF rule
 //!   and its self-host opt-in).
+//! - [`rpc_walk`] — how the executor walks a chain's endpoint list: what an
+//!   endpoint's error says about a method, and when a whole walk proves the
+//!   chain's endpoints lack it.
 //!
 //! Nondeterministic inputs (wall-clock time, generated identifiers, chain
 //! context, market prices, policy values) always enter through an event or an
@@ -56,9 +61,11 @@ pub mod funding;
 pub mod gas_math;
 pub mod hold;
 pub mod lifecycle;
+pub mod pace;
 pub mod quote;
 pub mod receipt;
 pub mod rpc_host;
+pub mod rpc_walk;
 pub mod settlement;
 pub mod signing;
 pub mod simulation;

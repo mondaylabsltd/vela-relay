@@ -39,6 +39,62 @@ Never `x-vela-rpc-url`. A caller-supplied endpoint could lie about a nonce, a
 receipt or a balance and make the relay send again, spending the float that every
 person on that chain depends on.
 
+### Endpoints that do not answer
+
+Before it uses an endpoint, the executor checks that the endpoint reports the
+chain's id. An endpoint that fails that check (the wrong chain, an error, an
+HTTP error, no answer) or that runs out the RPC timeout on any request is left
+out of the executor's walks for 3 minutes. On Avalanche about a dozen listed
+endpoints answer 403, 429, 521 or 530 to everything, and one never answers, so
+each walk used to ask them all again and wait the full 5 s timeout for that one.
+
+Two exceptions keep this from making things worse:
+
+- The operator's own endpoints (`VELA_RELAY_EXECUTOR_RPC_URLS`) are never left
+  out.
+- When every endpoint for a chain is cooling down, the walk asks all of them.
+
+A single call is sent on its own, not as a batch of one. Some endpoints
+(pocket.network on Avalanche) answer a one-call batch with a bare object, which
+the executor used to read as no answer. It now also accepts that bare object.
+
+The rules are in `vela-relay-core`'s `rpc_walk` (`EndpointCooldowns`,
+`batch_replies`). The cooldowns are kept per process or per isolate, like the
+rest of the walk's memory.
+
+### A method the chain's nodes do not have
+
+The executor simulates every operation before it signs, in three tiers:
+`eth_simulateV1`, then the Pimlico simulation contracts through `eth_call`, then
+`debug_traceCall`. Each tier walks the endpoint list above, one endpoint at a
+time, until one answers.
+
+Avalanche's C-Chain client does not implement `eth_simulateV1`. On 2026-10-08
+every one of the 28 endpoints the directory lists for 43114 answered `-32601`
+("method does not exist") or not at all, so each simulation walked the whole list
+before falling back, twice a pass, and an AVAX send took about a minute
+(vela-wallet #464). So:
+
+- **Avalanche (43114) and Fuji (43113)** ask for `eth_simulateV1` last.
+- **Any chain** where a whole walk got only "no such method" answers (JSON-RPC
+  `-32601`, or an error that says the method is missing) and no `result` is
+  treated the same way for 10 minutes. Endpoints that timed out or answered with
+  an HTTP error are no evidence either way. One endpoint that serves the method
+  ends it at once.
+
+"Last" means after the other two tiers, and only for the operations they could
+not decide. The method is never skipped, so a wrong belief costs one slow walk,
+never a verdict. The rule is `vela-relay-core`'s `simulation::simulate_v1_turn`
+and `rpc_walk`. Each process (docker) or isolate (Workers) keeps its own memory,
+which starts empty.
+
+Each operation is first simulated alone, and then the bundle is simulated
+before it is signed. When the bundle is a single operation and its own
+simulation ran in full (`eth_simulateV1` or `debug_traceCall`, with its gas and
+every log), that run is the bundle's simulation: the call is identical. An
+operation that only the Pimlico `eth_call` could check (no gas, no logs) is
+still simulated as a bundle.
+
 **Considered and not built** (2026-10-03): broadcasting through the wallet's RPC
 for a chain whose directory entry has no usable endpoint. Measured on a snapshot of
 the chain list the directory serves (ethereum-lists, 2026-05-06): of 2,602 chains,

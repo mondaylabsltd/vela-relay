@@ -18,7 +18,6 @@ use vela_relay_core::broadcast::{nonce_too_low, validate_raw_transaction};
 use vela_relay_core::execution::{
     self as core_execution, ExecutionOperation as Op, ExecutionOutcome as Out,
 };
-use vela_relay_core::simulation::{SimulationResult, SimulationVerdict};
 use vela_relay_core::task::{PreparedBundleIntent, RoutedUserOperation, truncate_diagnostic};
 use vela_relay_core::vault;
 use worker::{
@@ -421,7 +420,7 @@ impl LaneDo {
                             // Covers the crash window between save and
                             // broadcast: the reconcile alarm resumes the
                             // durable outbox even if this batch dies here.
-                            self.arm_reconcile().await;
+                            self.arm_reconcile(self.receipt_poll_ms()).await;
                             Out::Saved { saved: true }
                         }
                         Err(_) => Out::Failed {
@@ -497,7 +496,10 @@ impl LaneDo {
                 )
                 .await;
                 Out::OperationVerdicts {
-                    verdicts: verdicts.into_iter().map(operation_sim_verdict).collect(),
+                    verdicts: verdicts
+                        .into_iter()
+                        .map(core_execution::OperationSimVerdict::from)
+                        .collect(),
                 }
             }
             Op::FetchAccountNonces {
@@ -564,7 +566,7 @@ impl LaneDo {
                 )
                 .await;
                 Out::BundleVerdict {
-                    verdict: bundle_sim_verdict(verdict),
+                    verdict: core_execution::BundleSimVerdict::from(verdict),
                 }
             }
             Op::FetchTransactionContext {
@@ -799,6 +801,10 @@ impl LaneDo {
                     Ok(TreasuryReply::Acquired { acquired }) => Out::LeaseAcquired { acquired },
                     _ => treasury_unavailable(),
                 }
+            }
+            Op::Pause { ms } => {
+                worker::Delay::from(std::time::Duration::from_millis(*ms)).await;
+                Out::Done
             }
             Op::FetchTransactionReceipt { transaction_hash } => {
                 match context
@@ -1469,8 +1475,11 @@ impl LaneDo {
     ) -> Out {
         match self.submit_bundle_members(chain_id, intent).await {
             Ok(indexed) => {
-                // A submitted bundle now has a receipt to reconcile.
-                self.arm_reconcile().await;
+                // A submitted bundle now has a receipt to reconcile: the first
+                // check comes a block after the broadcast, not the poll
+                // interval after the save (core `pace::receipt_pace_ms`).
+                let pace = vela_relay_core::pace::receipt_pace_ms(chain_id, self.receipt_poll_ms());
+                self.arm_reconcile(pace).await;
                 Out::Indexed { indexed }
             }
             Err(message) => Out::Failed { message },
@@ -1587,13 +1596,18 @@ impl LaneDo {
             .flatten()
     }
 
-    /// Arms (or advances) the reconcile deadline to at most one poll interval
-    /// from now — the docker reconciler's tick, packed into the lane alarm.
-    async fn arm_reconcile(&self) {
-        let poll_ms = CfConfig::from_env(&self.env)
+    /// The configured receipt-probe interval
+    /// (`VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS`).
+    fn receipt_poll_ms(&self) -> u64 {
+        CfConfig::from_env(&self.env)
             .map(|config| config.receipt_poll_ms)
-            .unwrap_or(3_000);
-        let due = Date::now().as_millis() + poll_ms;
+            .unwrap_or(3_000)
+    }
+
+    /// Arms (or advances) the reconcile deadline to at most `within_ms` from
+    /// now — the docker reconciler's tick, packed into the lane alarm.
+    async fn arm_reconcile(&self, within_ms: u64) {
+        let due = Date::now().as_millis() + within_ms;
         let due = match self.reconcile_due().await {
             Some(existing) if existing <= due => existing,
             _ => due,
@@ -1670,10 +1684,11 @@ impl LaneDo {
             }
         }
 
-        // Keep ticking while the intent survives; clear the deadline once it
-        // is gone.
+        // Keep ticking, a block apart, while the intent survives; clear the
+        // deadline once it is gone.
         if self.intent().await.is_some() {
-            let due = Date::now().as_millis() + config.receipt_poll_ms;
+            let due = Date::now().as_millis()
+                + vela_relay_core::pace::receipt_pace_ms(intent.chain_id, config.receipt_poll_ms);
             let _ = self.state.storage().put(RECONCILE_DUE_KEY, due).await;
         } else {
             let _ = self.state.storage().delete(RECONCILE_DUE_KEY).await;
@@ -2034,61 +2049,8 @@ impl LaneDo {
     }
 }
 
-// --- verdict/reply conversions (docker engine arm mappings, verbatim) ---
-
-fn operation_sim_verdict(
-    verdict: SimulationVerdict<SimulationResult>,
-) -> core_execution::OperationSimVerdict {
-    match verdict {
-        SimulationVerdict::Success(_) => core_execution::OperationSimVerdict::Success,
-        SimulationVerdict::NonceMismatch => core_execution::OperationSimVerdict::NonceMismatch,
-        SimulationVerdict::Rejected(reason) => core_execution::OperationSimVerdict::Rejected {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Pending(reason) => core_execution::OperationSimVerdict::Pending {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Transient(reason) => core_execution::OperationSimVerdict::Transient {
-            reason: reason.to_string(),
-        },
-    }
-}
-
-fn bundle_sim_verdict(
-    verdict: SimulationVerdict<SimulationResult>,
-) -> core_execution::BundleSimVerdict {
-    match verdict {
-        SimulationVerdict::Success(simulation) => {
-            core_execution::BundleSimVerdict::Success(core_execution::BundleSimulationData {
-                gas_used: simulation.gas_used,
-                operation_gas_used: simulation
-                    .events
-                    .iter()
-                    .map(|event| event.actual_gas_used)
-                    .collect(),
-                logs: simulation
-                    .logs
-                    .iter()
-                    .map(|log| vela_relay_core::settlement::SettlementLog {
-                        address: log.address,
-                        topics: log.topics.clone(),
-                        data: log.data.clone(),
-                    })
-                    .collect(),
-            })
-        }
-        SimulationVerdict::NonceMismatch => core_execution::BundleSimVerdict::NonceMismatch,
-        SimulationVerdict::Rejected(reason) => core_execution::BundleSimVerdict::Rejected {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Pending(reason) => core_execution::BundleSimVerdict::Pending {
-            reason: reason.to_string(),
-        },
-        SimulationVerdict::Transient(reason) => core_execution::BundleSimVerdict::Transient {
-            reason: reason.to_string(),
-        },
-    }
-}
+// --- reply conversions (docker engine arm mappings, verbatim; the simulation
+// verdicts convert through the core's `From` impls) ---
 
 fn broadcast_reply(
     outcome: crate::arms::trusted::BroadcastOutcome,

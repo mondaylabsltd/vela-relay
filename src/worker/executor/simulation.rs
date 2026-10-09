@@ -2,7 +2,9 @@
 //! order (`eth_simulateV1` → deployed Pimlico `eth_call` → `debug_traceCall`)
 //! and every interpretation rule live in `vela_relay_core::simulation`; this
 //! module owns only the transport sequencing and the automatic contract
-//! deployment hook.
+//! deployment hook. On a chain known or recently proven to lack
+//! `eth_simulateV1` (core `simulate_v1_turn`) that tier is asked last, and only
+//! for what the other two could not decide.
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use serde_json::{Value, json};
@@ -12,8 +14,9 @@ pub(super) use vela_relay_core::simulation::{
     SimulationVerdict,
 };
 use vela_relay_core::simulation::{
-    debug_trace_params, parse_simulation, parse_trace_simulation, parse_u256,
-    pimlico_contracts_for_treasury, revert_reports_nonce_mismatch, simulate_params,
+    SIMULATE_V1, SimulateV1Turn, debug_trace_params, parse_simulation, parse_trace_simulation,
+    parse_u256, pimlico_contracts_for_treasury, revert_reports_nonce_mismatch, simulate_params,
+    simulate_v1_turn,
 };
 
 use super::{
@@ -36,6 +39,7 @@ enum PimlicoContractAvailability {
 /// fallback because it works through ordinary `eth_call`. If the pair is absent, the treasury
 /// deploys it durably through the canonical CREATE2 deployer and this batch waits for its receipt.
 /// `debug_traceCall` remains a fallback when automatic deployment is unavailable.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn simulate_individually(
     rpc: &TrustedRpcClient,
     chain_id: u64,
@@ -47,49 +51,141 @@ pub(super) async fn simulate_individually(
     hashes: &[B256],
 ) -> Vec<SimulationVerdict<SimulationResult>> {
     debug_assert_eq!(operations.len(), hashes.len());
-    let calls = operations
-        .iter()
-        .map(|operation| RpcBatchCall {
-            method: "eth_simulateV1",
-            params: simulate_params(
-                relayer,
+    let every = (0..operations.len()).collect::<Vec<_>>();
+    let turn = simulate_v1_turn(chain_id, rpc.lacks_method(chain_id, SIMULATE_V1));
+    let mut verdicts = match turn {
+        SimulateV1Turn::First => {
+            simulate_v1_individually(
+                rpc,
+                chain_id,
                 entry_point,
-                handle_ops_calldata(std::slice::from_ref(&operation.packed), beneficiary),
-            ),
-        })
-        .collect::<Vec<_>>();
+                relayer,
+                beneficiary,
+                operations,
+                hashes,
+                &every,
+            )
+            .await
+        }
+        SimulateV1Turn::Last => every
+            .iter()
+            .map(|_| SimulationVerdict::Transient("individual simulation method unavailable"))
+            .collect(),
+    };
+    simulate_individually_without_v1(
+        rpc,
+        chain_id,
+        entry_point,
+        relayer,
+        beneficiary,
+        deployer,
+        operations,
+        hashes,
+        &mut verdicts,
+    )
+    .await;
+    if turn == SimulateV1Turn::Last {
+        let undecided = transient_indexes(&verdicts);
+        if !undecided.is_empty() {
+            let last = simulate_v1_individually(
+                rpc,
+                chain_id,
+                entry_point,
+                relayer,
+                beneficiary,
+                operations,
+                hashes,
+                &undecided,
+            )
+            .await;
+            for (index, verdict) in undecided.into_iter().zip(last) {
+                if !matches!(verdict, SimulationVerdict::Transient(_)) {
+                    verdicts[index] = verdict;
+                }
+            }
+        }
+    }
+    verdicts
+}
 
-    let mut verdicts: Vec<SimulationVerdict<SimulationResult>> =
-        match rpc.batch(chain_id, &calls).await {
-            Ok(responses) => responses
-                .into_iter()
-                .zip(hashes)
-                .map(|(response, expected_hash)| match response {
-                    Ok(value) => parse_simulation(value, entry_point, &[*expected_hash]),
-                    Err(RpcError::Reverted { .. }) => {
-                        // `eth_simulateV1` reports a real call verdict inside `result`. A top-level
-                        // error means the RPC could not perform the method, even if its message says
-                        // revert.
-                        SimulationVerdict::Transient("individual simulation method unavailable")
-                    }
-                    Err(_) => SimulationVerdict::Transient("individual simulation RPC unavailable"),
-                })
-                .collect(),
-            Err(_) => hashes
-                .iter()
-                .map(|_| SimulationVerdict::Transient("individual simulation RPC unavailable"))
-                .collect(),
-        };
-
-    let fallback_indexes = verdicts
+fn transient_indexes(verdicts: &[SimulationVerdict<SimulationResult>]) -> Vec<usize> {
+    verdicts
         .iter()
         .enumerate()
         .filter_map(|(index, verdict)| {
             matches!(verdict, SimulationVerdict::Transient(_)).then_some(index)
         })
+        .collect()
+}
+
+/// The `eth_simulateV1` tier for the candidates at `indexes`, one verdict per
+/// index; what the walk showed about the method goes into the chain's memory.
+#[allow(clippy::too_many_arguments)]
+async fn simulate_v1_individually(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    entry_point: Address,
+    relayer: Address,
+    beneficiary: Address,
+    operations: &[PackedOperation],
+    hashes: &[B256],
+    indexes: &[usize],
+) -> Vec<SimulationVerdict<SimulationResult>> {
+    let calls = indexes
+        .iter()
+        .map(|index| RpcBatchCall {
+            method: SIMULATE_V1,
+            params: simulate_params(
+                relayer,
+                entry_point,
+                handle_ops_calldata(
+                    std::slice::from_ref(&operations[*index].packed),
+                    beneficiary,
+                ),
+            ),
+        })
         .collect::<Vec<_>>();
+    let (responses, answers) = rpc.batch_walk(chain_id, &calls).await;
+    rpc.note_method_walk(chain_id, SIMULATE_V1, &answers);
+    match responses {
+        Ok(responses) => responses
+            .into_iter()
+            .zip(indexes)
+            .map(|(response, index)| match response {
+                Ok(value) => parse_simulation(value, entry_point, &[hashes[*index]]),
+                Err(RpcError::Reverted { .. }) => {
+                    // `eth_simulateV1` reports a real call verdict inside `result`. A top-level
+                    // error means the RPC could not perform the method, even if its message says
+                    // revert.
+                    SimulationVerdict::Transient("individual simulation method unavailable")
+                }
+                Err(_) => SimulationVerdict::Transient("individual simulation RPC unavailable"),
+            })
+            .collect(),
+        Err(_) => indexes
+            .iter()
+            .map(|_| SimulationVerdict::Transient("individual simulation RPC unavailable"))
+            .collect(),
+    }
+}
+
+/// The Pimlico `eth_call` (deploying the pair when absent) and
+/// `debug_traceCall` tiers for every candidate still undecided (`Transient`).
+#[allow(clippy::too_many_arguments)]
+async fn simulate_individually_without_v1(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    entry_point: Address,
+    relayer: Address,
+    beneficiary: Address,
+    deployer: &SimulationContractDeployer,
+    operations: &[PackedOperation],
+    hashes: &[B256],
+    verdicts: &mut [SimulationVerdict<SimulationResult>],
+) {
+    let fallback_indexes = transient_indexes(verdicts);
     if fallback_indexes.is_empty() {
-        return verdicts;
+        return;
     }
     let pimlico_contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
         PimlicoContractAvailability::Ready(contracts) => Some(contracts),
@@ -102,7 +198,7 @@ pub(super) async fn simulate_individually(
                             "Pimlico simulation-contract deployment is pending confirmation",
                         );
                     }
-                    return verdicts;
+                    return;
                 }
                 SimulationDeploymentState::Unavailable => None,
             }
@@ -127,7 +223,7 @@ pub(super) async fn simulate_individually(
         }
     }
     if trace_indexes.is_empty() {
-        return verdicts;
+        return;
     }
     let trace_calls = trace_indexes
         .iter()
@@ -153,9 +249,9 @@ pub(super) async fn simulate_individually(
             ),
         };
     }
-    verdicts
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn simulate_bundle(
     rpc: &TrustedRpcClient,
     chain_id: u64,
@@ -173,60 +269,120 @@ pub(super) async fn simulate_bundle(
             .collect::<Vec<_>>(),
         beneficiary,
     );
-    match rpc
-        .call(
+    let turn = simulate_v1_turn(chain_id, rpc.lacks_method(chain_id, SIMULATE_V1));
+    if turn == SimulateV1Turn::First
+        && let Some(verdict) = simulate_v1_bundle(
+            rpc,
             chain_id,
-            "eth_simulateV1",
-            simulate_params(relayer, entry_point, calldata.clone()),
+            entry_point,
+            relayer,
+            calldata.clone(),
+            hashes,
         )
         .await
     {
-        Ok(value) => parse_simulation(value, entry_point, hashes),
-        Err(_) => {
-            let contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
-                PimlicoContractAvailability::Ready(contracts) => Some(contracts),
-                PimlicoContractAvailability::Missing(contracts) => {
-                    match deployer.ensure(chain_id, contracts).await {
-                        SimulationDeploymentState::Ready => Some(contracts),
-                        SimulationDeploymentState::Pending => {
-                            return SimulationVerdict::Pending(
-                                "Pimlico simulation-contract deployment is pending confirmation",
-                            );
-                        }
-                        SimulationDeploymentState::Unavailable => None,
-                    }
+        return verdict;
+    }
+    let verdict = simulate_bundle_without_v1(
+        rpc,
+        chain_id,
+        entry_point,
+        relayer,
+        beneficiary,
+        deployer,
+        calldata.clone(),
+        hashes,
+    )
+    .await;
+    if turn == SimulateV1Turn::Last
+        && matches!(verdict, SimulationVerdict::Transient(_))
+        && let Some(last) =
+            simulate_v1_bundle(rpc, chain_id, entry_point, relayer, calldata, hashes).await
+        && !matches!(last, SimulationVerdict::Transient(_))
+    {
+        return last;
+    }
+    verdict
+}
+
+/// The `eth_simulateV1` tier for the whole bundle: `None` when no endpoint
+/// performed it. What the walk showed goes into the chain's memory.
+async fn simulate_v1_bundle(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    entry_point: Address,
+    relayer: Address,
+    calldata: Bytes,
+    hashes: &[B256],
+) -> Option<SimulationVerdict<SimulationResult>> {
+    let (response, answers) = rpc
+        .call_walk(
+            chain_id,
+            SIMULATE_V1,
+            simulate_params(relayer, entry_point, calldata),
+        )
+        .await;
+    rpc.note_method_walk(chain_id, SIMULATE_V1, &answers);
+    response
+        .ok()
+        .map(|value| parse_simulation(value, entry_point, hashes))
+}
+
+/// The Pimlico `eth_call` (as `eth_estimateGas` of the bundle, deploying the
+/// pair when absent) and `debug_traceCall` tiers for the whole bundle.
+#[allow(clippy::too_many_arguments)]
+async fn simulate_bundle_without_v1(
+    rpc: &TrustedRpcClient,
+    chain_id: u64,
+    entry_point: Address,
+    relayer: Address,
+    beneficiary: Address,
+    deployer: &SimulationContractDeployer,
+    calldata: Bytes,
+    hashes: &[B256],
+) -> SimulationVerdict<SimulationResult> {
+    let contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
+        PimlicoContractAvailability::Ready(contracts) => Some(contracts),
+        PimlicoContractAvailability::Missing(contracts) => {
+            match deployer.ensure(chain_id, contracts).await {
+                SimulationDeploymentState::Ready => Some(contracts),
+                SimulationDeploymentState::Pending => {
+                    return SimulationVerdict::Pending(
+                        "Pimlico simulation-contract deployment is pending confirmation",
+                    );
                 }
-                PimlicoContractAvailability::Unavailable => None,
-            };
-            if let Some(contracts) = contracts {
-                let verdict = simulate_bundle_with_eth_call(
-                    rpc,
-                    chain_id,
-                    entry_point,
-                    relayer,
-                    calldata.clone(),
-                    hashes,
-                    contracts,
-                )
-                .await;
-                if !matches!(verdict, SimulationVerdict::Transient(_)) {
-                    return verdict;
-                }
-            }
-            match rpc
-                .call(
-                    chain_id,
-                    "debug_traceCall",
-                    debug_trace_params(relayer, entry_point, calldata),
-                )
-                .await
-            {
-                Ok(value) => parse_trace_simulation(value, entry_point, hashes),
-                Err(_) => SimulationVerdict::Transient(
-                    "no trusted executor RPC supports eth_simulateV1, deployed Pimlico eth_call, or debug_traceCall",
-                ),
+                SimulationDeploymentState::Unavailable => None,
             }
         }
+        PimlicoContractAvailability::Unavailable => None,
+    };
+    if let Some(contracts) = contracts {
+        let verdict = simulate_bundle_with_eth_call(
+            rpc,
+            chain_id,
+            entry_point,
+            relayer,
+            calldata.clone(),
+            hashes,
+            contracts,
+        )
+        .await;
+        if !matches!(verdict, SimulationVerdict::Transient(_)) {
+            return verdict;
+        }
+    }
+    match rpc
+        .call(
+            chain_id,
+            "debug_traceCall",
+            debug_trace_params(relayer, entry_point, calldata),
+        )
+        .await
+    {
+        Ok(value) => parse_trace_simulation(value, entry_point, hashes),
+        Err(_) => SimulationVerdict::Transient(
+            "no trusted executor RPC supports eth_simulateV1, deployed Pimlico eth_call, or debug_traceCall",
+        ),
     }
 }
 
@@ -300,6 +456,7 @@ async fn simulate_with_pimlico(
                 actual_gas_used: U256::ZERO,
             }],
             logs: Vec::new(),
+            full_execution: false,
         }),
         Err(RpcError::Reverted { message, data }) => {
             if revert_reports_nonce_mismatch(&message, data.as_deref()) {
@@ -356,6 +513,7 @@ async fn simulate_bundle_with_eth_call(
                     })
                     .collect(),
                 logs: Vec::new(),
+                full_execution: false,
             }),
             None => SimulationVerdict::Transient(
                 "Pimlico eth_call fallback returned an invalid eth_estimateGas quantity",

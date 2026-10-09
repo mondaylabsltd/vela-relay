@@ -5,8 +5,10 @@
 //! (`broadcast`); this module owns only transport policy (Constitution,
 //! Shell-owned concerns).
 //!
-//! Caches live per isolate (`thread_local`): the validated-URL set and the
-//! directory URL list — the same lifetimes the docker client gets from its
+//! Caches live per isolate (`thread_local`): the validated-URL set, the
+//! directory URL list, the endpoints cooling down after a failed chain check
+//! or a timeout, and the methods a walk proved the chain's endpoints lack
+//! (core `rpc_walk`) — the same lifetimes the docker client gets from its
 //! process-wide maps, scoped to one workerd isolate.
 
 use std::{
@@ -17,8 +19,12 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use vela_relay_core::{broadcast as core_broadcast, rpc_host::RpcHostPolicy};
-use worker::{Delay, Env, Fetch, Headers, Method, Request, RequestInit};
+use vela_relay_core::{
+    broadcast as core_broadcast,
+    rpc_host::RpcHostPolicy,
+    rpc_walk::{self, EndpointCooldowns, MethodAnswer, MissingMethods},
+};
+use worker::{Date, Delay, Env, Fetch, Headers, Method, Request, RequestInit};
 
 use super::market;
 use crate::config::CfConfig;
@@ -80,6 +86,8 @@ impl Display for RpcError {
 thread_local! {
     static DIRECTORY_URLS: RefCell<HashMap<u64, Vec<String>>> = RefCell::new(HashMap::new());
     static VALIDATED_URLS: RefCell<HashSet<(u64, String)>> = RefCell::new(HashSet::new());
+    static MISSING_METHODS: RefCell<MissingMethods> = RefCell::new(MissingMethods::default());
+    static COOLDOWNS: RefCell<EndpointCooldowns> = RefCell::new(EndpointCooldowns::default());
     static REQUEST_ID: Cell<u64> = const { Cell::new(1) };
 }
 
@@ -112,20 +120,51 @@ impl<'env> TrustedRpcClient<'env> {
         method: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        let urls = self.urls_or_error(chain_id).await?;
+        self.call_walk(chain_id, method, params).await.0
+    }
+
+    /// [`Self::call`], also reporting what each endpoint that answered said
+    /// about `method` (core `rpc_walk`).
+    pub async fn call_walk(
+        &self,
+        chain_id: u64,
+        method: &str,
+        params: Value,
+    ) -> (Result<Value, RpcError>, Vec<MethodAnswer>) {
+        let mut answers = Vec::new();
+        let urls = match self.urls_or_error(chain_id).await {
+            Ok(urls) => urls,
+            Err(error) => return (Err(error), answers),
+        };
         for url in urls {
             if self.validate_chain(chain_id, &url).await.is_err() {
                 continue;
             }
-            match self.request(&url, method, params.clone()).await {
-                Ok(response) => match response.into_result_and_error() {
-                    (Some(result), None) => return Ok(result),
-                    _ => continue,
-                },
-                Err(_) => continue,
+            let Ok(response) = self.request(chain_id, &url, method, params.clone()).await else {
+                continue;
+            };
+            answers.extend(response.method_answer());
+            if let (Some(result), None) = response.into_result_and_error() {
+                return (Ok(result), answers);
             }
         }
-        Err(RpcError::Unavailable)
+        (Err(RpcError::Unavailable), answers)
+    }
+
+    /// Whether a recent walk proved this chain's endpoints lack `method`.
+    pub fn lacks_method(&self, chain_id: u64, method: &str) -> bool {
+        let now = Date::now().as_millis();
+        MISSING_METHODS.with(|missing| missing.borrow().lacks(chain_id, method, now))
+    }
+
+    /// Folds a finished walk for `method` into the chain's memory.
+    pub fn note_method_walk(&self, chain_id: u64, method: &str, answers: &[MethodAnswer]) {
+        let now = Date::now().as_millis();
+        MISSING_METHODS.with(|missing| {
+            missing
+                .borrow_mut()
+                .note_walk(chain_id, method, answers, now);
+        });
     }
 
     pub async fn simulate(
@@ -139,7 +178,7 @@ impl<'env> TrustedRpcClient<'env> {
             if self.validate_chain(chain_id, &url).await.is_err() {
                 continue;
             }
-            match self.request(&url, method, params.clone()).await {
+            match self.request(chain_id, &url, method, params.clone()).await {
                 Ok(response) => match response.into_result_and_error() {
                     (Some(result), None) => return Ok(result),
                     (None, Some(error)) if error.is_execution_revert() => {
@@ -161,6 +200,30 @@ impl<'env> TrustedRpcClient<'env> {
         chain_id: u64,
         calls: &[RpcBatchCall<'_>],
     ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
+        self.batch_walk(chain_id, calls).await.0
+    }
+
+    /// [`Self::batch`], also reporting what each endpoint said about each
+    /// call it answered (core `rpc_walk`).
+    pub async fn batch_walk(
+        &self,
+        chain_id: u64,
+        calls: &[RpcBatchCall<'_>],
+    ) -> (
+        Result<Vec<Result<Value, RpcError>>, RpcError>,
+        Vec<MethodAnswer>,
+    ) {
+        let mut answers = Vec::new();
+        let result = self.batch_inner(chain_id, calls, &mut answers).await;
+        (result, answers)
+    }
+
+    async fn batch_inner(
+        &self,
+        chain_id: u64,
+        calls: &[RpcBatchCall<'_>],
+        answers: &mut Vec<MethodAnswer>,
+    ) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
         if calls.is_empty() {
             return Ok(Vec::new());
         }
@@ -174,7 +237,7 @@ impl<'env> TrustedRpcClient<'env> {
             if self.validate_chain(chain_id, &url).await.is_err() {
                 continue;
             }
-            let payload = unresolved
+            let mut payload = unresolved
                 .iter()
                 .map(|index| {
                     let call = &calls[*index];
@@ -186,12 +249,29 @@ impl<'env> TrustedRpcClient<'env> {
                     })
                 })
                 .collect::<Vec<_>>();
-            let Ok(body) = self.post_json(&url, &Value::Array(payload)).await else {
+            let sent = payload.len();
+            // A lone call goes on its own, not as a batch of one (core
+            // `rpc_walk::batch_replies`).
+            let payload = if sent == 1 {
+                payload.remove(0)
+            } else {
+                Value::Array(payload)
+            };
+            let Ok(body) = self.post_json(chain_id, &url, &payload).await else {
                 continue;
             };
-            let mut responses = match serde_json::from_str::<Vec<UpstreamResponse>>(&body) {
-                Ok(responses) => responses,
-                Err(_) => continue,
+            let Some(mut responses) = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|body| rpc_walk::batch_replies(body, sent))
+                .and_then(|replies| {
+                    replies
+                        .into_iter()
+                        .map(serde_json::from_value::<UpstreamResponse>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()
+                })
+            else {
+                continue;
             };
             saw_batch_response = true;
 
@@ -218,10 +298,9 @@ impl<'env> TrustedRpcClient<'env> {
                     retry.push(index);
                     continue;
                 }
-                match response_by_index
-                    .remove(&index)
-                    .and_then(definitive_batch_result)
-                {
+                let response = response_by_index.remove(&index);
+                answers.extend(response.as_ref().and_then(UpstreamResponse::method_answer));
+                match response.and_then(definitive_batch_result) {
                     Some(result) => results[index] = Some(result),
                     None => retry.push(index),
                 }
@@ -260,6 +339,7 @@ impl<'env> TrustedRpcClient<'env> {
             }
             match self
                 .request(
+                    chain_id,
                     &url,
                     "eth_sendRawTransaction",
                     json!([raw_transaction.clone()]),
@@ -298,12 +378,29 @@ impl<'env> TrustedRpcClient<'env> {
         )
     }
 
+    /// An endpoint is walked only once it reports the chain's id. One that
+    /// does not — wrong chain, an error, no answer — is left out of walks for
+    /// a while (core `rpc_walk::EndpointCooldowns`).
     async fn validate_chain(&self, chain_id: u64, url: &str) -> Result<(), RpcError> {
         let key = (chain_id, url.to_owned());
         if VALIDATED_URLS.with(|validated| validated.borrow().contains(&key)) {
             return Ok(());
         }
-        let response = self.request(url, "eth_chainId", json!([])).await?;
+        let checked = self.check_chain(chain_id, url).await;
+        match checked {
+            Ok(()) => {
+                VALIDATED_URLS.with(|validated| validated.borrow_mut().insert(key));
+                COOLDOWNS.with(|cooldowns| cooldowns.borrow_mut().clear(chain_id, url));
+            }
+            Err(_) => self.cool(chain_id, url),
+        }
+        checked
+    }
+
+    async fn check_chain(&self, chain_id: u64, url: &str) -> Result<(), RpcError> {
+        let response = self
+            .request(chain_id, url, "eth_chainId", json!([]))
+            .await?;
         let (result, error) = response.into_result_and_error();
         if error.is_some() {
             return Err(RpcError::InvalidResponse);
@@ -315,12 +412,26 @@ impl<'env> TrustedRpcClient<'env> {
         if returned != chain_id {
             return Err(RpcError::WrongChain);
         }
-        VALIDATED_URLS.with(|validated| validated.borrow_mut().insert(key));
         Ok(())
+    }
+
+    /// Leaves `url` out of the chain's walks for a while — unless it is one
+    /// of the operator's own endpoints, which are never cooled.
+    fn cool(&self, chain_id: u64, url: &str) {
+        if self
+            .explicit_urls
+            .get(&chain_id)
+            .is_some_and(|explicit| explicit.iter().any(|explicit| explicit == url))
+        {
+            return;
+        }
+        let now = Date::now().as_millis();
+        COOLDOWNS.with(|cooldowns| cooldowns.borrow_mut().cool(chain_id, url, now));
     }
 
     async fn request(
         &self,
+        chain_id: u64,
         url: &str,
         method: &str,
         params: Value,
@@ -328,6 +439,7 @@ impl<'env> TrustedRpcClient<'env> {
         let id = next_request_id(1);
         let body = self
             .post_json(
+                chain_id,
                 url,
                 &json!({
                     "jsonrpc": "2.0",
@@ -343,8 +455,9 @@ impl<'env> TrustedRpcClient<'env> {
 
     /// One POST racing the executor deadline — workerd fetch has no native
     /// timeout, so every request is bounded by a `Delay` (docker: reqwest
-    /// connect + request timeouts).
-    async fn post_json(&self, url: &str, payload: &Value) -> Result<String, ()> {
+    /// connect + request timeouts). An endpoint that runs out the deadline is
+    /// cooled: it would cost the whole timeout again on the next walk.
+    async fn post_json(&self, chain_id: u64, url: &str, payload: &Value) -> Result<String, ()> {
         use futures_util::future::{Either, select};
 
         let request = async {
@@ -368,12 +481,18 @@ impl<'env> TrustedRpcClient<'env> {
         let deadline = Delay::from(std::time::Duration::from_millis(self.rpc_timeout_ms));
         match select(std::pin::pin!(request), deadline).await {
             Either::Left((result, _)) => result,
-            Either::Right(((), _)) => Err(()),
+            Either::Right(((), _)) => {
+                self.cool(chain_id, url);
+                Err(())
+            }
         }
     }
 
+    /// The endpoints a walk asks: every usable one, less those cooling down.
     async fn urls_or_error(&self, chain_id: u64) -> Result<Vec<String>, RpcError> {
         let urls = self.urls(chain_id).await;
+        let now = Date::now().as_millis();
+        let urls = COOLDOWNS.with(|cooldowns| cooldowns.borrow().walkable(chain_id, urls, now));
         if urls.is_empty() {
             Err(RpcError::NoTrustedRpc(chain_id))
         } else {
@@ -479,6 +598,26 @@ impl UpstreamError {
 }
 
 impl UpstreamResponse {
+    /// What this reply says about the method it answers: an error object is
+    /// classified (a revert means the node ran the method), a bare `result`
+    /// is served, and a reply with neither is no answer.
+    fn method_answer(&self) -> Option<MethodAnswer> {
+        if let Some(error) = self
+            .fields
+            .get("error")
+            .and_then(|value| serde_json::from_value::<UpstreamError>(value.clone()).ok())
+        {
+            return Some(if error.is_execution_revert() {
+                MethodAnswer::Refused
+            } else {
+                rpc_walk::method_error_answer(error.code, error.message.as_deref().unwrap_or(""))
+            });
+        }
+        self.fields
+            .contains_key("result")
+            .then_some(MethodAnswer::Served)
+    }
+
     fn into_result_and_error(mut self) -> (Option<Value>, Option<UpstreamError>) {
         let result = self.fields.remove("result");
         let error = self

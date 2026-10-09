@@ -123,6 +123,9 @@ For native-gas chains, a low relayer balance triggers a durable treasury top-up.
 the greater of the next bundle prefund multiplied by `5` and the configured float target. If
 Binance supplies the native USD price, a single top-up is capped at USD 20; without a price the
 static `VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI` cap is used instead (10 native tokens by default).
+The pass that sends a top-up waits for it for about two blocks (at least 2 s, at most 5 s), and
+signs the bundle as soon as it is mined. A top-up that takes longer is picked up by the next
+pass, a few seconds later.
 
 ## Telegram executor alerts
 
