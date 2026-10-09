@@ -14,6 +14,7 @@
 //! - [`lifecycle`] — the single authoritative status transition table and the
 //!   patch/bundle-submission decisions every durable status write flows
 //!   through.
+//! - [`rejection`] — the machine reason every terminal rejection carries.
 //! - [`vault`] — deterministic HKDF key derivation for the treasury and the
 //!   relayer pool, and sender→lane routing.
 //! - [`gas_math`] — EIP-1559 price arithmetic: fee-history interpretation,
@@ -66,6 +67,7 @@ pub mod lifecycle;
 pub mod pace;
 pub mod quote;
 pub mod receipt;
+pub mod rejection;
 pub mod rpc_host;
 pub mod rpc_walk;
 pub mod settlement;

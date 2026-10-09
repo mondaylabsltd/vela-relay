@@ -424,9 +424,34 @@ required before the relayer submits `handleOps`.
 `pimlico_getUserOperationStatus` reads the one-hour Redis record and returns one of
 `not_found`, `queued`, `not_submitted`, `submitted`, `rejected`, `included`, or `failed`, with a
 `transactionHash` when one is known. A queued retry or locally rejected operation also returns
-`lastExecutorStage`, `lastExecutorError`, and `lastExecutorAttemptAtMs`; these show whether it
-is blocked in simulation, funding, broadcast, or rejected for a reason such as insufficient
-in-band reimbursement.
+`last_executor_stage`, `last_executor_error`, and `last_executor_attempt_at_ms` (snake_case on
+the wire); these show whether it is blocked in simulation, funding, broadcast, or rejected for a
+reason such as insufficient in-band reimbursement.
+
+A `rejected` or `failed` operation also returns `rejection_reason`, a code a wallet can put into
+words (`vela_relay_core::rejection`). The executor stage alone cannot: `in_band_settlement`
+covers a market that outran the payment, a payment under the minimum, and a payment that could
+not be read.
+
+| `rejection_reason` | when | in plain words |
+|---|---|---|
+| `fee_below_market` | network fees stayed above what the signed fee covers through the whole hold (about 35 minutes) | Network fees stayed above the amount you approved, so nothing was sent. Send again to use the current fee. |
+| `fee_below_minimum` | the fee is under the `$0.01` minimum at settlement (`docs/fees.md` §1c) | The fee was below the $0.01 minimum, so nothing was sent. |
+| `fee_payment_invalid` | the fee payment is missing, unreadable, in an unsupported combination, or not proven by the transfer logs | The fee payment could not be verified, so nothing was sent. |
+| `nonce_used` | another operation of the account already used this nonce on-chain | Another transaction from this account went through first, so this one was not sent. |
+| `simulation_failed` | the operation fails when simulated: it would revert | This transaction would fail on the network, so it was not sent. |
+| `invalid_operation` | the queued payload is malformed | The transaction was malformed and was not sent. |
+| `unsupported_fee_token` | Tempo: a fee token other than pathUSD | This network takes fees only in pathUSD. |
+| `relay_gave_up` | the relay stopped retrying without sending it (dead letter) | The relay could not send this transaction. Nothing was sent; try again. |
+| `reverted_onchain` | it was mined, but its execution failed | The transaction failed on the network. |
+| `bundle_failed` | the whole bundle transaction reverted | The transaction failed on the network. |
+| `unknown` | a reason this relay version does not know | Generic failure wording. |
+
+`nonce_in_flight` is never a record's reason: it is only the `data.reason` of the synchronous
+refusal above. A record rejected before `rejection_reason` existed gets one from its stage:
+`nonce` → `nonce_used`, `simulation` → `simulation_failed`, `dead_letter` → `relay_gave_up`,
+`queue` → `invalid_operation`, `tempo_fee_token` → `unsupported_fee_token`, `in_band_settlement`
+→ `fee_below_market`; one with a receipt → `reverted_onchain`.
 `eth_getUserOperationByHash` returns the original stored operation while its record remains
 available. `eth_getUserOperationReceipt` returns `null` until the operation is included and its
 receipt is known.

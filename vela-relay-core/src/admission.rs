@@ -976,6 +976,7 @@ mod tests {
             last_executor_stage: None,
             last_executor_error: None,
             last_executor_attempt_at_ms: None,
+            rejection_reason: None,
         }
     }
 

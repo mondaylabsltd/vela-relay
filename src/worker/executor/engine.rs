@@ -1560,7 +1560,7 @@ impl BatchShell<'_> {
                 let (stage, reason) = cause.diagnostic();
                 let written = engine
                     .store
-                    .mark_rejected_with_executor_reason(hash, stage, &reason)
+                    .mark_rejected_with_executor_reason(hash, stage, &reason, cause.code())
                     .await;
                 match written {
                     Ok(_) => {
@@ -1625,10 +1625,11 @@ impl BatchShell<'_> {
                 hash,
                 stage,
                 reason,
+                code,
             } => {
                 match engine
                     .store
-                    .mark_rejected_with_executor_reason(hash, stage, reason)
+                    .mark_rejected_with_executor_reason(hash, stage, reason, *code)
                     .await
                 {
                     // The field-rich rejection warns are core-driven

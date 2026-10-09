@@ -42,6 +42,23 @@ pub fn settlement_rejection_reason(paid: U256, required: U256, stable_logs_valid
     }
 }
 
+/// The machine reason for an in-band settlement rejection
+/// (`rejection::RejectionReason`): a payment that could not be read or proven,
+/// one under the relay's minimum, or one the network's fees outran.
+pub fn settlement_rejection_code(
+    evaluation: &SettlementEvaluation,
+    stable_logs_valid: bool,
+) -> crate::rejection::RejectionReason {
+    use crate::rejection::RejectionReason;
+    if !stable_logs_valid || !evaluation.is_shortfall() || evaluation.paid_amount.is_zero() {
+        RejectionReason::FeePaymentInvalid
+    } else if evaluation.paid_amount < evaluation.minimum_amount {
+        RejectionReason::FeeBelowMinimum
+    } else {
+        RejectionReason::FeeBelowMarket
+    }
+}
+
 const EXECUTE_USER_OP_SELECTOR: [u8; 4] = [0x7b, 0xb3, 0x74, 0x28];
 const MULTISEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -1219,7 +1236,8 @@ mod tests {
         SettlementInput, SettlementLog, SettlementRejection, StablecoinConfig,
         affordable_fee_per_gas, evaluate_batch, inclusion_floor_fee_per_gas,
         native_to_usd_stable_ceil, parse_market_usd_price, parse_reimbursement,
-        settlement_hold_reason, settlement_rejection_reason, verify_stable_transfer_logs,
+        settlement_hold_reason, settlement_rejection_code, settlement_rejection_reason,
+        verify_stable_transfer_logs,
     };
 
     #[test]
@@ -1597,6 +1615,65 @@ mod tests {
         );
         assert!(!stable_result.operations[0].accepted());
         assert!(stable_result.operations[1].accepted());
+    }
+
+    /// Each in-band rejection names its cause: a payment under the minimum,
+    /// one the market outran, one that could not be read or proven.
+    #[test]
+    fn a_settlement_rejection_names_why_in_a_code() {
+        use crate::rejection::RejectionReason;
+        let config = native_config(18);
+        let evaluate = |paid: u64, cost: u64| {
+            let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(paid))]);
+            evaluate_batch(
+                RECIPIENT,
+                &config,
+                &[SettlementInput {
+                    call_data: &call_data,
+                    gas_native_cost: U256::from(cost),
+                }],
+                None,
+            )
+            .unwrap()
+            .operations[0]
+                .clone()
+        };
+        // Under the 0.000001-coin floor, the gas costing next to nothing.
+        let dust = evaluate(999_999_999_999, 1);
+        assert_eq!(
+            settlement_rejection_code(&dust, true),
+            RejectionReason::FeeBelowMinimum
+        );
+        // Over the floor, under 1.1 × the gas cost.
+        let outran = evaluate(2_000_000_000_000, 2_000_000_000_000);
+        assert_eq!(
+            settlement_rejection_code(&outran, true),
+            RejectionReason::FeeBelowMarket
+        );
+        // A stablecoin transfer the logs do not prove.
+        let paid = evaluate(2_000_000_000_000, 1);
+        assert!(paid.accepted());
+        assert_eq!(
+            settlement_rejection_code(&paid, false),
+            RejectionReason::FeePaymentInvalid
+        );
+        // Calldata that is no payment at all.
+        let unreadable = evaluate_batch(
+            RECIPIENT,
+            &config,
+            &[SettlementInput {
+                call_data: &[0xde, 0xad],
+                gas_native_cost: U256::from(1u8),
+            }],
+            None,
+        )
+        .unwrap()
+        .operations[0]
+            .clone();
+        assert_eq!(
+            settlement_rejection_code(&unreadable, true),
+            RejectionReason::FeePaymentInvalid
+        );
     }
 
     #[test]

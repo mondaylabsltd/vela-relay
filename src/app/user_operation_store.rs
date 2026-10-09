@@ -8,6 +8,8 @@ use redis::{FromRedisValue, aio::MultiplexedConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use vela_relay_core::rejection::RejectionReason;
+
 use crate::{app::rpc::types::UserOperationStatusKind, utils::config::RedisConfig};
 
 const USER_OPERATION_TTL_SECS: u64 = 60 * 60;
@@ -1096,13 +1098,15 @@ impl UserOperationStatusStore {
         Ok(reply.is_some())
     }
 
-    /// Records a terminal local rejection with a bounded, client-safe explanation. On-chain
-    /// rejections remain represented by their receipt event instead.
+    /// Records a terminal local rejection with a bounded, client-safe explanation and the
+    /// machine reason a wallet words it by. On-chain rejections remain represented by their
+    /// receipt event instead.
     pub async fn mark_rejected_with_executor_reason(
         &self,
         user_operation_hash: &str,
         stage: &str,
         reason: &str,
+        code: RejectionReason,
     ) -> Result<bool, UserOperationStatusStoreError> {
         let attempted_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1118,6 +1122,7 @@ impl UserOperationStatusStore {
                 "lastExecutorStage": truncate_diagnostic(stage, 64),
                 "lastExecutorError": truncate_diagnostic(reason, 512),
                 "lastExecutorAttemptAtMs": attempted_at_ms,
+                "rejectionReason": code.as_str(),
             }),
         )
         .await

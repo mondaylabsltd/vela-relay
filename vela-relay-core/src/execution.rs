@@ -300,6 +300,8 @@ pub enum ExecutionOperation {
         hash: String,
         stage: &'static str,
         reason: String,
+        /// The machine reason the record carries (`rejectionReason`).
+        code: crate::rejection::RejectionReason,
     },
     /// Park item `index` in the durable delayed inbox (post-increment attempt
     /// count comes back). `cause` carries the business context for the
@@ -495,6 +497,18 @@ pub enum RejectionCause {
 }
 
 impl RejectionCause {
+    /// The machine reason a rejection leaves on the record
+    /// (`rejectionReason`), for the wallet to put into words.
+    pub fn code(&self) -> crate::rejection::RejectionReason {
+        use crate::rejection::RejectionReason;
+        match self {
+            Self::InvalidQueuedPayload { .. } => RejectionReason::InvalidOperation,
+            Self::SimulationRejected { .. } => RejectionReason::SimulationFailed,
+            Self::StaleNonce { .. } => RejectionReason::NonceUsed,
+            Self::UnsupportedTempoFeeToken { .. } => RejectionReason::UnsupportedFeeToken,
+        }
+    }
+
     /// The executor stage and reason a rejection leaves on the record, so
     /// what a client reads says why. A rejection used to write only its
     /// status and leave the last in-progress note beside it: the Arbitrum swap
@@ -1832,6 +1846,7 @@ async fn execute_with_lane_lease(
                 hash: candidate.hash_string.clone(),
                 stage: "in_band_settlement",
                 reason: reason.clone(),
+                code: crate::settlement::settlement_rejection_code(evaluation, stable_logs_valid),
             },
         )
         .await?
@@ -2158,12 +2173,20 @@ async fn execute_tempo_bundle(
                 .ok_or_else(|| "Tempo settlement markup overflow".to_owned())?;
         if paid < required || !stable_logs_valid {
             let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
+            let code = if !stable_logs_valid || paid.is_zero() {
+                crate::rejection::RejectionReason::FeePaymentInvalid
+            } else if paid < U256::from(10u128.pow(crate::tempo::PATH_USD_DECIMALS - 2)) {
+                crate::rejection::RejectionReason::FeeBelowMinimum
+            } else {
+                crate::rejection::RejectionReason::FeeBelowMarket
+            };
             if let ExecutionOutcome::Failed { message } = request(
                 ctx,
                 ExecutionOperation::MarkRejectedWithReason {
                     hash: candidate.hash_string.clone(),
                     stage: "in_band_settlement",
                     reason: reason.clone(),
+                    code,
                 },
             )
             .await?
@@ -3613,6 +3636,7 @@ mod tests {
             last_executor_stage: None,
             last_executor_error: None,
             last_executor_attempt_at_ms: None,
+            rejection_reason: None,
         };
         Fixture {
             routed,
@@ -5236,6 +5260,8 @@ mod tests {
                 hash: fixture.hash_string.clone(),
                 stage: "in_band_settlement",
                 reason: reason.into(),
+                // Over the one-unit minimum, under the market: outran.
+                code: crate::rejection::RejectionReason::FeeBelowMarket,
             },
             ExecutionOutcome::Done,
         );
@@ -5264,7 +5290,8 @@ mod tests {
 
     /// With a fresh price the minimum is `$0.01` of the coin (accepted down to
     /// 90% of it). A payment over the gas cost but under that minimum is held
-    /// like any shortfall, and once the budget is spent it is rejected.
+    /// like any shortfall, and once the budget is spent it is rejected with
+    /// the code that says so, not as a fee the market outran.
     #[test]
     fn a_payment_under_the_priced_minimum_is_rejected_as_below_the_minimum() {
         // Six decimals, the coin at $10: 90% of $0.01 is 900 units. The gas
@@ -5338,6 +5365,7 @@ mod tests {
                 hash: fixture.hash_string.clone(),
                 stage: "in_band_settlement",
                 reason: reason.into(),
+                code: crate::rejection::RejectionReason::FeeBelowMinimum,
             },
             ExecutionOutcome::Done,
         );
@@ -5466,6 +5494,7 @@ mod tests {
             last_executor_stage: None,
             last_executor_error: None,
             last_executor_attempt_at_ms: None,
+            rejection_reason: None,
         };
         let mut policy = policy();
         policy.is_tempo = true;
