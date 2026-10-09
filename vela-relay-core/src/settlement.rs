@@ -65,11 +65,12 @@ pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 11_000;
 /// A signed transaction cannot be bumped (the outbox rebroadcasts exact
 /// bytes), so a cap a rising base fee passes waits, and its lane with it,
 /// until the base fee falls back. Over 10.4 days of mainnet (`docs/fees.md`
-/// §2c) a 1.125× floor let 30 s-old `slow` quotes sign caps that were priced
-/// out 5× as often and wedged their lane for up to 9 hours; at 1.25× those
-/// quotes are held instead (0.19% of them rejected after the hold budget,
-/// against 0.01%). A fresh quote is all but unaffected: a block old, it
-/// always funds more than 1.33× the base fee plus its tip. It was 1.5× before the backtest, 1.125× in
+/// §2c, lenient inclusion) a 1.125× floor let 30 s-old `slow` quotes sign
+/// caps that were priced out 5× as often, the longest wedging its lane for
+/// 8.7 hours against 1.9 at 1.25×; at 1.25× those quotes are held instead
+/// (0.19% of them rejected after the hold budget, against 0.01%). A fresh
+/// quote is all but unaffected: a block old, it always funds more than 1.33×
+/// the base fee plus its tip. It was 1.5× before the backtest, and 1.125× in
 /// the backtest's first choice.
 pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 12_500;
 

@@ -347,11 +347,11 @@ alike (`TierTips::resolve`).
   30 gwei — but a faster tier never more than the window's blocks paid at its
   own percentile: BNB Smart Chain's blocks pay 0.05 / 0.05 / 0.057 gwei, and
   twice the node's 0.05 would have made `fast` 40% dearer for nothing. `fast`
-  bids twice `slow` wherever its blocks paid that much. The line is 30%, not one half,
-  because Ethereum's base fee targets half-full blocks: its 20-block average is
-  below 0.5 in 49% of windows and was never below 0.338 over the 10.4 days of
-  §2c, so it always reads busy; BNB Smart Chain's minute reads quiet 92% of
-  the time, Polygon's 93%, Avalanche's always.
+  bids twice `slow` wherever its blocks paid that much. The line is 30%, not
+  one half, because Ethereum's base fee targets half-full blocks: its 20-block
+  average is below 0.5 in 49% of windows and was never below 0.338 over the
+  10.4 days of §2c, so it always reads busy; BNB Smart Chain's minute reads
+  quiet 92% of the time, Polygon's 93%, Avalanche's always.
 
 On Ethereum the node's tip is no guide: on 2026-10-08 `eth_maxPriorityFeePerGas`
 answered 0 while blocks paid a median of 1 gwei, so the relay signed every tier
