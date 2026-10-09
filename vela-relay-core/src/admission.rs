@@ -10,6 +10,12 @@
 //! Crash-window policy is deliberate and unchanged: a queue failure after the
 //! record was created keeps the unadmitted record for recovery — no operation
 //! exists to delete an admission.
+//!
+//! Before any record is written the operation claims its nonce slot
+//! ([`crate::nonce_slot`]): a different operation of the same sender at a
+//! nonce whose holder is still in flight is refused with the
+//! `[existingHash:0x…]` marker, and the same operation again finds its own
+//! hash there and proceeds to the idempotent paths below.
 
 use alloy::primitives::keccak256;
 use crux_core::{App, Command, macros::effect};
@@ -17,6 +23,7 @@ use serde_json::{Value, json};
 
 use crate::{
     broadcast::parse_hex_bytes,
+    nonce_slot::{HolderState, NonceClaim, NonceHolder, NonceSlot},
     settlement::{MIN_NATIVE_FRACTION_DECIMALS, minimum_amount},
     task::{QueuedUserOperation, StoredUserOperation, UserOperation, UserOperationV0_7},
     tempo,
@@ -41,6 +48,24 @@ pub enum AdmissionOperation {
     LoadSettlementAssets,
     FetchTokenDecimals {
         token: String,
+    },
+    /// Claim the operation's nonce slot atomically ([`crate::nonce_slot::claim`]).
+    ClaimNonce {
+        slot: NonceSlot,
+        holder: NonceHolder,
+    },
+    /// Replace the slot's holder, only while it is still the one judged
+    /// final ([`crate::nonce_slot::take_over`]).
+    TakeOverNonce {
+        slot: NonceSlot,
+        judged_user_operation_hash: String,
+        holder: NonceHolder,
+    },
+    /// Give back a slot this admission claimed and then could not use
+    /// ([`crate::nonce_slot::release`]). Best effort.
+    ReleaseNonce {
+        slot: NonceSlot,
+        user_operation_hash: String,
     },
     CreateQueued {
         operation: QueuedUserOperation,
@@ -73,6 +98,10 @@ pub enum AdmissionResult {
         decimals: u32,
     },
     DecimalsUnavailable,
+    NonceClaim {
+        claim: NonceClaim,
+    },
+    NonceReleased,
     Created {
         created: bool,
     },
@@ -115,6 +144,13 @@ pub enum AdmissionOutcome {
         existing_chain_id: u64,
         existing_entry_point: String,
     },
+    /// Another operation of the sender still holds this nonce: refused with
+    /// `RpcError::nonce_in_flight`, naming it.
+    NonceInFlight {
+        existing_user_operation_hash: String,
+        sender_hex: String,
+        nonce: String,
+    },
     Invalid {
         message: String,
     },
@@ -146,6 +182,9 @@ pub struct SubmitRequest {
     /// the admission fingerprint or the durable record — it rides the queue
     /// envelope to the executor, which is the only thing that acts on it.
     pub submission_tier: Option<crate::gas_math::SubmissionTier>,
+    /// The shell's clock (Unix milliseconds): when this admission claims its
+    /// nonce slot, and what an earlier claim's age is judged against.
+    pub now_ms: u64,
 }
 
 #[derive(Default)]
@@ -207,6 +246,7 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
         user_operation,
         settlement_recipient,
         submission_tier,
+        now_ms,
     } = submit;
 
     if !entry_point_is_supported(&entry_point) {
@@ -221,6 +261,18 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
     let entry_point_address = parse_address_field(&entry_point, "entryPoint")
         .map_err(|message| AdmissionOutcome::Invalid { message })?;
     let user_operation_hash = prepared.user_operation_hash(entry_point_address, chain_id);
+
+    let slot = NonceSlot::new(
+        chain_id,
+        entry_point_address,
+        prepared.sender,
+        prepared.nonce,
+    );
+    let claimant = NonceHolder {
+        user_operation_hash: user_operation_hash.clone(),
+        claimed_at_ms: now_ms,
+    };
+    let fresh_claim = hold_nonce_slot(ctx, &slot, &claimant, now_ms).await?;
 
     let created = match request(
         ctx,
@@ -239,8 +291,14 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
         // The shell reports a missing queue backend here, BEFORE the record
         // exists — preserving the historical ordering where the queue handle
         // was checked ahead of the durable write.
-        AdmissionResult::QueueUnavailable => return Err(AdmissionOutcome::QueueUnavailable),
-        _ => return Err(AdmissionOutcome::StoreUnavailable),
+        AdmissionResult::QueueUnavailable => {
+            release_fresh_claim(ctx, fresh_claim, slot, user_operation_hash).await;
+            return Err(AdmissionOutcome::QueueUnavailable);
+        }
+        _ => {
+            release_fresh_claim(ctx, fresh_claim, slot, user_operation_hash).await;
+            return Err(AdmissionOutcome::StoreUnavailable);
+        }
     };
 
     let mut retry = false;
@@ -316,6 +374,99 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
             entry_point,
         }),
         _ => Err(AdmissionOutcome::StoreUnavailable),
+    }
+}
+
+/// Hold the operation's nonce slot, or refuse: `Ok(fresh)` when the slot
+/// names this operation (`fresh` = this admission claimed it), the
+/// [`AdmissionOutcome::NonceInFlight`] refusal while a different operation's
+/// holder is live, `StoreUnavailable` when the store could not answer.
+///
+/// The race between two different operations is settled by the store: claims
+/// and takeovers are atomic, and a takeover replaces only the holder that was
+/// judged here. Whoever loses finds the winner in the slot and, the winner
+/// being in flight, is refused, even before the winner's record is written.
+async fn hold_nonce_slot(
+    ctx: &Ctx,
+    slot: &NonceSlot,
+    claimant: &NonceHolder,
+    now_ms: u64,
+) -> Flow<bool> {
+    let mut reply = request(
+        ctx,
+        AdmissionOperation::ClaimNonce {
+            slot: slot.clone(),
+            holder: claimant.clone(),
+        },
+    )
+    .await;
+    for attempt in 1..=crate::nonce_slot::TAKEOVER_ATTEMPTS {
+        let holder = match reply {
+            AdmissionResult::NonceClaim {
+                claim: NonceClaim::Claimed { fresh },
+            } => return Ok(fresh),
+            AdmissionResult::NonceClaim {
+                claim: NonceClaim::Held { holder },
+            } => holder,
+            _ => return Err(AdmissionOutcome::StoreUnavailable),
+        };
+        let refusal = AdmissionOutcome::NonceInFlight {
+            existing_user_operation_hash: holder.user_operation_hash.clone(),
+            sender_hex: slot.sender.clone(),
+            nonce: slot.nonce_quantity(),
+        };
+        if attempt == crate::nonce_slot::TAKEOVER_ATTEMPTS {
+            // The slot changed hands under every attempt: it is contested
+            // right now, which is reason enough to refuse.
+            return Err(refusal);
+        }
+        let record = match request(
+            ctx,
+            AdmissionOperation::LoadExisting {
+                hash: holder.user_operation_hash.clone(),
+            },
+        )
+        .await
+        {
+            AdmissionResult::Record { record } => record,
+            _ => return Err(AdmissionOutcome::StoreUnavailable),
+        };
+        match crate::nonce_slot::holder_state(record.as_ref(), &holder, now_ms) {
+            HolderState::Live => return Err(refusal),
+            HolderState::Final | HolderState::Abandoned => {}
+        }
+        reply = request(
+            ctx,
+            AdmissionOperation::TakeOverNonce {
+                slot: slot.clone(),
+                judged_user_operation_hash: holder.user_operation_hash,
+                holder: claimant.clone(),
+            },
+        )
+        .await;
+    }
+    Err(AdmissionOutcome::StoreUnavailable)
+}
+
+/// Give back a slot this admission claimed when the admission failed before
+/// its record could exist, so the next operation at the nonce is not refused
+/// for one that never got in. A slot that already named this operation (the
+/// same operation submitted again) is someone's live claim and is kept.
+async fn release_fresh_claim(
+    ctx: &Ctx,
+    fresh_claim: bool,
+    slot: NonceSlot,
+    user_operation_hash: String,
+) {
+    if fresh_claim {
+        let _ = request(
+            ctx,
+            AdmissionOperation::ReleaseNonce {
+                slot,
+                user_operation_hash,
+            },
+        )
+        .await;
     }
 }
 
@@ -419,7 +570,7 @@ async fn validate_in_band_submission(
     }
 
     Err(AdmissionOutcome::Rejected {
-        message: "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin".into(),
+        message: "in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin".into(),
     })
 }
 
@@ -784,6 +935,7 @@ mod tests {
         ExistingAdmissionAction, PreparedUserOperation, SubmitRequest, existing_admission_action,
         parse_address_field, quantity,
     };
+    use crate::nonce_slot::{ADMISSION_GRACE_MS, NonceClaim, NonceHolder, NonceSlot};
     use crate::task::{
         QueuedUserOperation, StoredUserOperation, UserOperation, UserOperationStatus,
         UserOperationV0_7,
@@ -976,6 +1128,7 @@ mod tests {
             last_executor_stage: None,
             last_executor_error: None,
             last_executor_attempt_at_ms: None,
+            rejection_reason: None,
         }
     }
 
@@ -1020,6 +1173,17 @@ mod tests {
                 .resolve(&mut request, result)
                 .expect("resolve must succeed");
             self.absorb(effects);
+        }
+
+        /// This operation claims its nonce slot; the store answers `claim`.
+        fn claim(&mut self, operation: &UserOperation, claim: NonceClaim) {
+            self.step(
+                AdmissionOperation::ClaimNonce {
+                    slot: slot_of(operation),
+                    holder: holder_of(operation, NOW),
+                },
+                AdmissionResult::NonceClaim { claim },
+            );
         }
 
         fn assert_settled(&self, expected: AdmissionOutcome) {
@@ -1085,6 +1249,26 @@ mod tests {
             user_operation: operation,
             settlement_recipient: Some(RECIPIENT.into()),
             submission_tier,
+            now_ms: NOW,
+        }
+    }
+
+    const NOW: u64 = 1_760_000_000_000;
+
+    fn slot_of(operation: &UserOperation) -> NonceSlot {
+        let prepared = PreparedUserOperation::try_from(operation.clone()).unwrap();
+        NonceSlot::new(
+            LOCAL_POLICY_CHAIN,
+            parse_address_field(ENTRY_POINT, "entryPoint").unwrap(),
+            prepared.sender,
+            prepared.nonce,
+        )
+    }
+
+    fn holder_of(operation: &UserOperation, claimed_at_ms: u64) -> NonceHolder {
+        NonceHolder {
+            user_operation_hash: expected_hash(operation),
+            claimed_at_ms,
         }
     }
 
@@ -1110,6 +1294,7 @@ mod tests {
                 stablecoins: Vec::new(),
             },
         );
+        driver.claim(&operation, NonceClaim::Claimed { fresh: true });
         driver.step(
             AdmissionOperation::CreateQueued {
                 operation: QueuedUserOperation {
@@ -1162,6 +1347,7 @@ mod tests {
                 stablecoins: Vec::new(),
             },
         );
+        driver.claim(&operation, NonceClaim::Claimed { fresh: true });
         driver.step(
             AdmissionOperation::CreateQueued {
                 operation: QueuedUserOperation {
@@ -1212,6 +1398,7 @@ mod tests {
                 stablecoins: Vec::new(),
             },
         );
+        driver.claim(&operation, NonceClaim::Claimed { fresh: false });
         driver.step(
             AdmissionOperation::CreateQueued {
                 operation: QueuedUserOperation {
@@ -1248,6 +1435,7 @@ mod tests {
                 stablecoins: Vec::new(),
             },
         );
+        driver.claim(&operation, NonceClaim::Claimed { fresh: false });
         driver.step(
             AdmissionOperation::CreateQueued {
                 operation: QueuedUserOperation {
@@ -1285,6 +1473,7 @@ mod tests {
                 stablecoins: Vec::new(),
             },
         );
+        driver.claim(&operation, NonceClaim::Claimed { fresh: true });
         driver.step(
             AdmissionOperation::CreateQueued {
                 operation: QueuedUserOperation {
@@ -1326,7 +1515,7 @@ mod tests {
             },
         );
         driver.assert_settled(AdmissionOutcome::Rejected {
-            message: "in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin".into(),
+            message: "in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin".into(),
         });
     }
 
@@ -1341,6 +1530,496 @@ mod tests {
             message: "in-band UserOperations must set maxFeePerGas and maxPriorityFeePerGas to 0x0"
                 .into(),
         });
+    }
+    // ----- One live operation per nonce (`nonce_slot`) -----
+
+    /// The same account, the same nonce, a different payment: another hash.
+    fn twin_of(operation: &UserOperation) -> UserOperation {
+        let UserOperation::V0_7(mut twin) = operation.clone() else {
+            unreachable!()
+        };
+        let UserOperation::V0_7(other) = paying_operation(20_000_000_000_000) else {
+            unreachable!()
+        };
+        twin.call_data = other.call_data;
+        let twin = UserOperation::V0_7(twin);
+        assert_ne!(expected_hash(&twin), expected_hash(operation));
+        assert_eq!(slot_of(&twin), slot_of(operation));
+        twin
+    }
+
+    fn assets(driver: &mut Driver) {
+        driver.step(
+            AdmissionOperation::LoadSettlementAssets,
+            AdmissionResult::Assets {
+                native_decimals: 18,
+                stablecoins: Vec::new(),
+            },
+        );
+    }
+
+    fn stored_with(
+        operation: UserOperation,
+        status: UserOperationStatus,
+        admitted: bool,
+    ) -> StoredUserOperation {
+        let mut record = stored_admission(operation, admitted);
+        record.status = status;
+        record
+    }
+
+    /// The rest of an admission that holds its slot: record, queue, mark.
+    fn admits(driver: &mut Driver, operation: &UserOperation) {
+        let hash = expected_hash(operation);
+        driver.step(
+            AdmissionOperation::CreateQueued {
+                operation: QueuedUserOperation {
+                    user_operation_hash: hash.clone(),
+                    chain_id: LOCAL_POLICY_CHAIN,
+                    entry_point: ENTRY_POINT.into(),
+                    user_operation: operation.clone(),
+                },
+            },
+            AdmissionResult::Created { created: true },
+        );
+        driver.step(
+            AdmissionOperation::Enqueue {
+                envelope: json!({
+                    "schemaVersion": 1,
+                    "userOperationHash": hash,
+                    "chainId": LOCAL_POLICY_CHAIN,
+                    "entryPoint": ENTRY_POINT,
+                    "userOperation": operation,
+                }),
+                retry: false,
+            },
+            AdmissionResult::Enqueued,
+        );
+        driver.step(
+            AdmissionOperation::MarkAdmitted { hash: hash.clone() },
+            AdmissionResult::Marked { marked: true },
+        );
+        driver.assert_settled(AdmissionOutcome::Accepted {
+            user_operation_hash: hash,
+            sender_hex: "0x1111111111111111111111111111111111111111".into(),
+            entry_point: ENTRY_POINT.into(),
+        });
+    }
+
+    fn in_flight(holder: &UserOperation) -> AdmissionOutcome {
+        AdmissionOutcome::NonceInFlight {
+            existing_user_operation_hash: expected_hash(holder),
+            sender_hex: "0x1111111111111111111111111111111111111111".into(),
+            nonce: "0x0".into(),
+        }
+    }
+
+    /// The reported case: a second send at the nonce of a first that is
+    /// still waiting is refused at once, naming the first, instead of being
+    /// accepted and rejected minutes later as a fee problem.
+    #[test]
+    fn a_different_operation_at_a_nonce_still_in_flight_is_refused_naming_the_holder() {
+        let first = paying_operation(10_000_000_000_000);
+        let second = twin_of(&first);
+        for status in [
+            UserOperationStatus::Queued,
+            UserOperationStatus::NotSubmitted,
+            UserOperationStatus::Submitted,
+        ] {
+            let mut driver = Driver::submit(submit(second.clone()));
+            assets(&mut driver);
+            driver.claim(
+                &second,
+                NonceClaim::Held {
+                    holder: holder_of(&first, NOW - 40_000),
+                },
+            );
+            driver.step(
+                AdmissionOperation::LoadExisting {
+                    hash: expected_hash(&first),
+                },
+                AdmissionResult::Record {
+                    record: Some(stored_with(first.clone(), status, true)),
+                },
+            );
+            driver.assert_settled(in_flight(&first));
+        }
+    }
+
+    /// What a shipped wallet reads from the refusal: vela-core's
+    /// `parse_existing_user_op_hash` (v0.9.7 and main) looks for
+    /// `[existingHash:0x` in the raw error JSON, takes the hex digits and
+    /// needs a `]` after them; another operation's hash there is
+    /// `NotSent { NonceHeld }`, "another transaction is still pending".
+    #[test]
+    fn the_refusal_reaches_an_old_wallet_as_its_existing_hash_marker() {
+        let first = paying_operation(10_000_000_000_000);
+        let AdmissionOutcome::NonceInFlight {
+            existing_user_operation_hash,
+            sender_hex,
+            nonce,
+        } = in_flight(&first)
+        else {
+            unreachable!()
+        };
+        let error = crate::wire::RpcError::nonce_in_flight(
+            &existing_user_operation_hash,
+            &sender_hex,
+            &nonce,
+        );
+        let raw = serde_json::to_string(&error).unwrap();
+        // vela-core user_op.rs `parse_existing_user_op_hash`, verbatim.
+        fn parse_existing_user_op_hash(message: &str) -> Option<String> {
+            const MARK: &str = "[existingHash:0x";
+            for (at, _) in message.match_indices(MARK) {
+                let rest = &message[at + MARK.len()..];
+                let hex_len = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+                if hex_len > 0 && rest.as_bytes().get(hex_len) == Some(&b']') {
+                    return Some(format!("0x{}", &rest[..hex_len]));
+                }
+            }
+            None
+        }
+        assert_eq!(
+            parse_existing_user_op_hash(&raw),
+            Some(expected_hash(&first))
+        );
+        assert_eq!(
+            parse_existing_user_op_hash(&error.message),
+            Some(expected_hash(&first))
+        );
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["code"], -32602);
+        assert_eq!(value["data"]["reason"], "nonce_in_flight");
+        assert_eq!(value["data"]["existingHash"], expected_hash(&first));
+        assert_eq!(value["data"]["nonce"], "0x0");
+        assert_eq!(
+            value["data"]["sender"],
+            "0x1111111111111111111111111111111111111111"
+        );
+    }
+
+    /// Once the holder is settled, the nonce is free: a retry after a
+    /// rejection, or a new operation after an expired record, is admitted and
+    /// takes the slot over.
+    #[test]
+    fn a_retry_after_its_twin_settled_is_admitted_and_takes_the_slot() {
+        let first = paying_operation(10_000_000_000_000);
+        let second = twin_of(&first);
+        let settled = [
+            Some(stored_with(
+                first.clone(),
+                UserOperationStatus::Rejected,
+                true,
+            )),
+            Some(stored_with(
+                first.clone(),
+                UserOperationStatus::Included,
+                true,
+            )),
+            Some(stored_with(
+                first.clone(),
+                UserOperationStatus::Failed,
+                true,
+            )),
+            // Expired, or an admission that crashed long ago.
+            None,
+            Some(stored_with(
+                first.clone(),
+                UserOperationStatus::Queued,
+                false,
+            )),
+        ];
+        for record in settled {
+            let mut driver = Driver::submit(submit(second.clone()));
+            assets(&mut driver);
+            driver.claim(
+                &second,
+                NonceClaim::Held {
+                    holder: holder_of(&first, NOW - ADMISSION_GRACE_MS),
+                },
+            );
+            driver.step(
+                AdmissionOperation::LoadExisting {
+                    hash: expected_hash(&first),
+                },
+                AdmissionResult::Record { record },
+            );
+            driver.step(
+                AdmissionOperation::TakeOverNonce {
+                    slot: slot_of(&second),
+                    judged_user_operation_hash: expected_hash(&first),
+                    holder: holder_of(&second, NOW),
+                },
+                AdmissionResult::NonceClaim {
+                    claim: NonceClaim::Claimed { fresh: true },
+                },
+            );
+            admits(&mut driver, &second);
+        }
+    }
+
+    /// The same operation again finds its own hash in the slot and gets its
+    /// hash back, as it always did, however its first admission ended.
+    #[test]
+    fn the_same_operation_again_is_answered_with_its_own_hash() {
+        let first = paying_operation(10_000_000_000_000);
+        for status in [UserOperationStatus::Queued, UserOperationStatus::Rejected] {
+            let mut driver = Driver::submit(submit(first.clone()));
+            assets(&mut driver);
+            driver.claim(&first, NonceClaim::Claimed { fresh: false });
+            driver.step(
+                AdmissionOperation::CreateQueued {
+                    operation: QueuedUserOperation {
+                        user_operation_hash: expected_hash(&first),
+                        chain_id: LOCAL_POLICY_CHAIN,
+                        entry_point: ENTRY_POINT.into(),
+                        user_operation: first.clone(),
+                    },
+                },
+                AdmissionResult::Created { created: false },
+            );
+            driver.step(
+                AdmissionOperation::LoadExisting {
+                    hash: expected_hash(&first),
+                },
+                AdmissionResult::Record {
+                    record: Some(stored_with(first.clone(), status, true)),
+                },
+            );
+            driver.assert_settled(AdmissionOutcome::AlreadyQueued {
+                user_operation_hash: expected_hash(&first),
+            });
+        }
+    }
+
+    /// Two different operations at one nonce, a few milliseconds apart,
+    /// against one store whose claims are atomic (the Redis script, the
+    /// RecordDO): the first claims, the second finds it before its record
+    /// exists, judges it in flight and is refused. Exactly one is admitted.
+    #[test]
+    fn two_operations_racing_for_one_nonce_are_never_both_admitted() {
+        let first = paying_operation(10_000_000_000_000);
+        let second = twin_of(&first);
+        let mut slot: Option<NonceHolder> = None;
+        let mut claim = |holder: NonceHolder| {
+            let step = crate::nonce_slot::claim(slot.as_ref(), &holder);
+            if let Some(write) = step.write {
+                slot = Some(write);
+            }
+            step.reply
+        };
+
+        let mut winner = Driver::submit(submit(first.clone()));
+        let mut loser = Driver::submit(submit(second.clone()));
+        assets(&mut winner);
+        assets(&mut loser);
+        // Both claim, in the order the store serializes them.
+        let won = claim(holder_of(&first, NOW));
+        let lost = claim(holder_of(&second, NOW));
+        assert_eq!(won, NonceClaim::Claimed { fresh: true });
+        winner.claim(&first, won);
+        loser.claim(&second, lost);
+        // The winner has not written its record yet.
+        loser.step(
+            AdmissionOperation::LoadExisting {
+                hash: expected_hash(&first),
+            },
+            AdmissionResult::Record { record: None },
+        );
+        loser.assert_settled(in_flight(&first));
+        admits(&mut winner, &first);
+    }
+
+    /// A takeover only replaces the holder it judged. When a third operation
+    /// took the slot in between, the admission judges that one, and refuses
+    /// while it is in flight.
+    #[test]
+    fn a_takeover_that_loses_the_slot_to_another_judges_the_new_holder() {
+        let first = paying_operation(10_000_000_000_000);
+        let second = twin_of(&first);
+        let UserOperation::V0_7(mut third) = first.clone() else {
+            unreachable!()
+        };
+        let UserOperation::V0_7(other) = paying_operation(30_000_000_000_000) else {
+            unreachable!()
+        };
+        third.call_data = other.call_data;
+        let third = UserOperation::V0_7(third);
+
+        let mut driver = Driver::submit(submit(second.clone()));
+        assets(&mut driver);
+        driver.claim(
+            &second,
+            NonceClaim::Held {
+                holder: holder_of(&first, NOW - 600_000),
+            },
+        );
+        driver.step(
+            AdmissionOperation::LoadExisting {
+                hash: expected_hash(&first),
+            },
+            AdmissionResult::Record {
+                record: Some(stored_with(
+                    first.clone(),
+                    UserOperationStatus::Rejected,
+                    true,
+                )),
+            },
+        );
+        driver.step(
+            AdmissionOperation::TakeOverNonce {
+                slot: slot_of(&second),
+                judged_user_operation_hash: expected_hash(&first),
+                holder: holder_of(&second, NOW),
+            },
+            AdmissionResult::NonceClaim {
+                claim: NonceClaim::Held {
+                    holder: holder_of(&third, NOW - 2),
+                },
+            },
+        );
+        driver.step(
+            AdmissionOperation::LoadExisting {
+                hash: expected_hash(&third),
+            },
+            AdmissionResult::Record { record: None },
+        );
+        driver.assert_settled(in_flight(&third));
+    }
+
+    /// An admission that claimed its slot and then could not write its
+    /// record gives the slot back, so the next send is not refused for one
+    /// that never got in. One that found its own hash there keeps it.
+    #[test]
+    fn an_admission_that_fails_before_its_record_gives_the_nonce_back() {
+        let operation = paying_operation(10_000_000_000_000);
+        for (create, outcome) in [
+            (
+                AdmissionResult::QueueUnavailable,
+                AdmissionOutcome::QueueUnavailable,
+            ),
+            (
+                AdmissionResult::StoreFailed,
+                AdmissionOutcome::StoreUnavailable,
+            ),
+        ] {
+            let mut driver = Driver::submit(submit(operation.clone()));
+            assets(&mut driver);
+            driver.claim(&operation, NonceClaim::Claimed { fresh: true });
+            driver.step(
+                AdmissionOperation::CreateQueued {
+                    operation: QueuedUserOperation {
+                        user_operation_hash: expected_hash(&operation),
+                        chain_id: LOCAL_POLICY_CHAIN,
+                        entry_point: ENTRY_POINT.into(),
+                        user_operation: operation.clone(),
+                    },
+                },
+                create,
+            );
+            driver.step(
+                AdmissionOperation::ReleaseNonce {
+                    slot: slot_of(&operation),
+                    user_operation_hash: expected_hash(&operation),
+                },
+                AdmissionResult::NonceReleased,
+            );
+            driver.assert_settled(outcome);
+        }
+
+        let mut again = Driver::submit(submit(operation.clone()));
+        assets(&mut again);
+        again.claim(&operation, NonceClaim::Claimed { fresh: false });
+        again.step(
+            AdmissionOperation::CreateQueued {
+                operation: QueuedUserOperation {
+                    user_operation_hash: expected_hash(&operation),
+                    chain_id: LOCAL_POLICY_CHAIN,
+                    entry_point: ENTRY_POINT.into(),
+                    user_operation: operation.clone(),
+                },
+            },
+            AdmissionResult::StoreFailed,
+        );
+        again.assert_settled(AdmissionOutcome::StoreUnavailable);
+    }
+
+    /// A store that cannot say who holds the slot, or what that holder is,
+    /// admits nothing.
+    #[test]
+    fn a_store_that_cannot_judge_the_slot_admits_nothing() {
+        let first = paying_operation(10_000_000_000_000);
+        let second = twin_of(&first);
+        let mut driver = Driver::submit(submit(second.clone()));
+        assets(&mut driver);
+        driver.step(
+            AdmissionOperation::ClaimNonce {
+                slot: slot_of(&second),
+                holder: holder_of(&second, NOW),
+            },
+            AdmissionResult::StoreFailed,
+        );
+        driver.assert_settled(AdmissionOutcome::StoreUnavailable);
+
+        let mut driver = Driver::submit(submit(second.clone()));
+        assets(&mut driver);
+        driver.claim(
+            &second,
+            NonceClaim::Held {
+                holder: holder_of(&first, NOW - 1_000),
+            },
+        );
+        driver.step(
+            AdmissionOperation::LoadExisting {
+                hash: expected_hash(&first),
+            },
+            AdmissionResult::StoreFailed,
+        );
+        driver.assert_settled(AdmissionOutcome::StoreUnavailable);
+    }
+
+    /// A slot that changes hands under every attempt is refused rather than
+    /// fought over without end.
+    #[test]
+    fn a_slot_contested_on_every_attempt_is_refused() {
+        let first = paying_operation(10_000_000_000_000);
+        let second = twin_of(&first);
+        let mut driver = Driver::submit(submit(second.clone()));
+        assets(&mut driver);
+        driver.claim(
+            &second,
+            NonceClaim::Held {
+                holder: holder_of(&first, NOW - 600_000),
+            },
+        );
+        for _ in 1..crate::nonce_slot::TAKEOVER_ATTEMPTS {
+            driver.step(
+                AdmissionOperation::LoadExisting {
+                    hash: expected_hash(&first),
+                },
+                AdmissionResult::Record {
+                    record: Some(stored_with(
+                        first.clone(),
+                        UserOperationStatus::Rejected,
+                        true,
+                    )),
+                },
+            );
+            driver.step(
+                AdmissionOperation::TakeOverNonce {
+                    slot: slot_of(&second),
+                    judged_user_operation_hash: expected_hash(&first),
+                    holder: holder_of(&second, NOW),
+                },
+                AdmissionResult::NonceClaim {
+                    claim: NonceClaim::Held {
+                        holder: holder_of(&first, NOW - 600_000),
+                    },
+                },
+            );
+        }
+        driver.assert_settled(in_flight(&first));
     }
 }
 

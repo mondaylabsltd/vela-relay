@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vela_relay_core::nonce_slot::{NonceClaim, NonceHolder};
 use vela_relay_core::task::{
     PreparedFundingIntent, QueuedUserOperation, RoutedUserOperation, StoredUserOperation,
 };
@@ -43,6 +44,21 @@ pub enum RecordCommand {
     GiveUp {
         now_ms: u64,
     },
+    /// On a nonce-slot instance (`nonce:{slot}`): the core's
+    /// `nonce_slot::claim`, applied atomically. Replies `Nonce`.
+    ClaimNonce {
+        holder: NonceHolder,
+    },
+    /// On a nonce-slot instance: `nonce_slot::take_over`, replacing only the
+    /// holder the core judged. Replies `Nonce`.
+    TakeOverNonce {
+        judged_user_operation_hash: String,
+        holder: NonceHolder,
+    },
+    /// On a nonce-slot instance: `nonce_slot::release`. Replies `Released`.
+    ReleaseNonce {
+        user_operation_hash: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +77,12 @@ pub enum RecordReply {
     },
     Indexed {
         indexed: bool,
+    },
+    Nonce {
+        claim: NonceClaim,
+    },
+    Released {
+        released: bool,
     },
 }
 

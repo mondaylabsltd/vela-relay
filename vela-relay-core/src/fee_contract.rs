@@ -368,28 +368,61 @@ fn avalanche_bills_at_least_the_gas_the_chain_charges() {
     }
 }
 
-/// The dust floor binds identically on both sides: a near-zero-gas
-/// operation's requirement is the relay's `0.00001`-coin floor
-/// (`settlement::MIN_NATIVE_FRACTION_DECIMALS`), never less.
+/// The minimum binds identically on both sides: a near-zero-gas operation's
+/// requirement is the minimum, never less. With a price it is `$0.01` of the
+/// coin (what the quote publishes, accepted down to 90% of it at the
+/// executor's price); without one, the `0.000001`-coin safety floor
+/// (`settlement::MIN_NATIVE_FRACTION_DECIMALS`).
 #[test]
 fn the_dust_floor_is_the_requirement_when_the_gas_costs_less() {
-    use crate::settlement::{SettlementInput, evaluate_batch, minimum_amount};
-    let floor = minimum_amount(18, crate::settlement::MIN_NATIVE_FRACTION_DECIMALS).unwrap();
-    assert_eq!(floor, U256::from(10_000_000_000_000u64));
-    for (paid, accepted) in [(10_000_000_000_000u128, true), (9_999_999_999_999, false)] {
-        let call_data = native_payment(paid);
-        let evaluation = evaluate_batch(
-            TREASURY,
-            &assets(),
-            &[SettlementInput {
-                call_data: &call_data,
-                gas_native_cost: U256::from(1u8),
-            }],
-            None,
-        )
-        .unwrap();
-        assert_eq!(evaluation.operations[0].required_amount, floor);
-        assert_eq!(evaluation.all_accepted(), accepted, "paid {paid}");
+    use crate::settlement::{
+        SettlementInput, enforced_native_minimum, evaluate_batch, minimum_amount,
+        parse_market_usd_price, published_native_minimum,
+    };
+    let safety = minimum_amount(18, crate::settlement::MIN_NATIVE_FRACTION_DECIMALS).unwrap();
+    assert_eq!(safety, U256::from(1_000_000_000_000u64));
+    let eth = parse_market_usd_price("2423.92").unwrap();
+    let published = published_native_minimum(18, Some(eth)).unwrap();
+    // $0.01 of ETH at the investigation block's price.
+    assert_eq!(published, U256::from(4_125_548_697_977u64));
+    for (price, floor) in [
+        (None, safety),
+        (Some(eth), enforced_native_minimum(18, Some(eth)).unwrap()),
+    ] {
+        for (paid, accepted) in [(floor, true), (floor - U256::from(1u8), false)] {
+            let call_data = native_payment(paid.to::<u128>());
+            let evaluation = evaluate_batch(
+                TREASURY,
+                &assets(),
+                &[SettlementInput {
+                    call_data: &call_data,
+                    gas_native_cost: U256::from(1u8),
+                }],
+                price,
+            )
+            .unwrap();
+            assert_eq!(evaluation.operations[0].required_amount, floor);
+            assert_eq!(evaluation.all_accepted(), accepted, "paid {paid}");
+        }
+        // A wallet that paid the published minimum, and an old wallet that
+        // paid 0.00001 ETH, are both accepted whether or not the executor
+        // has a price.
+        for paid in [published, U256::from(10_000_000_000_000u64)] {
+            let call_data = native_payment(paid.to::<u128>());
+            assert!(
+                evaluate_batch(
+                    TREASURY,
+                    &assets(),
+                    &[SettlementInput {
+                        call_data: &call_data,
+                        gas_native_cost: U256::from(1u8),
+                    }],
+                    price,
+                )
+                .unwrap()
+                .all_accepted()
+            );
+        }
     }
 }
 

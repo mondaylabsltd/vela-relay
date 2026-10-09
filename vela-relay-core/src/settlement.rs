@@ -42,6 +42,23 @@ pub fn settlement_rejection_reason(paid: U256, required: U256, stable_logs_valid
     }
 }
 
+/// The machine reason for an in-band settlement rejection
+/// (`rejection::RejectionReason`): a payment that could not be read or proven,
+/// one under the relay's minimum, or one the network's fees outran.
+pub fn settlement_rejection_code(
+    evaluation: &SettlementEvaluation,
+    stable_logs_valid: bool,
+) -> crate::rejection::RejectionReason {
+    use crate::rejection::RejectionReason;
+    if !stable_logs_valid || !evaluation.is_shortfall() || evaluation.paid_amount.is_zero() {
+        RejectionReason::FeePaymentInvalid
+    } else if evaluation.paid_amount < evaluation.minimum_amount {
+        RejectionReason::FeeBelowMinimum
+    } else {
+        RejectionReason::FeeBelowMarket
+    }
+}
+
 const EXECUTE_USER_OP_SELECTOR: [u8; 4] = [0x7b, 0xb3, 0x74, 0x28];
 const MULTISEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -74,9 +91,100 @@ pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 11_000;
 /// the backtest's first choice.
 pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 12_500;
 
-pub const MIN_NATIVE_FRACTION_DECIMALS: u32 = 5;
+/// The native **safety floor**: `10^(decimals − 6)`, 0.000001 of the coin.
+///
+/// The minimum in-band fee is `$0.01` ([`MINIMUM_FEE_USD`]). This floor is
+/// what stands in for it where the relay has no fresh price for the coin, and
+/// what admission checks, since admission reads no price. It must therefore
+/// never be worth more than `$0.01` of a coin the relay CAN price, or a wallet
+/// that paid the published `$0.01` would be refused whenever one price read
+/// failed. Ethereum's coin binds that: 0.000001 ETH is `$0.0025` at $2,494
+/// (2026-10-09), and stays under `$0.01` up to ETH at $10,000. It was
+/// `10^(decimals − 5)`, which on every ETH chain made the minimum 0.00001 ETH,
+/// `$0.025`, two and a half times the rule (`docs/fees.md` §1 lists the 24
+/// built-in networks). It is a dust guard, not a guard against loss: the
+/// requirement's cost term, `markup × billed gas × cap`, is what keeps the
+/// relay from ever signing below cost.
+pub const MIN_NATIVE_FRACTION_DECIMALS: u32 = 6;
 pub const MIN_STABLE_FRACTION_DECIMALS: u32 = 2;
 pub const USD_PRICE_DECIMALS: u32 = 8;
+
+/// The minimum in-band fee: `$0.01`, in the 8-decimal USD fixed point.
+pub const MINIMUM_FEE_USD: u64 = USD_PRICE_SCALE / 100;
+
+/// How much of the `$0.01` minimum the executor takes, at its own price, from
+/// a payment that met the minimum the quote published at the quote's price:
+/// 90%. A coin that falls between the quote and the settlement makes `$0.01`
+/// more coin than the wallet signed; within 10% it is still accepted, so a
+/// wallet that paid exactly the published minimum is not refused for the
+/// market moving under it. It touches the minimum only: the cost term is
+/// never discounted, so the relay still never signs below cost.
+pub const MINIMUM_FEE_ACCEPTANCE_BPS: u64 = 9_000;
+
+/// `usd` (8-decimal fixed point) worth of the native coin at
+/// `native_usd_price`, in base units, rounded up.
+pub fn native_amount_for_usd_ceil(
+    usd: U256,
+    native_decimals: u32,
+    native_usd_price: U256,
+) -> Result<U256, SettlementError> {
+    if native_usd_price.is_zero() {
+        return Err(SettlementError::ArithmeticOverflow);
+    }
+    let scale = checked_pow10(native_decimals).ok_or(SettlementError::ArithmeticOverflow)?;
+    let numerator = widen_u256(usd)
+        .checked_mul(widen_u256(scale))
+        .ok_or(SettlementError::ArithmeticOverflow)?;
+    let denominator = widen_u256(native_usd_price);
+    let quotient = numerator / denominator;
+    let rounded = if numerator % denominator == U512::ZERO {
+        quotient
+    } else {
+        quotient
+            .checked_add(U512::ONE)
+            .ok_or(SettlementError::ArithmeticOverflow)?
+    };
+    narrow_u512(rounded)
+}
+
+/// The least native in-band fee the relay PUBLISHES (`vela_getInBandGasQuote`
+/// `minimumAmount`): `$0.01` of the coin at the quote's price, never under the
+/// safety floor; the safety floor alone where there is no price.
+pub fn published_native_minimum(
+    native_decimals: u32,
+    native_usd_price: Option<U256>,
+) -> Result<U256, SettlementError> {
+    native_minimum_at(native_decimals, native_usd_price, 10_000)
+}
+
+/// The least native in-band fee the executor ENFORCES: [`MINIMUM_FEE_ACCEPTANCE_BPS`]
+/// of `$0.01` at its own price, never under the safety floor; the safety
+/// floor alone where it has no price. Never above [`published_native_minimum`]
+/// at the same price, so a payment of the published minimum is accepted
+/// unless the coin fell more than 10% in between.
+pub fn enforced_native_minimum(
+    native_decimals: u32,
+    native_usd_price: Option<U256>,
+) -> Result<U256, SettlementError> {
+    native_minimum_at(
+        native_decimals,
+        native_usd_price,
+        MINIMUM_FEE_ACCEPTANCE_BPS,
+    )
+}
+
+fn native_minimum_at(
+    native_decimals: u32,
+    native_usd_price: Option<U256>,
+    share_bps: u64,
+) -> Result<U256, SettlementError> {
+    let safety = minimum_amount(native_decimals, MIN_NATIVE_FRACTION_DECIMALS)?;
+    let Some(price) = native_usd_price.filter(|price| !price.is_zero()) else {
+        return Ok(safety);
+    };
+    let usd = U256::from(MINIMUM_FEE_USD) * U256::from(share_bps) / U256::from(10_000u64);
+    Ok(native_amount_for_usd_ceil(usd, native_decimals, price)?.max(safety))
+}
 
 /// Settlement assets loaded from the controlled chain directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +238,11 @@ pub struct SettlementEvaluation {
     pub payment_asset: Option<Address>,
     pub paid_amount: U256,
     pub required_amount: U256,
+    /// The minimum part of `required_amount`, in the payment's unit: the
+    /// native minimum ([`enforced_native_minimum`]) or `0.01` of the
+    /// stablecoin. Tells a payment under the minimum from one the market
+    /// outran ([`settlement_rejection_code`]).
+    pub minimum_amount: U256,
     pub rejection: Option<SettlementRejection>,
 }
 
@@ -370,7 +483,10 @@ pub fn evaluate_batch(
     native_usd_price: Option<U256>,
 ) -> Result<BatchSettlementEvaluation, SettlementError> {
     validate_config(config)?;
-    let native_floor = minimum_amount(config.native_decimals, MIN_NATIVE_FRACTION_DECIMALS)?;
+    // The native minimum at the executor's own price: `$0.01` with the
+    // acceptance allowance where the price is fresh, the safety floor where
+    // there is none (`docs/fees.md` §1).
+    let native_floor = enforced_native_minimum(config.native_decimals, native_usd_price)?;
     let allowlist = config.stablecoins.keys().copied().collect::<BTreeSet<_>>();
     let mut operations = Vec::with_capacity(inputs.len());
 
@@ -409,6 +525,7 @@ pub fn evaluate_batch(
                 payment_asset: None,
                 paid_amount: U256::ZERO,
                 required_amount: marked_cost.max(native_floor),
+                minimum_amount: native_floor,
                 rejection: Some(SettlementRejection::ArithmeticOverflow),
             }),
             Err(error) => return Err(error),
@@ -437,6 +554,7 @@ fn evaluate_one(
                 payment_asset: None,
                 paid_amount,
                 required_amount,
+                minimum_amount: native_floor,
                 rejection: (paid_amount < required_amount)
                     .then_some(SettlementRejection::InsufficientPayment),
             })
@@ -467,6 +585,7 @@ fn evaluate_one(
                 payment_asset: Some(token),
                 paid_amount,
                 required_amount,
+                minimum_amount: stable_floor,
                 rejection: (paid_amount < required_amount)
                     .then_some(SettlementRejection::InsufficientPayment),
             })
@@ -477,6 +596,7 @@ fn evaluate_one(
             payment_asset: None,
             paid_amount: U256::ZERO,
             required_amount: marked_cost.max(native_floor),
+            minimum_amount: native_floor,
             rejection: Some(SettlementRejection::InsufficientPayment),
         }),
         _ => Ok(SettlementEvaluation {
@@ -485,6 +605,7 @@ fn evaluate_one(
             payment_asset: None,
             paid_amount: U256::ZERO,
             required_amount: marked_cost.max(native_floor),
+            minimum_amount: native_floor,
             rejection: Some(SettlementRejection::UnsupportedPaymentCombination),
         }),
     }
@@ -537,6 +658,7 @@ fn rejected_parse(
         payment_asset: None,
         paid_amount: U256::ZERO,
         required_amount: marked_cost.max(native_floor),
+        minimum_amount: native_floor,
         rejection: Some(match error {
             ReimbursementParseError::MalformedCallData => SettlementRejection::MalformedCallData,
             ReimbursementParseError::ArithmeticOverflow => SettlementRejection::ArithmeticOverflow,
@@ -1113,8 +1235,9 @@ mod tests {
         ChainAssetConfig, Reimbursement, ReimbursementParseError, SettlementEvaluation,
         SettlementInput, SettlementLog, SettlementRejection, StablecoinConfig,
         affordable_fee_per_gas, evaluate_batch, inclusion_floor_fee_per_gas,
-        native_to_usd_stable_ceil, parse_reimbursement, settlement_hold_reason,
-        settlement_rejection_reason, verify_stable_transfer_logs,
+        native_to_usd_stable_ceil, parse_market_usd_price, parse_reimbursement,
+        settlement_hold_reason, settlement_rejection_code, settlement_rejection_reason,
+        verify_stable_transfer_logs,
     };
 
     #[test]
@@ -1165,6 +1288,7 @@ mod tests {
             payment_asset: None,
             paid_amount: U256::from(paid),
             required_amount: U256::from(required),
+            minimum_amount: U256::ZERO,
             rejection,
         }
     }
@@ -1327,7 +1451,7 @@ mod tests {
 
     #[test]
     fn evaluates_each_operation_without_cross_subsidy() {
-        let config = native_config(5);
+        let config = native_config(6);
         let rich = safe_multisend(&[Entry::native(RECIPIENT, U256::from(399u64))]);
         let poor = safe_multisend(&[Entry::native(RECIPIENT, U256::ONE)]);
         let evaluation = evaluate_batch(
@@ -1357,7 +1481,7 @@ mod tests {
 
     #[test]
     fn uses_configured_markup_with_ceiling_rounding() {
-        let mut config = native_config(5);
+        let mut config = native_config(6);
         config.settlement_markup_bps = 15_001;
         let four = safe_multisend(&[Entry::native(RECIPIENT, U256::from(4u8))]);
         let five = safe_multisend(&[Entry::native(RECIPIENT, U256::from(5u8))]);
@@ -1425,30 +1549,44 @@ mod tests {
     #[test]
     fn enforces_native_and_stablecoin_floors_with_bundler_favourable_rounding() {
         let native_config = native_config(18);
-        let below_native = safe_multisend(&[Entry::native(
-            RECIPIENT,
-            U256::from(10_000_000_000_000u64 - 1),
-        )]);
-        let at_native =
-            safe_multisend(&[Entry::native(RECIPIENT, U256::from(10_000_000_000_000u64))]);
-        let native_result = evaluate_batch(
-            RECIPIENT,
-            &native_config,
-            &[
-                SettlementInput {
-                    call_data: &below_native,
+        let native_at = |paid: u64, price: Option<U256>| {
+            let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(paid))]);
+            evaluate_batch(
+                RECIPIENT,
+                &native_config,
+                &[SettlementInput {
+                    call_data: &call_data,
                     gas_native_cost: U256::ZERO,
-                },
-                SettlementInput {
-                    call_data: &at_native,
-                    gas_native_cost: U256::ZERO,
-                },
-            ],
-            None,
-        )
-        .unwrap();
-        assert!(!native_result.operations[0].accepted());
-        assert!(native_result.operations[1].accepted());
+                }],
+                price,
+            )
+            .unwrap()
+            .operations[0]
+                .clone()
+        };
+        // No fresh price: the safety floor, 0.000001 of the coin.
+        let unpriced = native_at(1_000_000_000_000 - 1, None);
+        assert!(!unpriced.accepted());
+        assert_eq!(unpriced.required_amount, U256::from(1_000_000_000_000u64));
+        assert_eq!(unpriced.minimum_amount, U256::from(1_000_000_000_000u64));
+        assert!(native_at(1_000_000_000_000, None).accepted());
+
+        // ETH at $2,494: 90% of $0.01 at the executor's price, rounded up —
+        // 3,608,660,785,887 wei, where the old floor asked 10,000,000,000,000.
+        let eth = Some(parse_market_usd_price("2494").unwrap());
+        let floor = native_at(3_608_660_785_887 - 1, eth);
+        assert!(!floor.accepted());
+        assert_eq!(floor.minimum_amount, U256::from(3_608_660_785_887u64));
+        assert!(native_at(3_608_660_785_887, eth).accepted());
+        // The published minimum, `$0.01`, is accepted, and so is the old
+        // wallets' 0.00001 ETH.
+        assert!(native_at(4_009_623_095_430, eth).accepted());
+        assert!(native_at(10_000_000_000_000, eth).accepted());
+
+        // A dollar coin: 0.009 of it.
+        let pegged = Some(U256::from(super::USD_PRICE_SCALE));
+        assert!(!native_at(9_000_000_000_000_000 - 1, pegged).accepted());
+        assert!(native_at(9_000_000_000_000_000, pegged).accepted());
 
         let stable_config = config_with_stable(18, 6);
         let below_floor =
@@ -1477,6 +1615,65 @@ mod tests {
         );
         assert!(!stable_result.operations[0].accepted());
         assert!(stable_result.operations[1].accepted());
+    }
+
+    /// Each in-band rejection names its cause: a payment under the minimum,
+    /// one the market outran, one that could not be read or proven.
+    #[test]
+    fn a_settlement_rejection_names_why_in_a_code() {
+        use crate::rejection::RejectionReason;
+        let config = native_config(18);
+        let evaluate = |paid: u64, cost: u64| {
+            let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(paid))]);
+            evaluate_batch(
+                RECIPIENT,
+                &config,
+                &[SettlementInput {
+                    call_data: &call_data,
+                    gas_native_cost: U256::from(cost),
+                }],
+                None,
+            )
+            .unwrap()
+            .operations[0]
+                .clone()
+        };
+        // Under the 0.000001-coin floor, the gas costing next to nothing.
+        let dust = evaluate(999_999_999_999, 1);
+        assert_eq!(
+            settlement_rejection_code(&dust, true),
+            RejectionReason::FeeBelowMinimum
+        );
+        // Over the floor, under 1.1 × the gas cost.
+        let outran = evaluate(2_000_000_000_000, 2_000_000_000_000);
+        assert_eq!(
+            settlement_rejection_code(&outran, true),
+            RejectionReason::FeeBelowMarket
+        );
+        // A stablecoin transfer the logs do not prove.
+        let paid = evaluate(2_000_000_000_000, 1);
+        assert!(paid.accepted());
+        assert_eq!(
+            settlement_rejection_code(&paid, false),
+            RejectionReason::FeePaymentInvalid
+        );
+        // Calldata that is no payment at all.
+        let unreadable = evaluate_batch(
+            RECIPIENT,
+            &config,
+            &[SettlementInput {
+                call_data: &[0xde, 0xad],
+                gas_native_cost: U256::from(1u8),
+            }],
+            None,
+        )
+        .unwrap()
+        .operations[0]
+            .clone();
+        assert_eq!(
+            settlement_rejection_code(&unreadable, true),
+            RejectionReason::FeePaymentInvalid
+        );
     }
 
     #[test]
@@ -1663,7 +1860,7 @@ mod tests {
         let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(140u64))]);
         let decision = decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[paid.as_slice()],
             &[U256::from(100u64)],
             None,
@@ -1684,7 +1881,7 @@ mod tests {
         let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(700u64))]);
         let decision = decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[paid.as_slice()],
             &[U256::ONE],
             None,
@@ -1709,7 +1906,7 @@ mod tests {
         let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(700u64))]);
         let decision = decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[paid.as_slice()],
             &[U256::ONE],
             None,
@@ -1737,7 +1934,7 @@ mod tests {
         let short = safe_multisend(&[Entry::native(RECIPIENT, U256::from(700u64))]);
         let decision = decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[&[] as &[u8], short.as_slice()],
             &[U256::ONE, U256::ONE],
             None,
@@ -1761,7 +1958,7 @@ mod tests {
         let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(1u64))]);
         let error = decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[paid.as_slice()],
             &[U256::MAX],
             None,
@@ -1796,7 +1993,7 @@ mod tests {
         let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(paid))]);
         decide_submission_fees(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[call_data.as_slice()],
             &[U256::ONE],
             None,
@@ -1833,7 +2030,7 @@ mod tests {
         let call_data = safe_multisend(&[Entry::native(RECIPIENT, U256::from(paid))]);
         decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[call_data.as_slice()],
             &[U256::ONE],
             None,
@@ -2070,7 +2267,7 @@ mod tests {
         let poor = safe_multisend(&[Entry::native(RECIPIENT, U256::from(300u64))]);
         let outer = decide_submission_fees(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[rich.as_slice(), poor.as_slice()],
             &[U256::ONE, U256::ONE],
             None,
@@ -2110,7 +2307,7 @@ mod tests {
         let paid = safe_multisend(&[Entry::native(RECIPIENT, U256::from(2_000_000_000u64))]);
         match decide_settlement(
             RECIPIENT,
-            &native_config(5),
+            &native_config(6),
             &[paid.as_slice()],
             &[U256::ONE],
             None,

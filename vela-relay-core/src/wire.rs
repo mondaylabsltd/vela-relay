@@ -138,6 +138,23 @@ impl RpcError {
         )
     }
 
+    /// `eth_sendUserOperation` refused: another operation of the sender still
+    /// holds this nonce (`nonce_slot`). The message is the old TypeScript
+    /// bundler's, byte for byte, with the `[existingHash:0x…]` marker shipped
+    /// wallets read; `data` says the same as structured fields.
+    pub fn nonce_in_flight(existing_user_operation_hash: &str, sender: &str, nonce: &str) -> Self {
+        Self::new(
+            -32602,
+            crate::nonce_slot::nonce_in_flight_message(existing_user_operation_hash),
+            Some(serde_json::json!({
+                "reason": crate::nonce_slot::NONCE_IN_FLIGHT_REASON,
+                "existingHash": existing_user_operation_hash,
+                "sender": sender,
+                "nonce": nonce,
+            })),
+        )
+    }
+
     pub fn estimation_unavailable() -> Self {
         Self::new(
             -32000,
@@ -554,6 +571,11 @@ pub struct InBandGasQuote {
     pub balance: Quantity,
     pub usd_price: Option<String>,
     pub usd_balance: Option<String>,
+    /// The least in-band fee, in this row's base units (hex), that the relay
+    /// takes in this asset (`docs/fees.md` §1): `$0.01` of the native coin at
+    /// `usd_price`, never under `0.000001` of it, and `0.000001` of it when
+    /// there is no price; `0.01` of a stablecoin.
+    pub minimum_amount: Quantity,
 }
 
 #[derive(Debug, Serialize)]
@@ -636,6 +658,11 @@ pub struct UserOperationStatus {
     /// Unix timestamp in milliseconds for the last deferred or rejected executor attempt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_executor_attempt_at_ms: Option<u64>,
+    /// Why a `rejected` or `failed` operation did not go through, as a code a
+    /// wallet can put into words (`rejection::RejectionReason`). Absent for
+    /// every other status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<crate::rejection::RejectionReason>,
 }
 
 fn empty_params() -> Value {
@@ -664,6 +691,7 @@ pub fn rpc_status(record: &crate::task::StoredUserOperation) -> UserOperationSta
         last_executor_attempt_at_ms: exposes_executor_diagnostic
             .then_some(record.last_executor_attempt_at_ms)
             .flatten(),
+        rejection_reason: crate::rejection::RejectionReason::of_record(record),
     }
 }
 
@@ -726,7 +754,9 @@ fn paymaster_from_v06(paymaster_and_data: &str) -> Option<String> {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{RpcError, RpcResponse, parse_envelope, validate_call};
+    use super::{
+        RpcError, RpcResponse, UserOperationStatusKind, parse_envelope, rpc_status, validate_call,
+    };
 
     fn bytes<T: serde::Serialize>(response: &RpcResponse<T>) -> String {
         serde_json::to_string(response).expect("wire responses always serialize")
@@ -883,12 +913,85 @@ mod tests {
             json!(6),
             RpcError::user_operation_rejected(
                 "in-band UserOperation must reimburse the settlement recipient with at least \
-                 0.00001 native coin or 0.01 of an allowlisted stablecoin",
+                 0.000001 native coin or 0.01 of an allowlisted stablecoin",
             ),
         );
         assert_eq!(
             bytes(&rejected),
-            r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32500,"message":"UserOperation simulation failed","data":"in-band UserOperation must reimburse the settlement recipient with at least 0.00001 native coin or 0.01 of an allowlisted stablecoin"}}"#
+            r#"{"jsonrpc":"2.0","id":6,"error":{"code":-32500,"message":"UserOperation simulation failed","data":"in-band UserOperation must reimburse the settlement recipient with at least 0.000001 native coin or 0.01 of an allowlisted stablecoin"}}"#
+        );
+    }
+
+    /// The refusal of a second operation at a nonce still in flight, byte for
+    /// byte: the old TypeScript bundler's code and sentence, carrying the
+    /// `[existingHash:0x…]` marker that v0.9.7 and later wallets read from the
+    /// raw error, and the same facts as structured `data`.
+    #[test]
+    fn renders_the_nonce_in_flight_refusal_with_the_marker_old_wallets_parse() {
+        let existing = "0x1c9a5c0c4e0b8e4e1f7f1e5b2a6d3c4b5a69788716253443526170819a8b7c6d";
+        let refused = RpcResponse::<Value>::error(
+            json!(7),
+            RpcError::nonce_in_flight(
+                existing,
+                "0x88cc22f5b4e0a3b1d0d3a2bd6f6e0e7f1d2f6894",
+                "0x5",
+            ),
+        );
+        assert_eq!(
+            bytes(&refused),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":7,"error":{{"code":-32602,"message":"Already have a pending UserOperation from this sender [existingHash:{existing}]","data":{{"existingHash":"{existing}","nonce":"0x5","reason":"nonce_in_flight","sender":"0x88cc22f5b4e0a3b1d0d3a2bd6f6e0e7f1d2f6894"}}}}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn the_status_names_why_a_rejected_operation_did_not_go_through() {
+        let mut record = crate::task::queued_record(
+            crate::task::QueuedUserOperation {
+                user_operation_hash: "0xab".into(),
+                chain_id: 1,
+                entry_point: "0x0000000071727De22E5E9d8BAf0edAc6f37da032".into(),
+                user_operation: crate::task::UserOperation::V0_7(Box::new(
+                    crate::task::UserOperationV0_7 {
+                        sender: "0x1111111111111111111111111111111111111111".into(),
+                        nonce: "0x0".into(),
+                        factory: None,
+                        factory_data: None,
+                        call_data: "0x".into(),
+                        call_gas_limit: "0x1".into(),
+                        verification_gas_limit: "0x1".into(),
+                        pre_verification_gas: "0x1".into(),
+                        max_fee_per_gas: "0x0".into(),
+                        max_priority_fee_per_gas: "0x0".into(),
+                        paymaster: None,
+                        paymaster_verification_gas_limit: None,
+                        paymaster_post_op_gas_limit: None,
+                        paymaster_data: None,
+                        signature: "0x01".into(),
+                        eip7702_auth: None,
+                        fee_token: None,
+                    },
+                )),
+            },
+            true,
+        );
+        // Queued: no reason, and the status bytes are what they always were.
+        assert_eq!(
+            serde_json::to_string(&rpc_status(&record)).unwrap(),
+            r#"{"status":"queued","transactionHash":null}"#
+        );
+        record.status = UserOperationStatusKind::Rejected;
+        record.last_executor_stage = Some("in_band_settlement".into());
+        record.last_executor_error = Some(
+            "in-band reimbursement is below the required amount: paid=1, required=2, shortfall=1"
+                .into(),
+        );
+        record.last_executor_attempt_at_ms = Some(5);
+        record.rejection_reason = Some("fee_below_minimum".into());
+        assert_eq!(
+            serde_json::to_string(&rpc_status(&record)).unwrap(),
+            r#"{"status":"rejected","transactionHash":null,"last_executor_stage":"in_band_settlement","last_executor_error":"in-band reimbursement is below the required amount: paid=1, required=2, shortfall=1","last_executor_attempt_at_ms":5,"rejection_reason":"fee_below_minimum"}"#
         );
     }
 

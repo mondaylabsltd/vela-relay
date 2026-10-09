@@ -329,6 +329,7 @@ impl LaneDo {
                     "lastExecutorStage": truncate_diagnostic(stage, 64),
                     "lastExecutorError": truncate_diagnostic(&reason, 512),
                     "lastExecutorAttemptAtMs": Date::now().as_millis(),
+                    "rejectionReason": cause.code().as_str(),
                 });
                 match self
                     .record(chain_id, hash, &RecordCommand::Patch { patch })
@@ -351,6 +352,7 @@ impl LaneDo {
                 hash,
                 stage,
                 reason,
+                code,
             } => {
                 let patch = serde_json::json!({
                     "status": "rejected",
@@ -358,6 +360,7 @@ impl LaneDo {
                     "lastExecutorStage": truncate_diagnostic(stage, 64),
                     "lastExecutorError": truncate_diagnostic(reason, 512),
                     "lastExecutorAttemptAtMs": Date::now().as_millis(),
+                    "rejectionReason": code.as_str(),
                 });
                 match self
                     .record(chain_id, hash, &RecordCommand::Patch { patch })

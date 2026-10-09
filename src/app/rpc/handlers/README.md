@@ -129,8 +129,17 @@ Call `POST /{chainId}` with one `safeAddress` parameter:
 ```
 
 Each quote identifies the configured settlement recipient, the asset, the user's current balance,
-and its USD valuation. `eth_sendUserOperation` still enforces a minimum in-band reimbursement of
-`0.00001` native coin or `0.01` USD stablecoin.
+its USD valuation, and `minimumAmount`: the least in-band fee the relay takes in that asset, in
+its base units (hex). The minimum is `$0.01` (`docs/fees.md` §1c):
+
+- native coin with a `usdPrice`: `$0.01` of it at that price, rounded up, never under
+  `0.000001` of the coin;
+- native coin without a `usdPrice`: `0.000001` of the coin (the safety floor);
+- a stablecoin, or Tempo's pathUSD: `0.01` of it.
+
+`eth_sendUserOperation` admits a native payment of at least `0.000001` of the coin or `0.01` of an
+allowlisted stablecoin; the executor then requires the minimum at its own price, accepting down to
+90% of `$0.01` so a payment of the published minimum survives the coin moving a little in between.
 
 ```json
 {
@@ -144,7 +153,8 @@ and its USD valuation. `eth_sendUserOperation` still enforces a minimum in-band 
     "symbol": "ETH",
     "balance": "0x0",
     "usdPrice": "3000.12",
-    "usdBalance": "0"
+    "usdBalance": "0",
+    "minimumAmount": "0x3081233c8d6"
   }]
 }
 ```
@@ -271,13 +281,67 @@ Admission is intentionally small and deterministic:
 
 - `maxFeePerGas` and `maxPriorityFeePerGas` must both be exactly `0x0`.
 - The Safe calldata must be `executeUserOp` delegating to the canonical Safe MultiSend contract.
-- The batch must transfer to the configured settlement recipient either at least `0.00001` native coin or at least `0.01` of one stablecoin listed in that chain's `stables` metadata.
+- The batch must transfer to the configured settlement recipient either at least `0.000001` native coin or at least `0.01` of one stablecoin listed in that chain's `stables` metadata. (The executor then requires the `$0.01` minimum, `docs/fees.md` §1c.)
 - Stablecoin amounts are converted to smallest units using the token's on-chain `decimals()` result. Transfers in unlisted tokens are ignored.
 - The operation must have valid v0.7 structural fields and a non-empty signature. EIP-7702 authorization is not enabled yet.
 
 The reimbursement is decoded from the signed calls, not from a wallet-supplied amount. A
 transfer-shaped payload does not count unless it is actually nested under the trusted Safe
 MultiSend delegatecall.
+
+#### One operation per account nonce
+
+An account executes one operation per nonce, so the relay admits one at a time
+(`vela_relay_core::nonce_slot`). Before it writes any record, admission claims the operation's
+**nonce slot**, `(chainId, entryPoint, sender, nonce)` over the full 256-bit nonce (keyed nonces
+are separate slots):
+
+- **The same operation again** (same `userOpHash`, any signature) finds its own hash there and is
+  answered with that hash, as always.
+- **A different operation** is refused while the slot's holder is **live**: its record is
+  `queued`, `not_submitted` or `submitted` (waiting, funding, held for fees, or in a bundle
+  awaiting inclusion), or its own admission is still running (no record yet, or one the queue has
+  not confirmed, within 120 s of its claim).
+- Once the holder is **final** (`included`, `rejected`, `failed`), its record has expired (one
+  hour), or its admission was abandoned (still no confirmed, executor-touched record 120 s after
+  the claim), the different operation is admitted and takes the slot over. A retry after a
+  failure goes through.
+
+The refusal is the old TypeScript bundler's, byte for byte, plus structured `data`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32602,
+    "message": "Already have a pending UserOperation from this sender [existingHash:0x9c1f…e47a]",
+    "data": {
+      "reason": "nonce_in_flight",
+      "existingHash": "0x9c1f…e47a",
+      "sender": "0x88cc…6894",
+      "nonce": "0x5"
+    }
+  }
+}
+```
+
+vela-wallet (v0.9.7 and later) reads the `[existingHash:0x…]` marker from the raw error and
+reports "another transaction is still pending"; the desktop app waits for it and sends again.
+
+**Two different operations at once.** Claims are atomic — a Redis Lua script on
+`vela:relay:nonce-slot:{slot}` in docker, a single-threaded RecordDO instance named
+`nonce:{slot}` on Cloudflare — so of two operations racing for one nonce exactly one claims it.
+The other finds the winner, whose record may not exist yet; a holder within its admission is live,
+so the loser is refused naming the winner. A takeover replaces only the holder the admission
+judged final, so two takeovers cannot both win either. If the winner's admission then fails before
+its record exists (store or queue unavailable), it gives the slot back, so the loser's retry is
+admitted.
+
+**Not covered.** A holder whose record expired (an operation still unsettled after an hour, such
+as a bundle wedged by a spike) no longer holds the slot; if it lands after a twin was admitted,
+the executor rejects the twin as `nonce_used`, as before. There is no fee-bump replacement: a
+different operation at a live nonce is always refused.
 
 After admission, the relay first creates a Redis record with `status: "queued"` and a one-hour
 TTL, then appends the following envelope to Iggy. It returns the `userOpHash` only after both
@@ -414,9 +478,34 @@ required before the relayer submits `handleOps`.
 `pimlico_getUserOperationStatus` reads the one-hour Redis record and returns one of
 `not_found`, `queued`, `not_submitted`, `submitted`, `rejected`, `included`, or `failed`, with a
 `transactionHash` when one is known. A queued retry or locally rejected operation also returns
-`lastExecutorStage`, `lastExecutorError`, and `lastExecutorAttemptAtMs`; these show whether it
-is blocked in simulation, funding, broadcast, or rejected for a reason such as insufficient
-in-band reimbursement.
+`last_executor_stage`, `last_executor_error`, and `last_executor_attempt_at_ms` (snake_case on
+the wire); these show whether it is blocked in simulation, funding, broadcast, or rejected for a
+reason such as insufficient in-band reimbursement.
+
+A `rejected` or `failed` operation also returns `rejection_reason`, a code a wallet can put into
+words (`vela_relay_core::rejection`). The executor stage alone cannot: `in_band_settlement`
+covers a market that outran the payment, a payment under the minimum, and a payment that could
+not be read.
+
+| `rejection_reason` | when | in plain words |
+|---|---|---|
+| `fee_below_market` | network fees stayed above what the signed fee covers through the whole hold (about 35 minutes) | Network fees stayed above the amount you approved, so nothing was sent. Send again to use the current fee. |
+| `fee_below_minimum` | the fee is under the `$0.01` minimum at settlement (`docs/fees.md` §1c) | The fee was below the $0.01 minimum, so nothing was sent. |
+| `fee_payment_invalid` | the fee payment is missing, unreadable, in an unsupported combination, or not proven by the transfer logs | The fee payment could not be verified, so nothing was sent. |
+| `nonce_used` | another operation of the account already used this nonce on-chain | Another transaction from this account went through first, so this one was not sent. |
+| `simulation_failed` | the operation fails when simulated: it would revert | This transaction would fail on the network, so it was not sent. |
+| `invalid_operation` | the queued payload is malformed | The transaction was malformed and was not sent. |
+| `unsupported_fee_token` | Tempo: a fee token other than pathUSD | This network takes fees only in pathUSD. |
+| `relay_gave_up` | the relay stopped retrying without sending it (dead letter) | The relay could not send this transaction. Nothing was sent; try again. |
+| `reverted_onchain` | it was mined, but its execution failed | The transaction failed on the network. |
+| `bundle_failed` | the whole bundle transaction reverted | The transaction failed on the network. |
+| `unknown` | a reason this relay version does not know | Generic failure wording. |
+
+`nonce_in_flight` is never a record's reason: it is only the `data.reason` of the synchronous
+refusal above. A record rejected before `rejection_reason` existed gets one from its stage:
+`nonce` → `nonce_used`, `simulation` → `simulation_failed`, `dead_letter` → `relay_gave_up`,
+`queue` → `invalid_operation`, `tempo_fee_token` → `unsupported_fee_token`, `in_band_settlement`
+→ `fee_below_market`; one with a receipt → `reverted_onchain`.
 `eth_getUserOperationByHash` returns the original stored operation while its record remains
 available. `eth_getUserOperationReceipt` returns `null` until the operation is included and its
 receipt is known.

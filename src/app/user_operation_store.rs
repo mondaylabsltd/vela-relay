@@ -8,6 +8,11 @@ use redis::{FromRedisValue, aio::MultiplexedConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use vela_relay_core::{
+    nonce_slot::{NonceClaim, NonceHolder, NonceSlot},
+    rejection::RejectionReason,
+};
+
 use crate::{app::rpc::types::UserOperationStatusKind, utils::config::RedisConfig};
 
 const USER_OPERATION_TTL_SECS: u64 = 60 * 60;
@@ -25,6 +30,54 @@ const DELAYED_OPERATION_KEY_PREFIX: &str = "vela:relay:delayed-user-operation:";
 const DELAYED_OPERATION_CLAIM_KEY_PREFIX: &str = "vela:relay:delayed-user-operation-claim:";
 const EXECUTOR_ALERT_KEY_PREFIX: &str = "vela:relay:executor-alert:";
 const DELAYED_OPERATION_SCHEDULE_KEY: &str = "vela:relay:delayed-user-operation-schedule";
+const NONCE_SLOT_KEY_PREFIX: &str = "vela:relay:nonce-slot:";
+
+// One live operation per account nonce (`vela_relay_core::nonce_slot`). A slot
+// is a hash {userOperationHash, claimedAtMs}. The scripts are the core's
+// `claim`, `take_over` and `release`, executed atomically: which holder may be
+// replaced is decided by the core between calls; a takeover only replaces the
+// holder named in ARGV[4], the one the core judged. Replies are
+// {code, holder hash, holder claimedAtMs}: 1 = claimed now, 2 = the claimant
+// already held it, 0 = held by the hash returned.
+const CLAIM_NONCE_SLOT_SCRIPT: &str = r#"
+local current = redis.call('HGET', KEYS[1], 'userOperationHash')
+if not current then
+  redis.call('HSET', KEYS[1], 'userOperationHash', ARGV[1], 'claimedAtMs', ARGV[2])
+  redis.call('PEXPIRE', KEYS[1], ARGV[3])
+  return {1, ARGV[1], ARGV[2]}
+end
+local claimed_at = redis.call('HGET', KEYS[1], 'claimedAtMs') or '0'
+if string.lower(current) == string.lower(ARGV[1]) then
+  return {2, current, claimed_at}
+end
+return {0, current, claimed_at}
+"#;
+
+const TAKE_OVER_NONCE_SLOT_SCRIPT: &str = r#"
+local current = redis.call('HGET', KEYS[1], 'userOperationHash')
+if current then
+  local claimed_at = redis.call('HGET', KEYS[1], 'claimedAtMs') or '0'
+  if string.lower(current) == string.lower(ARGV[1]) then
+    return {2, current, claimed_at}
+  end
+  if string.lower(current) ~= string.lower(ARGV[4]) then
+    return {0, current, claimed_at}
+  end
+end
+redis.call('DEL', KEYS[1])
+redis.call('HSET', KEYS[1], 'userOperationHash', ARGV[1], 'claimedAtMs', ARGV[2])
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return {1, ARGV[1], ARGV[2]}
+"#;
+
+const RELEASE_NONCE_SLOT_SCRIPT: &str = r#"
+local current = redis.call('HGET', KEYS[1], 'userOperationHash')
+if current and string.lower(current) == string.lower(ARGV[1]) then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+"#;
 // The retry backoff schedule lives in `vela_relay_core::hold`; the store only
 // forwards its precomputed lookup table to the scripts.
 
@@ -1096,13 +1149,71 @@ impl UserOperationStatusStore {
         Ok(reply.is_some())
     }
 
-    /// Records a terminal local rejection with a bounded, client-safe explanation. On-chain
-    /// rejections remain represented by their receipt event instead.
+    /// Claims an operation's nonce slot (`nonce_slot::claim`), atomically.
+    pub async fn claim_nonce_slot(
+        &self,
+        slot: &NonceSlot,
+        holder: &NonceHolder,
+    ) -> Result<NonceClaim, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(CLAIM_NONCE_SLOT_SCRIPT)
+            .arg(1)
+            .arg(nonce_slot_key(slot))
+            .arg(&holder.user_operation_hash)
+            .arg(holder.claimed_at_ms)
+            .arg(vela_relay_core::nonce_slot::SLOT_TTL_MS);
+        let reply: (i64, String, String) = self.query(command).await?;
+        nonce_claim_reply(reply)
+    }
+
+    /// Replaces the slot's holder only while it is still `judged_user_operation_hash`
+    /// (`nonce_slot::take_over`), atomically.
+    pub async fn take_over_nonce_slot(
+        &self,
+        slot: &NonceSlot,
+        judged_user_operation_hash: &str,
+        holder: &NonceHolder,
+    ) -> Result<NonceClaim, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(TAKE_OVER_NONCE_SLOT_SCRIPT)
+            .arg(1)
+            .arg(nonce_slot_key(slot))
+            .arg(&holder.user_operation_hash)
+            .arg(holder.claimed_at_ms)
+            .arg(vela_relay_core::nonce_slot::SLOT_TTL_MS)
+            .arg(judged_user_operation_hash);
+        let reply: (i64, String, String) = self.query(command).await?;
+        nonce_claim_reply(reply)
+    }
+
+    /// Clears the slot only while it still names this operation
+    /// (`nonce_slot::release`).
+    pub async fn release_nonce_slot(
+        &self,
+        slot: &NonceSlot,
+        user_operation_hash: &str,
+    ) -> Result<bool, UserOperationStatusStoreError> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(RELEASE_NONCE_SLOT_SCRIPT)
+            .arg(1)
+            .arg(nonce_slot_key(slot))
+            .arg(user_operation_hash);
+        let released: i64 = self.query(command).await?;
+        Ok(released == 1)
+    }
+
+    /// Records a terminal local rejection with a bounded, client-safe explanation and the
+    /// machine reason a wallet words it by. On-chain rejections remain represented by their
+    /// receipt event instead.
     pub async fn mark_rejected_with_executor_reason(
         &self,
         user_operation_hash: &str,
         stage: &str,
         reason: &str,
+        code: RejectionReason,
     ) -> Result<bool, UserOperationStatusStoreError> {
         let attempted_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1118,6 +1229,7 @@ impl UserOperationStatusStore {
                 "lastExecutorStage": truncate_diagnostic(stage, 64),
                 "lastExecutorError": truncate_diagnostic(reason, 512),
                 "lastExecutorAttemptAtMs": attempted_at_ms,
+                "rejectionReason": code.as_str(),
             }),
         )
         .await
@@ -1314,6 +1426,30 @@ use vela_relay_core::task::queued_record;
 
 /// Moved to the core (spec 002) so both shells bound diagnostics identically.
 use vela_relay_core::task::truncate_diagnostic;
+
+fn nonce_slot_key(slot: &NonceSlot) -> String {
+    format!("{NONCE_SLOT_KEY_PREFIX}{}", slot.key())
+}
+
+fn nonce_claim_reply(
+    (code, user_operation_hash, claimed_at_ms): (i64, String, String),
+) -> Result<NonceClaim, UserOperationStatusStoreError> {
+    match code {
+        1 => Ok(NonceClaim::Claimed { fresh: true }),
+        2 => Ok(NonceClaim::Claimed { fresh: false }),
+        0 => Ok(NonceClaim::Held {
+            holder: NonceHolder {
+                user_operation_hash,
+                // A slot written without a readable time is judged as old,
+                // by its record alone.
+                claimed_at_ms: claimed_at_ms.parse().unwrap_or(0),
+            },
+        }),
+        _ => Err(UserOperationStatusStoreError(
+            "nonce slot script returned an unknown reply",
+        )),
+    }
+}
 
 fn status_key(user_operation_hash: &str) -> String {
     format!("{STATUS_KEY_PREFIX}{user_operation_hash}")
@@ -1980,6 +2116,125 @@ mod tests {
             DELAYED_OPERATION_SCHEDULE_KEY,
             "vela:relay:delayed-user-operation-schedule"
         );
+    }
+
+    /// The nonce-slot scripts execute the core's `claim`, `take_over` and
+    /// `release` mechanically: they compare the stored holder before writing
+    /// and decide nothing about whether a holder is live.
+    #[test]
+    fn nonce_slot_scripts_compare_the_holder_before_mutation() {
+        use super::{
+            CLAIM_NONCE_SLOT_SCRIPT, RELEASE_NONCE_SLOT_SCRIPT, TAKE_OVER_NONCE_SLOT_SCRIPT,
+        };
+        assert!(CLAIM_NONCE_SLOT_SCRIPT.contains("if not current then"));
+        assert!(CLAIM_NONCE_SLOT_SCRIPT.contains("'PEXPIRE', KEYS[1], ARGV[3]"));
+        // A takeover replaces only the holder the core judged (ARGV[4]).
+        assert!(
+            TAKE_OVER_NONCE_SLOT_SCRIPT.contains("string.lower(current) ~= string.lower(ARGV[4])")
+        );
+        assert!(
+            RELEASE_NONCE_SLOT_SCRIPT.contains("string.lower(current) == string.lower(ARGV[1])")
+        );
+        for script in [
+            CLAIM_NONCE_SLOT_SCRIPT,
+            TAKE_OVER_NONCE_SLOT_SCRIPT,
+            RELEASE_NONCE_SLOT_SCRIPT,
+        ] {
+            assert!(!script.contains("status"), "liveness is the core's call");
+            assert!(!script.contains("cjson"));
+        }
+    }
+
+    #[test]
+    fn a_nonce_slot_reply_reads_as_the_cores_claim() {
+        use super::{nonce_claim_reply, nonce_slot_key};
+        use vela_relay_core::nonce_slot::{NonceClaim, NonceHolder, NonceSlot};
+        assert_eq!(
+            nonce_claim_reply((1, "0xaa".into(), "5".into())).unwrap(),
+            NonceClaim::Claimed { fresh: true }
+        );
+        assert_eq!(
+            nonce_claim_reply((2, "0xaa".into(), "5".into())).unwrap(),
+            NonceClaim::Claimed { fresh: false }
+        );
+        assert_eq!(
+            nonce_claim_reply((0, "0xbb".into(), "1760000000123".into())).unwrap(),
+            NonceClaim::Held {
+                holder: NonceHolder {
+                    user_operation_hash: "0xbb".into(),
+                    claimed_at_ms: 1_760_000_000_123,
+                },
+            }
+        );
+        assert!(nonce_claim_reply((9, String::new(), String::new())).is_err());
+        assert_eq!(
+            nonce_slot_key(&NonceSlot::new(8453, [0x11; 20], [0x22; 20], [0; 32])),
+            format!(
+                "vela:relay:nonce-slot:8453:0x{}:0x{}:0x{}",
+                "11".repeat(20),
+                "22".repeat(20),
+                "0".repeat(64)
+            )
+        );
+    }
+
+    /// The slot scripts against a real Redis: claim, refuse a twin, take over
+    /// only the judged holder, release only one's own.
+    #[tokio::test]
+    #[ignore = "requires a running Redis and VELA_RELAY_REDIS_URL"]
+    async fn nonce_slot_scripts_hold_one_operation_per_nonce_in_redis() {
+        use vela_relay_core::nonce_slot::{NonceClaim, NonceHolder, NonceSlot};
+        let store = super::UserOperationStatusStore::connect(&crate::utils::config::RedisConfig {
+            url: std::env::var("VELA_RELAY_REDIS_URL").expect("Redis connection URL"),
+            command_timeout: Duration::from_secs(2),
+        })
+        .await
+        .expect("Redis");
+        let mut nonce = [0u8; 32];
+        nonce[..8].copy_from_slice(&std::process::id().to_be_bytes().repeat(2));
+        let slot = NonceSlot::new(9_999_999_991, [0x11; 20], [0x22; 20], nonce);
+        let holder = |hash: &str, at: u64| NonceHolder {
+            user_operation_hash: hash.into(),
+            claimed_at_ms: at,
+        };
+        let (a, b, c) = ("0xaaaa", "0xbbbb", "0xcccc");
+        assert_eq!(
+            store.claim_nonce_slot(&slot, &holder(a, 1)).await.unwrap(),
+            NonceClaim::Claimed { fresh: true }
+        );
+        assert_eq!(
+            store.claim_nonce_slot(&slot, &holder(a, 2)).await.unwrap(),
+            NonceClaim::Claimed { fresh: false }
+        );
+        assert_eq!(
+            store.claim_nonce_slot(&slot, &holder(b, 3)).await.unwrap(),
+            NonceClaim::Held {
+                holder: holder(a, 1)
+            }
+        );
+        assert_eq!(
+            store
+                .take_over_nonce_slot(&slot, a, &holder(b, 4))
+                .await
+                .unwrap(),
+            NonceClaim::Claimed { fresh: true }
+        );
+        assert_eq!(
+            store
+                .take_over_nonce_slot(&slot, a, &holder(c, 5))
+                .await
+                .unwrap(),
+            NonceClaim::Held {
+                holder: holder(b, 4)
+            }
+        );
+        assert!(!store.release_nonce_slot(&slot, a).await.unwrap());
+        assert!(store.release_nonce_slot(&slot, b).await.unwrap());
+        assert_eq!(
+            store.claim_nonce_slot(&slot, &holder(c, 6)).await.unwrap(),
+            NonceClaim::Claimed { fresh: true }
+        );
+        assert!(store.release_nonce_slot(&slot, c).await.unwrap());
     }
 
     #[test]

@@ -39,12 +39,15 @@ required = max( markup × settlement_gas × cap ,  floor )
   client that names a speed gets that tier's cap and tip (§2a), clamped to what
   its payment funds. The cap is **inclusion headroom, not cost** — the chain
   only ever charges `base_fee + effective tip`.
-- **`floor`** — a dust guard: `0.00001` native coin, or `0.01` of a stablecoin
-  (≈ **1 cent**). This is NOT the price; it only bites when `markup × gas`
-  rounds below it (near-zero-gas ops). Both the quote layer and the settlement
-  layer compute it through the same `minimum_amount(decimals, fraction)` with
-  the same constants, so they can never disagree (pinned by
-  `the_dust_floor_is_the_requirement_when_the_gas_costs_less`).
+- **`floor`** — the **minimum in-band fee, `$0.01`** (§1c). This is NOT the
+  price; it only bites when `markup × gas` rounds below it (near-zero-gas ops,
+  which on the cheap chains is most of them). Native: `$0.01` of the coin at
+  the executor's own fresh price, accepted down to 90% of it; `0.000001` of
+  the coin where there is no fresh price. A stablecoin: `0.01` of it. The quote
+  publishes the floor per fee token as `minimumAmount` (§1c), from the same
+  functions the executor enforces it with, so they cannot disagree (pinned by
+  `the_dust_floor_is_the_requirement_when_the_gas_costs_less` and
+  `the_published_minimum_is_accepted_at_settlement_within_the_allowance`).
 
 ## 1a. The gas an operation pays for — used, not reserved
 
@@ -200,6 +203,92 @@ effectiveGasPrice`); the Worker logs the same line. A warning is the event to
 look at; `charged_wei` above `1.1 × billed_at_cap_wei` would be a loss. A
 bundle of several operations is one receipt, so the line is per bundle — per
 operation for the single-operation bundles that are nearly all of them.
+
+## 1c. The minimum fee — `$0.01`, published per fee token
+
+The owner's rule (2026-10-09): **the minimum in-band fee is `$0.01`**, and the
+relay never loses on an operation and always profits. The floor term of §1 is
+that minimum. It never decides whether the relay profits — the cost term
+`markup × billed gas × cap` does, at every fee and without any allowance — it
+only decides the least a near-zero-gas operation pays.
+
+**What the relay publishes.** Every row of `vela_getInBandGasQuote` carries
+`minimumAmount`, a hex quantity in the row's own base units:
+
+| row | `minimumAmount` |
+|---|---|
+| native coin, `usdPrice` present | `max(⌈$0.01 / usdPrice⌉, 10^(decimals−6))` — exactly `$0.01` of any coin under $10,000 |
+| native coin, `usdPrice` null | `10^(decimals−6)`, 0.000001 of the coin — the **safety floor** |
+| allowlisted stablecoin, Tempo pathUSD | `10^(decimals−2)`, 0.01 of it |
+
+`usdPrice` is the relay's Binance `{symbol}USDT` read, cached 60 s (a *fresh*
+price), or one dollar exactly on the chains whose coin is the dollar (Gnosis
+xDAI, Arc USDC, Stable USDT0: `settlement::pegged_native_usd_price`).
+`settlement::published_native_minimum`, `quote::quotes_from_multicall`.
+
+**What it enforces.**
+
+- *Admission* reads no price: a native payment must be at least the safety
+  floor, `10^(decimals−6)`, or an allowlisted stablecoin at least `0.01`.
+  Tempo's pathUSD at least `0.01`, as before. (`admission.rs`)
+- *Settlement* (native): `floor = max(⌈$0.009 / price⌉, 10^(decimals−6))` at
+  the executor's own fresh price (`MINIMUM_FEE_ACCEPTANCE_BPS` = 90%), or the
+  safety floor where its price read failed. The executor reads the price once
+  per attempt, shared by this floor, the stablecoin conversion and the top-up
+  cap; for a native payment a failed read is the safety floor, never a
+  retry. (`settlement::enforced_native_minimum`, `execution.rs`)
+- *Settlement* (stablecoin): `0.01` of it, unchanged.
+
+**Why 90%.** A wallet signs against the minimum the quote published at the
+quote's price; the executor judges it at its own price, moments or (through a
+hold) minutes later. If the coin fell in between, `$0.01` is more coin than
+was signed. Within 10% the payment is still accepted, so a wallet paying
+exactly the published minimum is not refused because the market moved under
+it (pinned by `the_published_minimum_is_accepted_at_settlement_within_the_allowance`:
+accepted at the quote's price and 10% below it, refused at 11%). The
+allowance touches only the minimum: what the relay can lose is decided by the
+cost term, which it never discounts.
+
+**Why the safety floor is `0.000001` of the coin.** It is what applies where
+the relay has no fresh price, and what admission checks. It must never be worth
+more than `$0.01` of a coin the relay CAN price, or a wallet that paid the
+published `$0.01` would be refused whenever one executor price read failed. It
+used to be `0.00001` of the coin, which on every Ethereum-coin chain *was* the
+minimum: 0.00001 ETH, `$0.025`, two and a half times the rule, on every L2
+send (and, through the wallet's conversion, on every stablecoin fee there
+too). The 24 networks built into vela-wallet (`app/network_admin.rs
+BUILTIN_CHAINS`), at 2026-10-09 prices:
+
+| networks | coin | price | relay prices it | `$0.01` is | 0.00001 coin (old) | 0.000001 coin (safety) |
+|---|---|---|---|---|---|---|
+| Ethereum, Arbitrum, Optimism, Base, Unichain, World Chain, Soneium, MegaETH, Robinhood Chain, Ink | ETH | $2,494 | Binance | 0.00000401 | **$0.0249** | $0.0025 |
+| BNB Chain | BNB | $741.6 | Binance | 0.0000135 | $0.0074 | $0.00074 |
+| X Layer | OKB | $125.6 | no | (0.0000796) | $0.00126 | $0.000126 |
+| Avalanche | AVAX | $10.26 | Binance | 0.000975 | $0.0001 | $0.00001 |
+| XRPL EVM | XRP | $1.387 | Binance | 0.00721 | $0.000014 | $0.0000014 |
+| Gnosis, Arc, Stable | xDAI, USDC, USDT0 | $1 | peg | 0.01 | $0.00001 | $0.000001 |
+| Mantle | MNT | $0.551 | no | (0.0181) | $0.0000055 | $0.00000055 |
+| Polygon | POL | $0.0993 | Binance | 0.1007 | $0.000001 | $0.0000001 |
+| Celo | CELO | $0.0935 | Binance | 0.107 | | |
+| Kaia | KAIA | $0.0559 | Binance | 0.179 | | |
+| Monad | MON | $0.0246 | no | (0.406) | | |
+| Plume | PLUME | $0.0178 | Binance | 0.561 | | |
+| Tempo | pathUSD | $1 | protocol | 0.01 pathUSD (§5, unchanged) | | |
+
+Ethereum's coin binds: the safety floor must stay under `$0.01 / $2,494` =
+0.000004 ETH. `10^(decimals−6)` is a quarter of that and stays under `$0.01`
+until ETH reaches $10,000 — revisit it if a priced coin ever does (above that
+the published minimum is the safety floor, a little over `$0.01`). Below ETH
+it is worth next to nothing, and on the three coins the relay cannot price at
+all (MON, OKB, MNT) it is a dust guard only. That is safe: the safety floor
+never stood between the relay and a loss; the cost term does.
+
+**Wallets.** A wallet pays at least `minimumAmount`, and where `usdPrice` is
+null and it has a price of its own, at least `$0.01` by it (§3). A wallet that
+predates `minimumAmount` pays `max($0.01 at usdPrice, 0.00001 coin)`, which is
+always at least `minimumAmount`: it overpays on the Ethereum-coin chains, and
+is accepted. A row without `minimumAmount` is an older relay, whose admission
+still requires `0.00001` of the coin.
 
 ## 2. Repricing — the safety valve that makes a fixed client payment work
 
@@ -654,8 +743,13 @@ F = max( settlementGas × inBandFeePerGas[tier] ,  settlementGas × own_check(ti
   a quiet window — `slow` at least 0.001 gwei once the window paid any tip and
   at least the node's tip where the blocks bear it out, each faster tier at
   least the slower one).
-- **The dust floor**: at least `$0.01` of the native coin (and never below the
-  relay's `0.00001`-coin floor), or `$0.01` of a stablecoin.
+- **The dust floor**: at least the row's `minimumAmount` (§1c) — `$0.01` of
+  the native coin at the quote's `usdPrice`, `0.01` of a stablecoin. Where
+  `usdPrice` is null, `minimumAmount` is the 0.000001-coin safety floor, and a
+  wallet with a price of its own still pays `$0.01` by it. A stablecoin fee is
+  floored at its own `minimumAmount`, never at the native one converted. A
+  relay that publishes no `minimumAmount` is older: pay `max($0.01, 0.00001
+  coin)`, which its admission requires.
 - **A fresh quote.** The acceptance table in §2c is for quotes 12, 30 and 60 s
   old. A client that re-quotes once a block while the confirm surface is up,
   and refreshes a quote older than a block before signing, sits in the 12 s
@@ -745,8 +839,10 @@ speed.)
 
 - The relay requires `max(markup × settlement_gas × cap, floor)`: a 1.1× markup
   (`VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS`), the cap the outer transaction
-  is signed with, and the `0.00001`-coin / `$0.01` dust floor. It rounds every
-  step in its own favor with fail-closed overflow.
+  is signed with, and the `$0.01` minimum (§1c: published per fee token as
+  `minimumAmount`, accepted down to 90% at the executor's price, `0.000001` of
+  the coin without a price). It rounds every step in its own favor with
+  fail-closed overflow.
 - **It bills the gas a bundle uses, not the gas it reserves** (§1a): on
   Ethereum and the other listed chains, the measured gas plus 15% and 30,000
   (never past the operations' own limits, the same cap `settlementGas` is

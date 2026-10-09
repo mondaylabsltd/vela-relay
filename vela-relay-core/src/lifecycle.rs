@@ -139,6 +139,7 @@ pub fn dead_letter_patch(record: &StoredUserOperation, now_ms: u64) -> Option<se
         "lastExecutorStage": DEAD_LETTER_STAGE,
         "lastExecutorError": crate::task::truncate_diagnostic(&reason, 512),
         "lastExecutorAttemptAtMs": now_ms,
+        "rejectionReason": crate::rejection::RejectionReason::RelayGaveUp.as_str(),
     }))
 }
 
@@ -373,6 +374,8 @@ mod tests {
             "the relay stopped retrying this operation without sending it; last error: waiting for relayer funding transaction confirmation"
         );
         assert_eq!(patch["lastExecutorAttemptAtMs"], 1_791_031_695_572_u64);
+        // The wallet reads why: the relay gave up, not a fee problem.
+        assert_eq!(patch["rejectionReason"], "relay_gave_up");
         // ...and the store's own table lets it through.
         assert_eq!(
             decide_patch(

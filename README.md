@@ -215,7 +215,8 @@ publishing setup.
 Relay charges no separate fee: each UserOperation declares zero EntryPoint fees
 and embeds a trusted Safe MultiSend transfer reimbursing the settlement recipient
 for the gas the relay spends. The relay requires `max(1.1 × settlement gas × cap,
-floor)` (floor = 0.00001 native or $0.01 stablecoin), where the settlement gas is
+floor)` (floor = the $0.01 minimum, published per fee token as `minimumAmount` by
+`vela_getInBandGasQuote`; 0.000001 of the native coin where the relay has no price), where the settlement gas is
 the gas the bundle measurably used plus a buffer on Ethereum and the other listed
 chains, and the outer gas limit elsewhere; it reprices the outer transaction down
 toward the inclusion floor rather than rejecting an honest-but-short payment.
@@ -224,6 +225,11 @@ toward the inclusion floor rather than rejecting an honest-but-short payment.
 `inBandFeePerGas`; a client pays their product. The full rule — the requirement,
 the speed tiers and their tips, the backtest that chose the numbers, what a client
 pays, and stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
+
+One operation per account nonce is in flight at a time: `eth_sendUserOperation` refuses a
+different operation at a nonce whose earlier operation is still pending, with the
+`[existingHash:0x…]` marker wallets read, and every rejected operation's status names why in
+`rejection_reason` ([src/app/rpc/handlers/README.md](src/app/rpc/handlers/README.md)).
 
 ## HTTP endpoints
 

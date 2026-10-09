@@ -184,6 +184,12 @@ pub struct StoredUserOperation {
     pub last_executor_error: Option<String>,
     #[serde(default)]
     pub last_executor_attempt_at_ms: Option<u64>,
+    /// Why a terminal rejection happened, as a [`crate::rejection::RejectionReason`]
+    /// code. Kept as text so a record written by a newer relay never fails to
+    /// load in an older one; absent on every record that is not rejected, so
+    /// those keep their exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 /// Bounds an operator-facing diagnostic before it is stored: external error
@@ -224,6 +230,7 @@ pub fn queued_record(operation: QueuedUserOperation, admitted: bool) -> StoredUs
         last_executor_stage: None,
         last_executor_error: None,
         last_executor_attempt_at_ms: None,
+        rejection_reason: None,
     }
 }
 

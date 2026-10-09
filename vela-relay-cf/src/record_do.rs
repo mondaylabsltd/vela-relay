@@ -9,6 +9,12 @@
 //! Guard semantics: the DO is single-threaded, so create-if-absent and
 //! read-modify-write are race-free by construction — the platform supplies
 //! what the docker shell builds from Redis SETNX and Lua CAS.
+//!
+//! The same class also hosts one instance per account nonce slot, named
+//! `nonce:{chainId}:{entryPoint}:{sender}:{nonce}` (`nonce_slot`): `nonceHolder`
+//! → the slot's holder, under the same `expiresAtMs` alarm. Its commands apply
+//! the core's `claim`, `take_over` and `release` with no await between the read
+//! and the write, so two admissions racing for a nonce are serialized here.
 
 use worker::{
     Date, DurableObject, Env, Request, Response, Result, State, durable_object, wasm_bindgen,
@@ -21,6 +27,7 @@ const RECORD_TTL_MS: u64 = 3_600 * 1_000;
 
 const RECORD_KEY: &str = "record";
 const EXPIRES_KEY: &str = "expiresAtMs";
+const NONCE_HOLDER_KEY: &str = "nonceHolder";
 
 #[durable_object]
 pub struct RecordDo {
@@ -93,6 +100,36 @@ impl DurableObject for RecordDo {
                     .apply_bundle_submission(bundle_chain_id, &transaction_hash)
                     .await?,
             },
+            RecordCommand::ClaimNonce { holder } => {
+                let current = self.nonce_holder().await?;
+                let step = vela_relay_core::nonce_slot::claim(current.as_ref(), &holder);
+                self.write_nonce_holder(step.write).await?;
+                RecordReply::Nonce { claim: step.reply }
+            }
+            RecordCommand::TakeOverNonce {
+                judged_user_operation_hash,
+                holder,
+            } => {
+                let current = self.nonce_holder().await?;
+                let step = vela_relay_core::nonce_slot::take_over(
+                    current.as_ref(),
+                    &judged_user_operation_hash,
+                    &holder,
+                );
+                self.write_nonce_holder(step.write).await?;
+                RecordReply::Nonce { claim: step.reply }
+            }
+            RecordCommand::ReleaseNonce {
+                user_operation_hash,
+            } => {
+                let current = self.nonce_holder().await?;
+                let released =
+                    vela_relay_core::nonce_slot::release(current.as_ref(), &user_operation_hash);
+                if released {
+                    self.state.storage().delete(NONCE_HOLDER_KEY).await?;
+                }
+                RecordReply::Released { released }
+            }
         };
         Response::from_json(&reply)
     }
@@ -122,6 +159,33 @@ impl DurableObject for RecordDo {
 impl RecordDo {
     async fn record(&self) -> Option<vela_relay_core::task::StoredUserOperation> {
         self.state.storage().get(RECORD_KEY).await.ok().flatten()
+    }
+
+    /// A slot's holder. A read that fails is an error, never an empty slot:
+    /// reading it as empty would let a second operation claim a held nonce.
+    async fn nonce_holder(&self) -> Result<Option<vela_relay_core::nonce_slot::NonceHolder>> {
+        self.state.storage().get(NONCE_HOLDER_KEY).await
+    }
+
+    /// Store a slot's new holder and keep the slot for `nonce_slot::SLOT_TTL_MS`
+    /// (garbage collection only: a stale holder is judged by its record).
+    async fn write_nonce_holder(
+        &self,
+        holder: Option<vela_relay_core::nonce_slot::NonceHolder>,
+    ) -> Result<()> {
+        let Some(holder) = holder else {
+            return Ok(());
+        };
+        let ttl_ms = vela_relay_core::nonce_slot::SLOT_TTL_MS;
+        self.state.storage().put(NONCE_HOLDER_KEY, &holder).await?;
+        self.state
+            .storage()
+            .put(EXPIRES_KEY, Date::now().as_millis() + ttl_ms)
+            .await?;
+        self.state
+            .storage()
+            .set_alarm(std::time::Duration::from_millis(ttl_ms))
+            .await
     }
 
     async fn schedule_alarm(&self) -> Result<()> {
